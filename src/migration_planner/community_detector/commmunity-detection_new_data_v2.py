@@ -9,9 +9,6 @@
 # MAGIC   5. Walktrap
 # MAGIC   6. k-clique community
 
-# COMMAND ----------
-
-!pip install python-louvain python-igraph adjustText infomap netgraph
 
 # COMMAND ----------
 
@@ -26,27 +23,17 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 # Import libraries
-import pandas as pd #For reading dataset files
-import networkx as nx #For network creation/analysis
+import pandas as pd  # For reading dataset files
+import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
 import community as community_louvain
-import matplotlib.pyplot as plt #For plotting graphs
-import igraph as ig
-import random
+import matplotlib.pyplot as plt  # For plotting graphs
 from datetime import datetime
-%matplotlib inline
 from networkx.algorithms.centrality import degree_centrality
-from sklearn.preprocessing import MinMaxScaler
 import numpy as np
-from scipy.cluster.hierarchy import dendrogram, linkage
-from netgraph import Graph
 from infomap import Infomap
-from pyspark.sql.functions import col, lit, when
-from sklearn.metrics import adjusted_rand_score
+from pyspark.sql.functions import col, lit
 from collections import Counter
-
-
-
 
 
 # COMMAND ----------
@@ -65,8 +52,10 @@ dbutils.fs.ls("file:///Workspace/Users/aspram.grigoryan@databricks.com/LH_Stream
 
 # COMMAND ----------
 
-dbutils.fs.cp("file:/Workspace/Users/aspram.grigoryan@databricks.com/LH_Stream_Community_Detection/Stream-Table-dependencies-All-ADW-Streams-Tabelle1.csv",
-              "dbfs:/tmp/new_data.csv")
+dbutils.fs.cp(
+    "file:/Workspace/Users/aspram.grigoryan@databricks.com/LH_Stream_Community_Detection/Stream-Table-dependencies-All-ADW-Streams-Tabelle1.csv",
+    "dbfs:/tmp/new_data.csv",
+)
 
 
 # COMMAND ----------
@@ -82,34 +71,35 @@ dbutils.fs.cp("file:/Workspace/Users/aspram.grigoryan@databricks.com/LH_Stream_C
 
 df2 = spark.read.format("csv").option("header", "true").load("dbfs:/tmp/source_transform_target_tables_per_stream.csv")
 
-depend_df = spark.table('odp_adw_mvp_n.db_cascade.cascade_dependants').withColumn('weight', lit('')).withColumn('type', lit('casacade_dependent'))
+depend_df = (
+    spark.table('odp_adw_mvp_n.db_cascade.cascade_dependants')
+    .withColumn('weight', lit(''))
+    .withColumn('type', lit('casacade_dependent'))
+)
 
-df = df2.filter(col('table_type') != 'Trns').select('stream_name', col('DB_Table_Name').alias('table_name'), 'table_type')
+df = df2.filter(col('table_type') != 'Trns').select(
+    'stream_name', col('DB_Table_Name').alias('table_name'), 'table_type'
+)
 display(df)
 
 # COMMAND ----------
 
 # Self join to find dependencies
-result = df.alias("df1").join(
-    df.alias("df2"),
-    col("df1.table_name") == col("df2.table_name")
-)
+result = df.alias("df1").join(df.alias("df2"), col("df1.table_name") == col("df2.table_name"))
 
 display(result.filter(col("df2.stream_name").contains("IMP_LOCATIONS") == True))
 
 # COMMAND ----------
 
 # Filter only Src -> Tgt dependencies
-filtered_result = result.filter(
-    (col("df1.table_type") == "Src") & (col("df2.table_type") == "Tgt")
-)
+filtered_result = result.filter((col("df1.table_type") == "Src") & (col("df2.table_type") == "Tgt"))
 
 # Select required columns and rename them
 output = filtered_result.select(
     col("df1.stream_name").alias("from"),
     col("df2.stream_name").alias("to"),
     col("df1.table_name").alias("table"),
-    lit('dependent').alias('')
+    lit('dependent').alias(''),
 )
 
 output.show()
@@ -142,7 +132,6 @@ edges = edges.groupby(['from', 'to'])['weight'].sum().reset_index()
 G_directed = nx.from_pandas_edgelist(edges, source='from', target='to', edge_attr=True, create_using=nx.DiGraph())
 
 
-
 # COMMAND ----------
 
 # MAGIC %md
@@ -160,18 +149,19 @@ node_colors = [v for _, v in sorted_nodes]
 sorted_nodes_list = [n for n, _ in sorted_nodes]  # Reorder nodes
 
 # Create position layout
-pos = nx.spring_layout(G_directed, seed = 2)
+pos = nx.spring_layout(G_directed, seed=2)
 
 # Draw the graph
 plt.figure(figsize=(12, 8))
 
 nx.draw_networkx_edges(G_directed, pos, edge_color='gray')  # Draw edges first
 nodes = nx.draw_networkx_nodes(
-    G_directed, pos,
+    G_directed,
+    pos,
     nodelist=sorted_nodes_list,  # Use sorted nodes for correct layering
     node_size=node_sizes,
     node_color=node_colors,
-    cmap=plt.cm.Reds  # Use a color map for centrality
+    cmap=plt.cm.Reds,  # Use a color map for centrality
 )
 # Disable labels for simplicity
 nx.draw_networkx_labels(G_directed, pos, labels={}, font_size=8)
@@ -180,7 +170,9 @@ nx.draw_networkx_labels(G_directed, pos, labels={}, font_size=8)
 # Add title and show the plot
 plt.title("Stream Dependency Graph with Centrality")
 
-plt.savefig("svg_plots_latest/graph_visualization_stream_dependency_with_centrality.svg", format="svg", bbox_inches='tight')
+plt.savefig(
+    "svg_plots_latest/graph_visualization_stream_dependency_with_centrality.svg", format="svg", bbox_inches='tight'
+)
 
 
 plt.show()
@@ -192,7 +184,9 @@ sorted_nodes
 # Convert the sorted list of tuples to a DataFrame
 df = pd.DataFrame(sorted_nodes, columns=["node", "centrality"])
 
-output_path = "./centrality_sorted_nodes_latest/sorted_nodes_overall_centrality.csv"  # Save file in the workspace directory
+output_path = (
+    "./centrality_sorted_nodes_latest/sorted_nodes_overall_centrality.csv"  # Save file in the workspace directory
+)
 
 # Save DataFrame to CSV without the index column
 df.to_csv(output_path, index=False)
@@ -229,17 +223,18 @@ label_threshold = 0.2
 labels = {n: n if in_degree_centrality[n] >= label_threshold else '' for n in G_directed.nodes()}
 
 # Create position layout
-pos = nx.spring_layout(G_directed, seed = 2)
+pos = nx.spring_layout(G_directed, seed=2)
 
 # Draw the graph
 plt.figure(figsize=(12, 8))
 nx.draw_networkx_edges(G_directed, pos, edge_color='gray')
 nodes = nx.draw_networkx_nodes(
-    G_directed, pos,
+    G_directed,
+    pos,
     nodelist=sorted_nodes_list_in,
     node_size=node_sizes_in,
     node_color=node_colors_in,
-    cmap=plt.cm.Blues
+    cmap=plt.cm.Blues,
 )
 
 # Add labels with adjustment
@@ -255,7 +250,9 @@ adjust_text(texts, arrowprops=dict(arrowstyle='->', color='gray', lw=0.5))
 plt.title("Stream Dependency Graph with In-Degree Centrality")
 plt.colorbar(nodes, label="In-Degree Centrality")
 
-plt.savefig("svg_plots_latest/graph_visualization_stream_dependency_with_in_centrality.svg", format="svg", bbox_inches='tight')
+plt.savefig(
+    "svg_plots_latest/graph_visualization_stream_dependency_with_in_centrality.svg", format="svg", bbox_inches='tight'
+)
 
 plt.show()
 
@@ -266,7 +263,9 @@ plt.show()
 # Convert the sorted list of tuples to a DataFrame
 df = pd.DataFrame(sorted_in_nodes, columns=["node", "centrality"])
 
-output_path = "./centrality_sorted_nodes_latest/sorted_nodes_indegree_centrality.csv"  # Save file in the workspace directory
+output_path = (
+    "./centrality_sorted_nodes_latest/sorted_nodes_indegree_centrality.csv"  # Save file in the workspace directory
+)
 
 # Save DataFrame to CSV without the index column
 df.to_csv(output_path, index=False)
@@ -303,17 +302,18 @@ label_threshold = 0.12
 labels = {n: n if out_degree_centrality[n] >= label_threshold else '' for n in G_directed.nodes()}
 
 # Create position layout
-pos = nx.spring_layout(G_directed, seed = 5)
+pos = nx.spring_layout(G_directed, seed=5)
 
 # Draw the graph
 plt.figure(figsize=(12, 8))
 nx.draw_networkx_edges(G_directed, pos, edge_color='gray')
 nodes = nx.draw_networkx_nodes(
-    G_directed, pos,
+    G_directed,
+    pos,
     nodelist=sorted_nodes_list_out,
     node_size=node_sizes_out,
     node_color=node_colors_out,
-    cmap=plt.cm.Greens
+    cmap=plt.cm.Greens,
 )
 
 # Add labels with adjustment
@@ -328,7 +328,9 @@ adjust_text(texts, arrowprops=dict(arrowstyle='->', color='gray', lw=0.5))
 # Add title and colorbar
 plt.title("Stream Dependency Graph with Out-Degree Centrality")
 plt.colorbar(nodes, label="Out-Degree Centrality")
-plt.savefig("svg_plots_latest/graph_visualization_stream_dependency_with_out_centrality.svg", format="svg", bbox_inches='tight')
+plt.savefig(
+    "svg_plots_latest/graph_visualization_stream_dependency_with_out_centrality.svg", format="svg", bbox_inches='tight'
+)
 
 plt.show()
 
@@ -339,7 +341,9 @@ plt.show()
 # Convert the sorted list of tuples to a DataFrame
 df = pd.DataFrame(sorted_out_nodes, columns=["node", "centrality"])
 
-output_path = "./centrality_sorted_nodes_latest/sorted_nodes_outdegree_centrality.csv"  # Save file in the workspace directory
+output_path = (
+    "./centrality_sorted_nodes_latest/sorted_nodes_outdegree_centrality.csv"  # Save file in the workspace directory
+)
 
 # Save DataFrame to CSV without the index column
 df.to_csv(output_path, index=False)
@@ -349,10 +353,10 @@ print(f"CSV saved to {output_path}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Streams with a high degree of connectivity (many incoming or outgoing edges) are critical because they influence or depend on multiple other streams.   
-# MAGIC Streams with many outgoing edges are producers (important data sources).  
-# MAGIC Streams with many incoming edges are consumers (dependent on multiple upstream processes).  
-# MAGIC As next steps we need to: 
+# MAGIC Streams with a high degree of connectivity (many incoming or outgoing edges) are critical because they influence or depend on multiple other streams.
+# MAGIC Streams with many outgoing edges are producers (important data sources).
+# MAGIC Streams with many incoming edges are consumers (dependent on multiple upstream processes).
+# MAGIC As next steps we need to:
 # MAGIC - The graph shows how streams depend on each other. Migration must respect these dependencies, need to migrate producer streams (with outgoing edges) before their dependent consumer streams (with incoming edges).
 # MAGIC - Analyze clusters of tightly connected nodes (streams with interdependencies) to identify complex sections of the pipeline. Cycles (if present) indicate circular dependencies that might complicate migration or testing.
 # MAGIC - Streams with higher edge weights indicate more significant dependencies (e.g., many shared tables). These require thorough testing and validation during migration. Streams with low connectivity might be easier to migrate in isolation.
@@ -367,7 +371,7 @@ print(f"CSV saved to {output_path}")
 
 # MAGIC %md
 # MAGIC ## 4. Fast community unfolding (Louvian)
-# MAGIC **can play with the resolution parameter to force a bigger number of clusters. However, cluster uniformity cannot be controlled.  
+# MAGIC **can play with the resolution parameter to force a bigger number of clusters. However, cluster uniformity cannot be controlled.
 # MAGIC **does not take into account the directedness of the graph
 # MAGIC ***the algo is not deterministic
 
@@ -375,15 +379,9 @@ print(f"CSV saved to {output_path}")
 
 import pandas as pd  # For reading dataset files
 import networkx as nx  # For network creation/analysis
-from networkx.algorithms import community
-import community as community_louvain
 import matplotlib.pyplot as plt  # For plotting graphs
-import igraph as ig
-import random
 
-G_undirected = nx.from_pandas_edgelist(
-    edges, source="from", target="to", edge_attr=True
-)
+G_undirected = nx.from_pandas_edgelist(edges, source="from", target="to", edge_attr=True)
 
 # Use Louvain community detection algorithm to find communities
 lst_m = community_louvain.best_partition(G_undirected, resolution=2.5)
@@ -424,9 +422,6 @@ display(df_clusters)
 import pandas as pd
 import networkx as nx
 import community as community_louvain
-import numpy as np
-from sklearn.metrics import adjusted_rand_score
-from collections import Counter
 
 # Number of runs
 num_runs = 1000
@@ -513,7 +508,6 @@ plt.savefig("svg_plots_latest/graph_visualization_consensus_clusters.svg", forma
 plt.show()
 
 
-
 # COMMAND ----------
 
 # MAGIC %md
@@ -532,9 +526,9 @@ for node, cluster_id in consensus_partition.items():
 for cluster_id, nodes in consensus_clusters.items():
     subgraph = G_undirected.subgraph(nodes)  # Create a subgraph for the cluster
     pos = nx.spring_layout(subgraph, seed=2, k=2)  # Layout for the subgraph (with seed for consistency)
-    
+
     plt.figure(figsize=(8, 6))
-    
+
     # Draw nodes and edges
     nx.draw(
         subgraph,
@@ -542,7 +536,7 @@ for cluster_id, nodes in consensus_clusters.items():
         with_labels=True,
         node_size=300,
         node_color=[cluster_id] * len(nodes),  # Assign the cluster ID as the color
-        cmap=plt.cm.Spectral  # Use a colormap for distinct colors
+        cmap=plt.cm.Spectral,  # Use a colormap for distinct colors
     )
 
     # Draw edge labels (weights)
@@ -550,7 +544,9 @@ for cluster_id, nodes in consensus_clusters.items():
     nx.draw_networkx_edge_labels(subgraph, pos, edge_labels=edge_labels, font_size=10)
 
     plt.title(f"Consensus Cluster {int(cluster_id)}")
-    plt.savefig(f"svg_plots_latest/graph_consensus_clusters_louvain_{cluster_id}.svg", format="svg", bbox_inches='tight')
+    plt.savefig(
+        f"svg_plots_latest/graph_consensus_clusters_louvain_{cluster_id}.svg", format="svg", bbox_inches='tight'
+    )
 
     plt.show()
 
@@ -563,7 +559,6 @@ for cluster_id, nodes in consensus_clusters.items():
 
 # COMMAND ----------
 
-from infomap import Infomap
 import networkx as nx
 
 # Step 2: Map node labels to unique integers
@@ -690,10 +685,10 @@ for node, community_id in flat_partition.items():  # flat_partition contains nod
 for community_id, nodes in communities.items():
     # Create a subgraph for the community
     subgraph = G_directed.subgraph(nodes)
-    
+
     # Generate positions for the subgraph
     pos = nx.spring_layout(subgraph, seed=2, k=2)  # Use a fixed seed for consistency, Increase k for more spacing
-    
+
     # Draw the subgraph
     plt.figure(figsize=(8, 6))
     nx.draw(
@@ -702,15 +697,15 @@ for community_id, nodes in communities.items():
         with_labels=False,  # Disable default labels
         node_size=300,
         node_color=[community_id] * len(nodes),  # Assign the community ID as the color
-        cmap=plt.cm.Spectral  # Use a colormap for distinct colors
+        cmap=plt.cm.Spectral,  # Use a colormap for distinct colors
     )
-    
+
     # Add labels with smaller font size
     nx.draw_networkx_labels(
         subgraph,
         pos,
         font_size=8,  # Adjust this value to control label size
-        font_color="black"  # Optional: Set label color
+        font_color="black",  # Optional: Set label color
     )
 
     # Add edge labels (weights)
@@ -718,6 +713,8 @@ for community_id, nodes in communities.items():
     nx.draw_networkx_edge_labels(subgraph, pos, edge_labels=edge_labels, font_size=8)
 
     plt.title(f"Community {int(community_id)}")
-    plt.savefig(f"svg_plots_latest/graph_visualization_infomap_clusters_{community_id}.svg", format="svg", bbox_inches='tight')
+    plt.savefig(
+        f"svg_plots_latest/graph_visualization_infomap_clusters_{community_id}.svg", format="svg", bbox_inches='tight'
+    )
 
     plt.show()
