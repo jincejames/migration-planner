@@ -12,12 +12,10 @@
 # COMMAND ----------
 
 from IPython.display import Image
-Image("../input/image-community/Community.jpeg") #https://healthcommcapacity.org/
+
+Image("../input/image-community/Community.jpeg")  # https://healthcommcapacity.org/
 
 # COMMAND ----------
-
-!pip install netgraph
-from netgraph import Graph
 
 # COMMAND ----------
 
@@ -33,21 +31,16 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
-!pip install python-louvain python-igraph
-
-
-# COMMAND ----------
-
 # Import libraries
-import pandas as pd #For reading dataset files
-import networkx as nx #For network creation/analysis
+import pandas as pd  # For reading dataset files
+import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
 import community as community_louvain
-import matplotlib.pyplot as plt #For plotting graphs
+import matplotlib.pyplot as plt  # For plotting graphs
 import igraph as ig
 import random
 from datetime import datetime
-%matplotlib inline
+
 
 # COMMAND ----------
 
@@ -60,36 +53,44 @@ current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 # COMMAND ----------
 
-from pyspark.sql.functions import col, lit, when
-df2 = spark.read.format("csv").option("header", "true").load("/Workspace/Users/aspram.grigoryan@databricks.com/(Clone) LH Stream Community Detection/source_transform_target_tables_per_stream.csv")
-depend_df = spark.table('odp_adw_mvp_n.db_cascade.cascade_dependants').withColumn('weight', lit('')).withColumn('type', lit('casacade_dependent'))
+from pyspark.sql.functions import col, lit
 
-df = df2.filter(col('table_type') != 'Trns').select('stream_name', col('DB_Table_Name').alias('table_name'), 'table_type')
+df2 = (
+    spark.read.format("csv")
+    .option("header", "true")
+    .load(
+        "/Workspace/Users/aspram.grigoryan@databricks.com/(Clone) LH Stream Community Detection/source_transform_target_tables_per_stream.csv"
+    )
+)
+depend_df = (
+    spark.table('odp_adw_mvp_n.db_cascade.cascade_dependants')
+    .withColumn('weight', lit(''))
+    .withColumn('type', lit('casacade_dependent'))
+)
+
+df = df2.filter(col('table_type') != 'Trns').select(
+    'stream_name', col('DB_Table_Name').alias('table_name'), 'table_type'
+)
 df.show()
 
 # COMMAND ----------
 
 # Self join to find dependencies
-result = df.alias("df1").join(
-    df.alias("df2"),
-    col("df1.table_name") == col("df2.table_name")
-)
+result = df.alias("df1").join(df.alias("df2"), col("df1.table_name") == col("df2.table_name"))
 
 result.show()
 
 # COMMAND ----------
 
 # Filter only Src -> Tgt dependencies
-filtered_result = result.filter(
-    (col("df1.table_type") == "Src") & (col("df2.table_type") == "Tgt")
-)
+filtered_result = result.filter((col("df1.table_type") == "Src") & (col("df2.table_type") == "Tgt"))
 
 # Select required columns and rename them
 output = filtered_result.select(
     col("df1.stream_name").alias("from"),
     col("df2.stream_name").alias("to"),
     col("df1.table_name").alias("table"),
-    lit('dependent').alias('')
+    lit('dependent').alias(''),
 )
 
 output.show()
@@ -98,11 +99,11 @@ output.show()
 
 output = output.union(depend_df)
 # Show the output
-result = output.groupBy('from','to').count().select('from','to',col('count').alias('weight'))
+result = output.groupBy('from', 'to').count().select('from', 'to', col('count').alias('weight'))
 result1 = result.filter(col('from') != col('to'))
 edges = result1.toPandas()
 edges = edges.groupby(['from', 'to'])['weight'].sum().reset_index()
-G_directed = nx.from_pandas_edgelist(edges, source='from', target='to',edge_attr=True, create_using=nx.DiGraph())
+G_directed = nx.from_pandas_edgelist(edges, source='from', target='to', edge_attr=True, create_using=nx.DiGraph())
 
 # COMMAND ----------
 
@@ -120,15 +121,15 @@ nx.draw_networkx(G_directed)
 
 # COMMAND ----------
 
-#Modularity for different communities
+# Modularity for different communities
 lst_b = nx.community.girvan_newman(G_directed)
 modularity = []
 for x in lst_b:
-  modularity.append(community.modularity(G_directed, x))
+    modularity.append(community.modularity(G_directed, x))
 
 # COMMAND ----------
 
-#Plot modularity
+# Plot modularity
 plt.plot(modularity, 'o')
 plt.xlabel('# of clusters')
 plt.ylabel('modularity')
@@ -136,11 +137,11 @@ plt.show()
 
 # COMMAND ----------
 
-import random
 
 # Function to generate a random color in hex format
 def generate_random_color():
     return "#{:06x}".format(random.randint(0, 0xFFFFFF))
+
 
 plt.figure(figsize=(50, 50))
 
@@ -193,12 +194,9 @@ plt.show()
 
 # COMMAND ----------
 
-import pandas as pd #For reading dataset files
-import networkx as nx #For network creation/analysis
+import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
-import community as community_louvain
-import matplotlib.pyplot as plt #For plotting graphs
-import igraph as ig
+import matplotlib.pyplot as plt  # For plotting graphs
 
 # Apply Girvan-Newman algorithm to find communities
 lst_b = community.girvan_newman(G_directed)
@@ -217,11 +215,13 @@ for idx, community_nodes in enumerate(temp):
     community_id = idx + 1
     num_streams = len(community_nodes)
     list_of_streams = ", ".join(community_nodes)
-    community_data.append({
-        "Community ID": community_id,
-        "Number of Streams in Community": num_streams,
-        "List of Streams": list_of_streams
-    })
+    community_data.append(
+        {
+            "Community ID": community_id,
+            "Number of Streams in Community": num_streams,
+            "List of Streams": list_of_streams,
+        }
+    )
 
 # Convert to a pandas DataFrame for tabular representation
 community_df = pd.DataFrame(community_data)
@@ -236,12 +236,10 @@ display(community_df)
 
 # COMMAND ----------
 
-import pandas as pd #For reading dataset files
-import networkx as nx #For network creation/analysis
+import pandas as pd  # For reading dataset files
+import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
-import community as community_louvain
-import matplotlib.pyplot as plt #For plotting graphs
-import igraph as ig
+import matplotlib.pyplot as plt  # For plotting graphs
 
 # Initialize data for the table
 data = []
@@ -257,13 +255,9 @@ for idx, community_nodes in enumerate(lst_b):
     community_id = idx + 1  # Assign a unique ID to each community
     number_of_streams = len(community_nodes)
     streams_list = ", ".join(community_nodes)
-    
+
     # Append data for this community
-    data.append({
-        "Community ID": community_id,
-        "Number of Streams": number_of_streams,
-        "List of Streams": streams_list
-    })
+    data.append({"Community ID": community_id, "Number of Streams": number_of_streams, "List of Streams": streams_list})
 
 # Create a DataFrame from the collected data
 community_table = pd.DataFrame(data)
@@ -271,17 +265,16 @@ display(community_table)
 
 # COMMAND ----------
 
-import pandas as pd #For reading dataset files
-import networkx as nx #For network creation/analysis
+import pandas as pd  # For reading dataset files
+import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
-import community as community_louvain
-import matplotlib.pyplot as plt #For plotting graphs
-import igraph as ig
-import random
+import matplotlib.pyplot as plt  # For plotting graphs
+
 
 # Function to generate a random color in hex format
 def generate_random_color():
     return f"#{random.randint(0, 0xFFFFFF):06x}"
+
 
 # Generate random colors dynamically for communities
 def generate_colors_for_communities(community_count):
@@ -344,13 +337,10 @@ plt.show()
 
 # COMMAND ----------
 
-import pandas as pd #For reading dataset files
-import networkx as nx #For network creation/analysis
+import pandas as pd  # For reading dataset files
+import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
-import community as community_louvain
-import matplotlib.pyplot as plt #For plotting graphs
-import igraph as ig
-import random
+import matplotlib.pyplot as plt  # For plotting graphs
 
 # Create an undirected graph from the pandas edgelist
 G_undirected = nx.from_pandas_edgelist(edges, source='from', target='to', edge_attr=True)
@@ -374,17 +364,16 @@ display(community_df)
 
 # COMMAND ----------
 
-import pandas as pd #For reading dataset files
-import networkx as nx #For network creation/analysis
+import pandas as pd  # For reading dataset files
+import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
-import community as community_louvain
-import matplotlib.pyplot as plt #For plotting graphs
-import igraph as ig
-import random
+import matplotlib.pyplot as plt  # For plotting graphs
+
 
 # Function to generate a random color in hex format
 def generate_random_color():
     return f"#{random.randint(0, 0xFFFFFF):06x}"
+
 
 # Create an undirected graph from the pandas edgelist
 G_undirected = nx.from_pandas_edgelist(edges, source='from', target='to', edge_attr=True)
@@ -414,17 +403,15 @@ for counter, community_nodes in enumerate(lst_m):
 nx.draw_networkx_edges(G_undirected, pos, alpha=0.5, edge_color="gray")
 
 # Draw nodes with assigned colors
-nx.draw_networkx_nodes(
-    G_undirected, pos,
-    node_color=list(color_map_b.values()),
-    node_size=800  # Adjust size as needed
-)
+nx.draw_networkx_nodes(G_undirected, pos, node_color=list(color_map_b.values()), node_size=800)  # Adjust size as needed
 
 # Add labels to the nodes
 nx.draw_networkx_labels(G_undirected, pos, font_size=10, font_color="black")
 
 # Extract edge weights to display them as labels
-edge_labels = nx.get_edge_attributes(G_undirected, 'weight')  # Replace 'weight' with the actual attribute name if different
+edge_labels = nx.get_edge_attributes(
+    G_undirected, 'weight'
+)  # Replace 'weight' with the actual attribute name if different
 nx.draw_networkx_edge_labels(G_undirected, pos, edge_labels=edge_labels, font_size=8)
 
 # Remove axes for a cleaner visualization
@@ -447,14 +434,9 @@ plt.show()
 import pandas as pd  # For reading dataset files
 import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
-import community as community_louvain
 import matplotlib.pyplot as plt  # For plotting graphs
-import igraph as ig
-import random
 
-G_undirected = nx.from_pandas_edgelist(
-    edges, source="from", target="to", edge_attr=True
-)
+G_undirected = nx.from_pandas_edgelist(edges, source="from", target="to", edge_attr=True)
 
 # Use Louvain community detection algorithm to find communities
 lst_m = community_louvain.best_partition(G_undirected)
@@ -482,17 +464,17 @@ display(df_clusters)
 
 # COMMAND ----------
 
-import pandas as pd #For reading dataset files
-import networkx as nx #For network creation/analysis
+import pandas as pd  # For reading dataset files
+import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
 import community as community_louvain
-import matplotlib.pyplot as plt #For plotting graphs
-import igraph as ig
-import random
+import matplotlib.pyplot as plt  # For plotting graphs
+
 
 # Function to generate a random color in hex format
 def generate_random_color():
     return f"#{random.randint(0, 0xFFFFFF):06x}"
+
 
 # Create a figure with a larger size for better visualization
 plt.figure(figsize=(50, 50))
@@ -521,17 +503,15 @@ for node, community in lst_m.items():
 nx.draw_networkx_edges(G_undirected, pos, alpha=0.6, edge_color="gray")
 
 # Draw nodes of the graph with assigned colors
-nx.draw_networkx_nodes(
-    G_undirected, pos, 
-    node_color=list(color_map_b.values()), 
-    node_size=500
-)
+nx.draw_networkx_nodes(G_undirected, pos, node_color=list(color_map_b.values()), node_size=500)
 
 # Add labels to the nodes
 nx.draw_networkx_labels(G_undirected, pos, font_size=10, font_color="black")
 
 # Extract edge weights to display them as labels
-edge_labels = nx.get_edge_attributes(G_undirected, 'weight')  # Replace 'weight' with the actual edge attribute name if different
+edge_labels = nx.get_edge_attributes(
+    G_undirected, 'weight'
+)  # Replace 'weight' with the actual edge attribute name if different
 nx.draw_networkx_edge_labels(G_undirected, pos, edge_labels=edge_labels, font_size=8)
 
 # Remove axes for a cleaner visualization
@@ -551,30 +531,30 @@ plt.show()
 
 # COMMAND ----------
 
-import pandas as pd #For reading dataset files
-import networkx as nx #For network creation/analysis
+import pandas as pd  # For reading dataset files
+import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
 import community as community_louvain
-import matplotlib.pyplot as plt #For plotting graphs
-import igraph as ig
-import random
+import matplotlib.pyplot as plt  # For plotting graphs
 
 
-G = nx.from_pandas_edgelist(edges, source='from', target='to',edge_attr=True, create_using=nx.DiGraph())
+G = nx.from_pandas_edgelist(edges, source='from', target='to', edge_attr=True, create_using=nx.DiGraph())
 g = ig.Graph.TupleList(G.edges(), directed=False)
-wtrap = g.community_walktrap(steps = 20)
+wtrap = g.community_walktrap(steps=20)
 clust = wtrap.as_clustering()
 max(set(clust.membership)) + 1
 
+
 def find_community(step):
-    wtrap = g.community_walktrap(steps = step)
+    wtrap = g.community_walktrap(steps=step)
     clust = wtrap.as_clustering()
     return max(set(clust.membership)) + 1
 
-for step in range(1,20):
-        print ("############# Step Test : %d ################" % step)
-        rst_com = find_community(step)
-        print ("Count of Community being found：%d" % rst_com)
+
+for step in range(1, 20):
+    print("############# Step Test : %d ################" % step)
+    rst_com = find_community(step)
+    print("Count of Community being found：%d" % rst_com)
 
 # COMMAND ----------
 
@@ -588,13 +568,12 @@ step = 10  # Number of steps
 # COMMAND ----------
 
 # DBTITLE 1,Tabular output for Walktrap
-import pandas as pd #For reading dataset files
-import networkx as nx #For network creation/analysis
+import pandas as pd  # For reading dataset files
+import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
 import community as community_louvain
-import matplotlib.pyplot as plt #For plotting graphs
+import matplotlib.pyplot as plt  # For plotting graphs
 import igraph as ig
-import random
 
 # Extract clusters from the walktrap result
 wtrap = g.community_walktrap(steps=step)
@@ -620,7 +599,7 @@ cluster_df = pd.DataFrame(
         (community_id, ', '.join(map(str, nodes)), len(nodes))  # Add the length of nodes for stream count
         for community_id, nodes in cluster_dict.items()
     ],
-    columns=["Community_ID", "Nodes", "Stream_Count"]  # Include 'Stream_Count' column
+    columns=["Community_ID", "Nodes", "Stream_Count"],  # Include 'Stream_Count' column
 )
 # Convert to JSON if needed
 cluster_json = cluster_dict  # You can save this to a JSON file if required
@@ -662,7 +641,7 @@ plot = ig.plot(
     mark_groups=True,
     bbox=(5000, 5000),
     vertex_label=g.vs['label'],  # Node labels
-    edge_label=g.es['label'],    # Edge weights as labels
+    edge_label=g.es['label'],  # Edge weights as labels
     vertex_size=50,
     edge_width=[max(1, w) for w in g.es['weight']],
 )
@@ -678,21 +657,22 @@ plot.save('/Volumes/odp_adb_ctdb_testing_catalog/testing/lh_metadata_files/SVGS/
 # COMMAND ----------
 
 # DBTITLE 1,k_clique_communities
-import pandas as pd #For reading dataset files
-import networkx as nx #For network creation/analysis
+import pandas as pd  # For reading dataset files
+import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
 import community as community_louvain
-import matplotlib.pyplot as plt #For plotting graphs
+import matplotlib.pyplot as plt  # For plotting graphs
 import igraph as ig
-import random
 
-def find_community(graph,k):
-    return list(community.k_clique_communities(graph,k))
 
-for k in range(2,10):
-        print ("############# k-Clique: %d ################" % k)
-        rst_com = find_community(G_undirected,k)
-        print ("Count of Community being found：%d" % len(rst_com))
+def find_community(graph, k):
+    return list(community.k_clique_communities(graph, k))
+
+
+for k in range(2, 10):
+    print("############# k-Clique: %d ################" % k)
+    rst_com = find_community(G_undirected, k)
+    print("Count of Community being found：%d" % len(rst_com))
 
 # COMMAND ----------
 
@@ -707,13 +687,12 @@ k = 14  # Number of cliques
 # COMMAND ----------
 
 # DBTITLE 1,Graph output for k_clique_communities
-import pandas as pd #For reading dataset files
-import networkx as nx #For network creation/analysis
+import pandas as pd  # For reading dataset files
+import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
 import community as community_louvain
-import matplotlib.pyplot as plt #For plotting graphs
+import matplotlib.pyplot as plt  # For plotting graphs
 import igraph as ig
-import random
 
 # Create a weighted graph from the edges DataFrame
 G_undirected = nx.from_pandas_edgelist(edges, source='from', target='to', edge_attr=True)
@@ -743,9 +722,7 @@ scaled_weights = [(5 * (w - min_weight) / (max_weight - min_weight) + 0.5) for w
 # Draw the graph
 plt.figure(figsize=(25, 20))
 nx.draw_networkx_edges(G_undirected, pos, width=scaled_weights, alpha=0.7, edge_color="gray")
-nx.draw_networkx_nodes(G_undirected, pos, 
-                       node_color=list(color_map_b.values()), 
-                       node_size=600, edgecolors="black")
+nx.draw_networkx_nodes(G_undirected, pos, node_color=list(color_map_b.values()), node_size=600, edgecolors="black")
 nx.draw_networkx_labels(G_undirected, pos, font_size=10, font_color="black")
 
 edge_labels = nx.get_edge_attributes(G_undirected, "weight")
@@ -773,7 +750,7 @@ plt.show()
 # Initialize a dictionary to store community details
 community_details = []
 # k = 14
-#13, 14 some what even distribution but communities are less 5,6
+# 13, 14 some what even distribution but communities are less 5,6
 lst_m = community.k_clique_communities(G_undirected, k)
 
 # Iterate over the communities
@@ -781,9 +758,9 @@ for idx, comnty in enumerate(lst_m):
     community_name = f"Community {idx + 1}"  # Name the community
     stream_count = len(comnty)  # Count nodes in the community
     streams = ", ".join(comnty)  # Join node names (streams) as a single string
-    community_details.append({"Community": community_name, 
-                              "Stream Count": stream_count, 
-                              "Streams": streams})  # Add all details to the list
+    community_details.append(
+        {"Community": community_name, "Stream Count": stream_count, "Streams": streams}
+    )  # Add all details to the list
 
 # Convert the list of dictionaries to a DataFrame
 community_df = pd.DataFrame(community_details)
