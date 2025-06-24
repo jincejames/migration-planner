@@ -51,7 +51,6 @@ include = ["src"]
 dependencies = [
   "black~=24.3.0",
   "coverage[toml]~=7.4.4",
-  "databricks-labs-pylint~=0.5",
   "mypy~=1.9.0",
   "pylint~=3.3.1",
   "pylint-pytest==2.0.0a0",
@@ -116,7 +115,7 @@ branch = true
 parallel = true
 
 [tool.coverage.report]
-#omit = ["*/working-copy/*", 'src/databricks/labs/dqx/__main__.py']
+#omit = ["*/working-copy/*", 'src/databricks/labs/xyz/__main__.py']
 #exclude_lines = [
 #    "no cov",
 #    "if __name__ == .__main__.:",
@@ -188,7 +187,6 @@ limit-inference-results = 100
 # List of plugins (as comma separated values of python module names) to load,
 # usually to register additional checkers.
 load-plugins = [
-    "databricks.labs.pylint.all",
     "pylint_pytest",
     "pylint.extensions.bad_builtin",
     "pylint.extensions.broad_try_clause",
