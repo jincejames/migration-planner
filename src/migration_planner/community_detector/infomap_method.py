@@ -126,19 +126,23 @@ duplicate_tables.groupBy("table_name1", "db_name1").count().display()
 # duplicate_tables.display(False)
 
 # There are tables with same table name, are the DDLs same for duplicates? Are they 2 different instances? or same?
-# RESULT -> If they are present in 2 different DBs, they should be also different table instances. This needs to be confirmed again. Send non archive examples to Michael
+# RESULT -> If they are present in 2 different DBs, they should be also different table instances. 
 
 # COMMAND ----------
 
 # DBTITLE 1,Filtering Transactional Tables
-dependency_without_transactional_df = dependency_df.filter(~col('table_type').contains('Trns')).select(
-    'stream_name', col('DB_Table_Name').alias('table_name'), 'table_type'
-).distinct()
+dependency_without_transactional_df = (
+    dependency_df.filter(~col('table_type').contains('Trns'))
+    .select('stream_name', col('DB_Table_Name').alias('table_name'), 'table_type')
+    .distinct()
+)
 
 
 # Self join to find dependencies and filter intra stream dependency
-filtered_self_join_result = dependency_without_transactional_df.alias("df1").join(dependency_without_transactional_df.alias("df2"), col("df1.table_name") == col("df2.table_name")).filter(
-    col("df1.stream_name") != col("df2.stream_name")
+filtered_self_join_result = (
+    dependency_without_transactional_df.alias("df1")
+    .join(dependency_without_transactional_df.alias("df2"), col("df1.table_name") == col("df2.table_name"))
+    .filter(col("df1.stream_name") != col("df2.stream_name"))
 )
 
 display(filtered_self_join_result)
@@ -208,11 +212,78 @@ stream_stream_dependency_df.count()
 
 # COMMAND ----------
 
-# DBTITLE 1,Analysis: Src Streams for INT_IDM_INVENTORY Stream. To Verify Correctness
-display(stream_stream_dependency_df.filter((col("to") == "INT_IDM_INVENTORY")).sort("from"))
+# Group by 'from' and 'to', count occurrences, and compute weights
+weighted_stream_stream_dependency_df = stream_stream_dependency_df.groupBy('from', 'to').count().select('from', 'to', col('count').alias('weight'))
+display(weighted_stream_stream_dependency_df)
 
-# ToDo: Check if the below input streams for INT_IDM_INVENTORY is correct
-# Todo: Share the results with Micheal to verify
+#<ToDo> Add table size into weight calculation
+
+#<ToDo> CLarify why ARCHIVE is used as a source stream (read that is read from) / which usecases use this? -> This should be only archive to archive. Check if there are any other instances. This also could be the case some cleanup is happening.
+
+# RESULT: There are duplicated archivals
+
+# COMMAND ----------
+
+# DBTITLE 1,Merge bidirectional dependencies with summed weights
+from pyspark.sql.functions import when, array, sort_array
+
+# Step 1: Identify bidirectional pairs and sum their weights, keeping only one direction
+bidirectional_merged = (
+    weighted_stream_stream_dependency_df.alias("forward")
+    .join(
+        weighted_stream_stream_dependency_df.alias("backward"),
+        (col("forward.from") == col("backward.to")) & 
+        (col("forward.to") == col("backward.from"))
+    )
+    .select(
+        # If forward.weight > backward.weight, use forward.from/to, else use backward.from/to
+        when(col("forward.weight") > col("backward.weight"), col("forward.from"))
+            .otherwise(col("backward.from")).alias("streamA"),
+        when(col("forward.weight") > col("backward.weight"), col("forward.to"))
+            .otherwise(col("backward.to")).alias("streamB"),
+        (col("forward.weight") + col("backward.weight")).alias("weight"),
+        sort_array(array(col("forward.from"), col("forward.to"))).alias("pair_key")
+    )
+    .dropDuplicates(["pair_key"])  # Only keep one row per bidirectional pair
+    .select("streamA", "streamB", "weight")
+)
+
+print(f"Bidirectional pairs (merged): {bidirectional_merged.count()}")
+
+# Step 2: Identify unidirectional relationships (no reverse edge exists)
+unidirectional = (
+    weighted_stream_stream_dependency_df.alias("forward")
+    .join(
+        weighted_stream_stream_dependency_df.alias("backward"),
+        (col("forward.from") == col("backward.to")) & 
+        (col("forward.to") == col("backward.from")),
+        "left_anti"  # Keep only rows from forward that don't have a match in backward
+    )
+    .select(
+        col("forward.from").alias("streamA"),
+        col("forward.to").alias("streamB"),
+        col("forward.weight").alias("weight")
+    )
+)
+
+print(f"Unidirectional relationships: {unidirectional.count()}")
+
+# Step 3: Combine bidirectional (merged) and unidirectional
+merged_dependency_df = bidirectional_merged.union(unidirectional)
+
+print(f"\nTotal edges after merging: {merged_dependency_df.count()}")
+print(f"Original edges: {weighted_stream_stream_dependency_df.count()}")
+print(f"Reduction: {weighted_stream_stream_dependency_df.count() - merged_dependency_df.count()} edges")
+
+display(merged_dependency_df.orderBy("streamA", "streamB"))
+
+# COMMAND ----------
+
+# DBTITLE 1,Analysis: Src Streams for INT_IDM_INVENTORY Stream. To Verify Correctness
+# display(stream_stream_dependency_df.filter((col("to") == "INT_IDM_INVENTORY")).sort("from"))
+
+display(merged_dependency_df.filter((col("streamA") == "INT_IDM_REF_PRODUCT_COSMA")|(col("streamB") == "INT_IDM_REF_PRODUCT_COSMA")).sort("streamA","streamB"))
+# Result -> Verified with Micheal for 2 streams.
 
 # COMMAND ----------
 
@@ -231,44 +302,28 @@ display(stream_stream_dependency_df.filter((col("to") == "INT_IDM_INVENTORY") & 
 
 # COMMAND ----------
 
-# Group by 'from' and 'to', count occurrences, and compute weights
-weighted_stream_stream_dependency_df = stream_stream_dependency_df.groupBy('from', 'to').count().select('from', 'to', col('count').alias('weight'))
-display(weighted_stream_stream_dependency_df)
-
-#<ToDo> Add table size into weight calculation
-
-#<ToDo> CLarify why ARCHIVE is used as a source stream (read that is read from) / which usecases use this? -> This should be only archive to archive. Check if there are any other instances. This also could be the case some cleanup is happening.
-
-# RESULT: There are duplicated archivals
-
-# COMMAND ----------
-
 # DBTITLE 1,Analysis: Total number of stream to stream connections
-weighted_stream_stream_dependency_df.display()
+merged_dependency_df.filter(col("weight")<=3).count()
 
-# COMMAND ----------
-
-# DBTITLE 1,Analysis: Total number of stream to stream connections
-weighted_stream_stream_dependency_df.filter(col("weight")<=3).count()
-
-# Total number of connecttions = 4293
-# Stream - stream dependecies where weight <= 3, aka only 3 or less tables has connection between 2 streams = 3379
-# ~79% stream - stream connections are loosely coupled
+# Total number of connecttions = 3800
+# Stream - stream dependecies where weight <= 3, aka only 3 or less tables has connection between 2 streams = 2861
+# ~75% stream - stream connections are loosely coupled
 
 
 # COMMAND ----------
 
 # Only use for small data!
-edges_df = weighted_stream_stream_dependency_df.toPandas()
+edges_df = merged_dependency_df.toPandas()
 edges_df.to_csv("/Volumes/users/jince_james/lufthansa/community_detection/edges.csv", index=False)
 
 # COMMAND ----------
 
 # Aggregate weights if necessary (depends on whether the grouping already handles this)
-edges = edges_df.groupby(['from', 'to'])['weight'].sum().reset_index()
+edges = edges_df.groupby(['streamA', 'streamB'])['weight'].sum().reset_index()
 
 # Build the directed graph
-G_directed = nx.from_pandas_edgelist(edges, source='from', target='to', edge_attr=True, create_using=nx.DiGraph())
+# <TODO> Not valid anymore, since the edges have been merged where there are bidirectional dependencies
+G_directed = nx.from_pandas_edgelist(edges, source='streamA', target='streamB', edge_attr=True, create_using=nx.DiGraph())
 
 # COMMAND ----------
 
