@@ -19,19 +19,23 @@ import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
 import matplotlib.pyplot as plt  # For plotting graphs
 import igraph as ig
+import leidenalg as la
 import random
 from datetime import datetime
+import os
+import numpy as np
 
 %matplotlib inline
 from networkx.algorithms.centrality import degree_centrality
 from sklearn.preprocessing import MinMaxScaler
-import numpy as np
 from scipy.cluster.hierarchy import dendrogram, linkage
 from netgraph import Graph
 from infomap import Infomap
 from pyspark.sql.functions import col, lit, when
 from sklearn.metrics import adjusted_rand_score
 from collections import Counter
+
+
 
 # COMMAND ----------
 
@@ -332,13 +336,8 @@ edges = edges_df.groupby(['streamA', 'streamB'])['weight'].sum().reset_index()
 
 # COMMAND ----------
 
-import numpy as np
-import pandas as pd
-import igraph as ig
-import leidenalg as la
-from sklearn.metrics import adjusted_rand_score
 
-# Build an undirected weighted igraph graph from your edge list
+# Build an undirected weighted igraph graph from the edge list
 # edges is a pandas DataFrame with columns:
 #   - streamA: source node label (string/int)
 #   - streamB: target node label (string/int)
@@ -354,14 +353,20 @@ g = ig.Graph.TupleList(
     edge_attrs=["weight"]
 )
 
-# Quick sanity summary (number of vertices/edges, etc.)
+# Also build a NetworkX graph for plotting (separate from igraph/Leiden)
+G = nx.from_pandas_edgelist(
+    edges, "streamA", "streamB",
+    edge_attr="weight",
+    create_using=nx.Graph()
+)
+
+# Quick sanity summary check
 print(g.summary())
+print(f"NetworkX graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
 
-# ------------------------------------------------------------
-# 2) Run Leiden using the RBConfiguration objective at a fixed resolution (gamma)
-# ------------------------------------------------------------
-def run_leiden_rb(g, resolution, seed, weights="weight", n_iterations=10):
+#Run Leiden using the RBConfiguration objective at a fixed resolution (gamma)
+def run_leiden_rb(g, resolution, seed, weights="weight", n_iterations=100):
     """
     Run Leiden community detection on graph g using the RBConfiguration objective.
 
@@ -389,7 +394,7 @@ def run_leiden_rb(g, resolution, seed, weights="weight", n_iterations=10):
 
     # find_partition runs Leiden optimization for the chosen partition type/objective.
     # RBConfigurationVertexPartition = modularity-like objective with a resolution parameter.
-    # seed=... is crucial: it ensures runs differ across seeds (true stability check).
+    # seed=... is crucial: it ensures runs start from different random initializations across seeds.
     part = la.find_partition(
         g,
         la.RBConfigurationVertexPartition,
@@ -402,8 +407,7 @@ def run_leiden_rb(g, resolution, seed, weights="weight", n_iterations=10):
     # part.membership is a list of length |V|, giving cluster id for each vertex
     membership = np.array(part.membership, dtype=int)
 
-    # Compute community sizes by counting how many nodes got each community label
-    # (np.bincount assumes labels are 0..K-1)
+    # Compute community sizes by counting how many nodes each community label got
     counts = np.bincount(membership)
 
     # Sort community sizes descending (largest community first)
@@ -431,9 +435,7 @@ def run_leiden_rb(g, resolution, seed, weights="weight", n_iterations=10):
     }
 
 
-# ------------------------------------------------------------
-# 3) Stability metric: average pairwise Adjusted Rand Index (ARI)
-# ------------------------------------------------------------
+# Stability metric: average pairwise Adjusted Rand Index (ARI)
 def stability_ari(memberships):
     """
     Compute average pairwise Adjusted Rand Index (ARI) across partitions.
@@ -441,7 +443,6 @@ def stability_ari(memberships):
     ARI compares two partitions of the same nodes:
       - 1.0: identical clustering
       - ~0: no better than random agreement
-      - <0: worse than random (possible, uncommon)
 
     Here we average ARI over all pairs of runs for a given resolution.
     """
@@ -456,14 +457,28 @@ def stability_ari(memberships):
     return float(np.mean(aris)) if aris else 1.0
 
 
-# ------------------------------------------------------------
-# 4) Scan over resolutions (gamma) and many random seeds per resolution
-# ------------------------------------------------------------
-# Resolution grid: controls granularity (higher -> more communities)
+# Helper to map igraph membership -> (stream -> community)
+# igraph vertex "name" will be the original labels from TupleList
+igraph_names = np.array(g.vs["name"])
+
+def membership_to_leiden_df(membership):
+    return pd.DataFrame({
+        "stream": igraph_names,
+        "community": membership
+    })
+
+
+#Scan over resolutions (gamma) and many random seeds per resolution
+#Resolution grid: controls granularity (higher -> more communities)
 resolutions = [0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0, 1.2, 1.5, 1.8, 2.2, 2.6, 3.0]
 
-# Multiple random restarts at each resolution to test robustness
+#Multiple random restarts at each resolution to test robustness
 seeds = [1, 7, 43, 99, 123, 11, 28, 37, 45, 672, 42, 10, 100, 178, 2, 3, 5]
+
+# Store one representative run per resolution (so plotting does not re-run Leiden)
+# If ARI==1.0 at a resolution, any seed is equivalent; otherwise this still gives a consistent choice.
+plot_seed = 42
+rep_by_res = {}  # resolution -> dict returned by run_leiden_rb (includes membership, quality, etc.)
 
 rows = []
 for res in resolutions:
@@ -498,12 +513,19 @@ for res in resolutions:
         "stability_ari": stability_ari(memberships),
     })
 
+    # Keep a representative partition for plotting later (no re-run)
+    rep = next((r for r in runs if r["seed"] == plot_seed), runs[0])
+    rep_by_res[res] = rep
+
+
 summary = pd.DataFrame(rows)
 
-# Summary table 
+# Summary table
 summary = summary.sort_values("resolution").reset_index(drop=True)
+
 # Final summary table
 summary
+
 
 
 # COMMAND ----------
@@ -638,257 +660,426 @@ summary
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC **Plotting the bigger clustered graph for the chosen resolutions where each node is colored in the color of the community it has been clustered into. 
+# MAGIC Results are saved under ./leiden_plots**
+
+# COMMAND ----------
+
 import os
 import numpy as np
 import pandas as pd
-import igraph as ig
-import leidenalg as la
 import networkx as nx
 import matplotlib.pyplot as plt
 
-# ------------------------------------------------------------
-# Assumptions:
-# - edges: pandas df with columns ["streamA", "streamB", "weight"]
-# - summary: pandas df with columns:
-#     ["resolution", "largest_comm_share_avg", "stability_ari", ...]
-# ------------------------------------------------------------
 
-# ----------------------------
-# 1) Build graphs (igraph for Leiden, networkx for plotting)
-# ----------------------------
-g = ig.Graph.TupleList(
-    edges[["streamA", "streamB", "weight"]].itertuples(index=False, name=None),
-    directed=False,
-    edge_attrs=["weight"]
-)
-
-G = nx.from_pandas_edgelist(
-    edges, "streamA", "streamB",
-    edge_attr="weight",
-    create_using=nx.Graph()
-)
-
-print(g.summary())
-print(f"NetworkX graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-
-# ----------------------------
-# 2) Leiden runner (RBConfiguration)
-# ----------------------------
-def run_leiden_rb_membership(g, resolution, seed=42, weights="weight", n_iterations=10):
+def select_resolutions(
+    summary: pd.DataFrame,
+    ari_target: float = 1.0,
+    max_largest_comm_share: float = 0.50,
+    sort_by: str = "resolution",
+):
     """
-    Returns:
-      - membership array of length |V| with community id per vertex
-      - part object (optional use: quality, etc.)
+    Select resolutions from the summary table using simple filters.
+
+    Parameters
+    ----------
+    summary : pd.DataFrame
+    ari_target : float
+        Keep resolutions whose stability_ari equals this value (default 1.0).
+    max_largest_comm_share : float
+        Keep resolutions with average largest community share <= this threshold (default 0.50).
+    sort_by : str
+        Column to sort the result by (default "resolution").
+
+    Returns
+    -------
+    selected : pd.DataFrame
+        Filtered summary.
+    selected_resolutions : list[float]
+        Resolution values to plot.
     """
-    part = la.find_partition(
-        g,
-        la.RBConfigurationVertexPartition,
-        weights=weights,
-        resolution_parameter=resolution,
-        n_iterations=n_iterations,
-        seed=seed,
-    )
-    membership = np.array(part.membership, dtype=int)
-    return membership, part
+    selected = summary[
+        (summary["stability_ari"] == ari_target) &
+        (summary["largest_comm_share_avg"] <= max_largest_comm_share)
+    ].sort_values(sort_by)
 
-# ----------------------------
-# 3) Select resolutions: ARI == 1.0 and largest blob <= 50%
-# ----------------------------
-selected = summary[
-    (summary["stability_ari"] == 1.0) &
-    (summary["largest_comm_share_avg"] <= 0.50)
-].sort_values("resolution")
+    selected_resolutions = selected["resolution"].tolist()
+    return selected, selected_resolutions
 
-selected_resolutions = selected["resolution"].tolist()
-print("Selected resolutions:", selected_resolutions)
-print(selected[["resolution", "largest_comm_share_avg", "stability_ari", "n_communities_avg"]])
 
-# ----------------------------
-# 4) Precompute a single layout once (so plots are comparable)
-# ----------------------------
-# Note: for dense graphs, try k=0.15 or 0.2. For sparse, leave k=None.
-pos = nx.spring_layout(G, seed=42, k=0.15)
+def precompute_layout(
+    G: nx.Graph,
+    seed: int = 42,
+    k=None,
+):
+    """
+    Precompute a single spring layout (so plots are comparable).
 
-# ----------------------------
-# 5) Precompute edge styling once (weight -> width/alpha)
-# ----------------------------
-w = np.array([G[u][v].get("weight", 1.0) for u, v in G.edges()], dtype=float)
+    Parameters
+    ----------
+    G : nx.Graph
+        Graph to layout.
+    seed : int
+        Random seed for deterministic layout.
+    k : float or None
+        Spring layout distance parameter. None uses NetworkX default.
 
-# Avoid divide-by-zero if all weights equal
-w_min, w_max = float(w.min()), float(w.max())
-den = (w_max - w_min) if (w_max - w_min) > 0 else 1.0
+    Returns
+    -------
+    pos : dict
+        Node -> (x, y) layout positions.
+    """
+    pos = nx.spring_layout(G, seed=seed, k=k)
+    return pos
 
-edge_widths = 0.2 + 3.0 * (w - w_min) / den          # ~0.2 .. 3.2
-edge_alphas = 0.05 + 0.45 * (w - w_min) / den        # ~0.05 .. 0.5
 
-# ----------------------------
-# 6) Helper to map igraph membership -> (stream -> community)
-# ----------------------------
-# igraph vertex "name" will be the original labels from TupleList
-igraph_names = np.array(g.vs["name"])
-name_to_comm = None  # per resolution
+def precompute_edge_style(
+    G: nx.Graph,
+    weight_attr: str = "weight",
+    width_min: float = 0.2,
+    width_scale: float = 3.0,
+    alpha_min: float = 0.05,
+    alpha_scale: float = 0.45,
+):
+    """
+    Precompute edge widths and alphas from edge weights.
 
-def membership_to_leiden_df(membership):
-    return pd.DataFrame({
-        "stream": igraph_names,
-        "community": membership
-    })
+    Parameters
+    ----------
+    G : nx.Graph
+        Graph whose edges will be styled.
+    weight_attr : str
+        Edge attribute name to use as weights.
+    width_min, width_scale : float
+        width = width_min + width_scale * normalized_weight
+    alpha_min, alpha_scale : float
+        alpha = alpha_min + alpha_scale * normalized_weight
 
-# ----------------------------
-# 7) Plot each selected resolution at high quality
-# ----------------------------
-outdir = "leiden_plots"
-os.makedirs(outdir, exist_ok=True)
+    Returns
+    -------
+    edge_widths : np.ndarray
+        Width per edge in the order of G.edges().
+    edge_alphas : np.ndarray
+        Alpha per edge in the order of G.edges().
+    """
+    w = np.array([G[u][v].get(weight_attr, 1.0) for u, v in G.edges()], dtype=float)
 
-# Large canvas + high DPI output for zooming
-FIGSIZE = (30, 24)      # inches (big)
-DPI = 300               # high-res
-LABEL_FONTSIZE = 6      # readable-ish; 380 nodes will still be dense
+    # Handle empty graph or single-weight graph safely
+    if w.size == 0:
+        return np.array([]), np.array([])
 
-for res in selected_resolutions:
-    membership, part = run_leiden_rb_membership(g, res, seed=42, n_iterations=10)
-    leiden_df = membership_to_leiden_df(membership)
+    w_min, w_max = float(w.min()), float(w.max())
+    den = (w_max - w_min) if (w_max - w_min) > 0 else 1.0
+    w_norm = (w - w_min) / den
 
-    # Map stream -> community
-    node_to_comm = dict(zip(leiden_df["stream"], leiden_df["community"]))
+    edge_widths = width_min + width_scale * w_norm
+    edge_alphas = alpha_min + alpha_scale * w_norm
+    return edge_widths, edge_alphas
 
-    # Color nodes by community id
-    node_colors = [node_to_comm.get(n, -1) for n in G.nodes()]
 
-    # Compute a few plot annotations
-    counts = np.bincount(membership)
-    n_comms = len(counts)
-    largest_share = counts.max() / g.vcount()
-    tiny_lt5 = int((counts < 5).sum())
-    quality = float(part.quality())
+def plot_leiden_resolutions(
+    G: nx.Graph,
+    g_igraph,
+    selected_resolutions,
+    rep_by_res: dict,
+    membership_to_leiden_df,
+    pos: dict = None,
+    edge_widths=None,
+    edge_alphas=None,
+    outdir: str = "leiden_plots",
+    figsize=(30, 24),
+    dpi: int = 300,
+    label_fontsize: int = 6,
+    node_size: int = 110,
+    cmap=plt.cm.tab20,
+    draw_labels: bool = True,
+    save: bool = True,
+    show: bool = True,
+):
+    """
+    Plot each selected resolution using stored memberships.
 
-    # --- Create figure ---
-    fig = plt.figure(figsize=FIGSIZE, dpi=DPI)
-    ax = plt.gca()
+    Parameters
+    ----------
+    G : nx.Graph
+        Graph to plot (NetworkX).
+    g_igraph : igraph.Graph
+        Graph used for Leiden (only used here for g_igraph.vcount()).
+    selected_resolutions : list
+        Resolutions to plot.
+    rep_by_res : dict
+        resolution -> dict containing at least: "membership", "quality", "seed"
+    membership_to_leiden_df : callable
+        Function that maps membership -> DataFrame with columns ["stream","community"]
+    pos : dict or None
+        Node positions. If None, will compute nx.spring_layout(G, seed=42).
+    edge_widths, edge_alphas : array-like or None
+        If None, will compute from weights with defaults.
+    outdir : str
+        Output directory for PNGs.
+    figsize, dpi, label_fontsize : plotting params
+    node_size, cmap : node styling
+    draw_labels : bool
+        Whether to draw node labels.
+    save, show : bool
+        Save figures and/or display them.
 
-    # Draw nodes
-    nx.draw_networkx_nodes(
-        G, pos,
-        node_color=node_colors,
-        node_size=110,
-        cmap=plt.cm.tab20,
-        linewidths=0.0,
-        ax=ax
-    )
+    Returns
+    -------
+    outputs : list[str]
+        Paths of saved files (may be empty if save=False).
+    """
+    if pos is None:
+        pos = nx.spring_layout(G, seed=42, k=None)
 
-    # Draw edges (per-edge alpha by looping)
-    for (u, v), lw, a in zip(G.edges(), edge_widths, edge_alphas):
-        nx.draw_networkx_edges(
+    if edge_widths is None or edge_alphas is None:
+        edge_widths, edge_alphas = precompute_edge_style(G)
+
+    os.makedirs(outdir, exist_ok=True)
+    outputs = []
+
+    for res in selected_resolutions:
+        rep = rep_by_res[res]
+        membership = rep["membership"]
+        quality = rep["quality"]
+
+        leiden_df = membership_to_leiden_df(membership)
+
+        # Map stream -> community
+        node_to_comm = dict(zip(leiden_df["stream"], leiden_df["community"]))
+
+        # Color nodes by community id
+        node_colors = [node_to_comm.get(n, -1) for n in G.nodes()]
+
+        # Compute a few plot annotations
+        counts = np.bincount(membership)
+        n_comms = len(counts)
+        largest_share = counts.max() / g_igraph.vcount()
+        tiny_lt5 = int((counts < 5).sum())
+
+        # --- Create figure ---
+        fig = plt.figure(figsize=figsize, dpi=dpi)
+        ax = plt.gca()
+
+        # Draw nodes
+        nx.draw_networkx_nodes(
             G, pos,
-            edgelist=[(u, v)],
-            width=float(lw),
-            alpha=float(a),
+            node_color=node_colors,
+            node_size=node_size,
+            cmap=cmap,
+            linewidths=0.0,
             ax=ax
         )
 
-    # Labels (will be crowded, but you requested zoomable readability)
-    nx.draw_networkx_labels(
-        G, pos,
-        font_size=LABEL_FONTSIZE,
-        ax=ax
-    )
+        # Draw edges (per-edge alpha by looping)
+        for (u, v), lw, a in zip(G.edges(), edge_widths, edge_alphas):
+            nx.draw_networkx_edges(
+                G, pos,
+                edgelist=[(u, v)],
+                width=float(lw),
+                alpha=float(a),
+                ax=ax
+            )
 
-    title = (
-        f"Leiden (RBConfiguration) — resolution γ={res}\n"
-        f"#comms={n_comms}, largest_comm_share={largest_share:.3f}, small_comms<5={tiny_lt5}, quality={quality:.2f}"
-    )
-    ax.set_title(title)
-    ax.axis("off")
+        # Labels
+        if draw_labels:
+            nx.draw_networkx_labels(
+                G, pos,
+                font_size=label_fontsize,
+                ax=ax
+            )
 
-    # Save and show
-    outfile = os.path.join(outdir, f"leiden_rb_gamma_{res}.png")
-    plt.savefig(outfile, bbox_inches="tight")
-    plt.show()
+        title = (
+            f"Leiden (RBConfiguration) — resolution γ={res} (seed={rep['seed']})\n"
+            f"#comms={n_comms}, largest_comm_share={largest_share:.3f}, "
+            f"small_comms<5={tiny_lt5}, quality={quality:.2f}"
+        )
+        ax.set_title(title)
+        ax.axis("off")
 
-    print(f"Saved: {outfile}")
+        if save:
+            outfile = os.path.join(outdir, f"leiden_rb_gamma_{res}.png")
+            plt.savefig(outfile, bbox_inches="tight")
+            outputs.append(outfile)
+
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        if save:
+            print(f"Saved: {outputs[-1]}")
+
+    return outputs
+
+
+# Example usage (matches your current flow):
+
+selected, selected_resolutions = select_resolutions(summary, ari_target=1.0, max_largest_comm_share=0.50)
+print("Selected resolutions:", selected_resolutions)
+print(selected[["resolution", "largest_comm_share_avg", "stability_ari", "n_communities_avg"]])
+
+pos = precompute_layout(G, seed=42, k=None)
+edge_widths, edge_alphas = precompute_edge_style(G)
+
+plot_leiden_resolutions(
+    G=G,
+    g_igraph=g,
+    selected_resolutions=selected_resolutions,
+    rep_by_res=rep_by_res,
+    membership_to_leiden_df=membership_to_leiden_df,
+    pos=pos,
+    edge_widths=edge_widths,
+    edge_alphas=edge_alphas,
+    outdir="leiden_plots",
+    figsize=(30, 24),
+    dpi=300,
+    label_fontsize=6,
+)
 
 
 # COMMAND ----------
 
-import numpy as np
-import networkx as nx
-import matplotlib.pyplot as plt
+# MAGIC %md
+# MAGIC **Plotting the subgraphs / clusters, by choosing the preferred resolution**
 
-# edges: pd.DataFrame with streamA, streamB, weight
-# leiden_df: pd.DataFrame with columns ["stream", "community"]
+# COMMAND ----------
 
-# --- Build full graph once
-G = nx.from_pandas_edgelist(
-    edges, "streamA", "streamB",
-    edge_attr="weight",
-    create_using=nx.Graph()
-)
 
-# NetworkX 3.x replacement for nx.info(G)
-print(f"Graph: |V|={G.number_of_nodes():,}, |E|={G.number_of_edges():,}")
 
-# --- Map node -> community
-node_to_comm = dict(zip(leiden_df["stream"], leiden_df["community"]))
+# Helper to build leiden_df from a stored membership array (no re-run)
+def membership_to_leiden_df(membership, igraph_names):
+    return pd.DataFrame({
+        "stream": np.array(igraph_names),
+        "community": np.array(membership, dtype=int),
+    })
 
-# Keep only nodes that actually have a community label
-labeled_nodes = [n for n in G.nodes() if n in node_to_comm]
 
-# Precompute a global layout ONCE so every community plot is comparable
-# (you can switch to a per-community layout if you prefer)
-pos_global = nx.spring_layout(G.subgraph(labeled_nodes), seed=42)
+# Choose which solution to visualize (from rep_by_res only; no Leiden re-run)
+def get_leiden_df(resolution, rep_by_res, igraph_names):
+    """
+    Get leiden_df for a chosen resolution from already-computed results (rep_by_res).
+    """
+    rep = rep_by_res[resolution]
+    leiden_df = membership_to_leiden_df(rep["membership"], igraph_names)
 
-# --- Helper: scale edge widths for a given graph
-def edge_style(subG, min_w=0.2, max_w=3.2):
+    meta = {
+        "resolution": float(rep.get("resolution", resolution)),
+        "seed": int(rep["seed"]),
+        "quality": float(rep.get("quality", np.nan)),
+    }
+    return leiden_df, meta
+
+
+# Helper: scale edge widths/alphas for a given graph
+def edge_style(subG, weight_attr="weight", min_w=0.2, max_w=3.2):
     if subG.number_of_edges() == 0:
         return [], []
-    w = np.array([subG[u][v].get("weight", 1.0) for u, v in subG.edges()], dtype=float)
+    w = np.array([subG[u][v].get(weight_attr, 1.0) for u, v in subG.edges()], dtype=float)
     w_min, w_max = float(w.min()), float(w.max())
     widths = min_w + (max_w - min_w) * (w - w_min) / (w_max - w_min + 1e-9)
     alphas = 0.10 + 0.60 * (w - w_min) / (w_max - w_min + 1e-9)
     return widths, alphas
 
-# --- Plot each community as its own induced subgraph
-communities = sorted(leiden_df["community"].unique())
 
-for c in communities:
-    # Nodes in this community
-    comm_nodes = [n for n in labeled_nodes if node_to_comm.get(n) == c]
+def plot_communities_induced_subgraphs(
+    G,
+    leiden_df,
+    outdir="leiden_community_plots",
+    layout_seed=42,
+    layout_k=None,
+    weight_attr="weight",
+    figsize=(24, 18),
+    dpi=220,
+    node_size=220,
+    font_size=8,
+    cmap=plt.cm.tab20,
+    show=True,
+    save=True,
+    filename_prefix="community",
+):
+    """
+    Plot each community as its induced subgraph (and optionally save each figure).
+    Uses an existing Leiden solution.
+    """
+    os.makedirs(outdir, exist_ok=True)
 
-    # Induced subgraph: only edges between nodes in the community
-    H = G.subgraph(comm_nodes).copy()
+    # Map node -> community
+    node_to_comm = dict(zip(leiden_df["stream"], leiden_df["community"]))
 
-    # If you also want to show isolated nodes (no internal edges), this will still plot them.
-    print(f"Community {c}: nodes={H.number_of_nodes()}, edges={H.number_of_edges()}")
+    # Keep only nodes that actually have a community label
+    labeled_nodes = [n for n in G.nodes() if n in node_to_comm]
 
-    # Use global positions (consistent across plots) but only keep positions for these nodes
-    pos = {n: pos_global[n] for n in H.nodes() if n in pos_global}
+    # Precompute a global layout ONCE so every community plot is comparable
+    pos_global = nx.spring_layout(G.subgraph(labeled_nodes), seed=layout_seed, k=layout_k)
 
-    # If a community has nodes not in pos (rare), fall back to a local layout
-    if len(pos) != H.number_of_nodes():
-        pos = nx.spring_layout(H, seed=42)
+    communities = sorted(leiden_df["community"].unique())
+    saved_files = []
 
-    widths, alphas = edge_style(H)
+    for c in communities:
+        # Nodes in this community
+        comm_nodes = [n for n in labeled_nodes if node_to_comm[n] == c]
 
-    # BIG + high DPI so you can zoom/read labels
-    plt.figure(figsize=(24, 18), dpi=220)
+        # Induced subgraph: only edges between nodes in the community
+        H = G.subgraph(comm_nodes).copy()
 
-    # Draw nodes
-    nx.draw_networkx_nodes(
-        H, pos,
-        node_size=220,
-        node_color=[c] * H.number_of_nodes(),  # single color per community (still uses cmap)
-        cmap=plt.cm.tab20
-    )
+        print(f"Community {c}: nodes={H.number_of_nodes()}, edges={H.number_of_edges()}")
 
-    # Draw edges with per-edge alpha
-    if H.number_of_edges() > 0:
+        # Use global positions (consistent across plots)
+        pos = {n: pos_global[n] for n in H.nodes()}
+
+        widths, alphas = edge_style(H, weight_attr=weight_attr)
+
+        plt.figure(figsize=figsize, dpi=dpi)
+
+        # Draw nodes
+        nx.draw_networkx_nodes(
+            H, pos,
+            node_size=node_size,
+            node_color=[c] * H.number_of_nodes(),
+            cmap=cmap
+        )
+
+        # Draw edges with per-edge alpha
         for (u, v), lw, a in zip(H.edges(), widths, alphas):
             nx.draw_networkx_edges(H, pos, edgelist=[(u, v)], width=float(lw), alpha=float(a))
 
-    # Labels (bigger than your full-graph version since this is smaller)
-    nx.draw_networkx_labels(H, pos, font_size=8)
+        # Labels
+        nx.draw_networkx_labels(H, pos, font_size=font_size)
 
-    plt.title(f"Community {c} — nodes={H.number_of_nodes()} edges={H.number_of_edges()}", fontsize=16)
-    plt.axis("off")
-    plt.tight_layout()
-    plt.show()
+        plt.title(f"Community {c} — nodes={H.number_of_nodes()} edges={H.number_of_edges()}", fontsize=16)
+        plt.axis("off")
+        plt.tight_layout()
+
+        if save:
+            outfile = os.path.join(outdir, f"{filename_prefix}_{c}.png")
+            plt.savefig(outfile, bbox_inches="tight")
+            saved_files.append(outfile)
+            print(f"Saved: {outfile}")
+
+        if show:
+            plt.show()
+        else:
+            plt.close()
+
+    return saved_files
+
+
+# Example usage
+
+resolution = 1.2
+leiden_df, meta = get_leiden_df(resolution, rep_by_res, igraph_names)
+print(meta)
+
+saved = plot_communities_induced_subgraphs(
+    G=G,
+    leiden_df=leiden_df,
+    outdir=f"leiden_community_plots_gamma_{resolution}",
+    layout_seed=42,
+    layout_k=None,
+    show=True,
+    save=True,
+    filename_prefix=f"gamma_{resolution}_comm"
+)
+print("Saved files:")
