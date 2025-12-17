@@ -44,9 +44,25 @@ current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 # COMMAND ----------
 
 dbutils.widgets.text(
-    "input_path",
-    "/Volumes/users/jince_james/lufthansa/community_detection/ETL-table-dependencies_20251201_1345.csv",
-    "Input CSV Path"
+    "volume_name",
+    "/Volumes/users/jince_james/lufthansa/community_detection/",
+    "Input Volume Path"
+)
+
+# COMMAND ----------
+
+dbutils.widgets.text(
+    "input_dependency_name",
+    "ETL-table-dependencies_20251201_1345.csv",
+    "Input CSV file name"
+)
+
+# COMMAND ----------
+
+dbutils.widgets.text(
+    "outofscope_stream_file_name",
+    "out-of-scopte-streams.csv",
+    "Out of scope streams file name"
 )
 
 # COMMAND ----------
@@ -56,22 +72,60 @@ dbutils.widgets.text(
 
 # COMMAND ----------
 
-input_path = dbutils.widgets.get("input_path")
+volume_path = dbutils.widgets.get("volume_name")
 
 # COMMAND ----------
 
-dependency_df = spark.read.format("csv").option("header", "true").load(input_path)
+input_path = volume_path + dbutils.widgets.get("input_dependency_name")
+
+# COMMAND ----------
+
+outofscope_stream_path = volume_path + dbutils.widgets.get("outofscope_stream_file_name")
+
+# COMMAND ----------
+
+# DBTITLE 1,Reading input stream - table dependency file
+dependency_df_full = spark.read.format("csv").option("header", "true").load(input_path)
+dependency_df_full.count()
+
+# COMMAND ----------
+
+# DBTITLE 1,Reading duplicates stream names
+outofscope_stream_names_df = spark.read.format("csv").option("header","true").load(outofscope_stream_path).select(col("stream_name"))
+outofscope_stream_names_rows_list = outofscope_stream_names_df.collect()
+outofscope_stream_names_list = [x['stream_name'] for x in outofscope_stream_names_rows_list]
+
+# COMMAND ----------
+
+print(outofscope_stream_names_list)
 
 # COMMAND ----------
 
 from pyspark.sql.functions import col, upper
 
-# Removing streams associated with acrchiving, GDPR and housekeeping
-dependency_df = dependency_df.filter(
+# Removing streams associated with acrchiving, GDPR, housekeeping and out of scope streams
+dependency_df_filtered = dependency_df_full.filter(
     ~upper(col("stream_name")).contains("ARCHIVE") & 
     ~upper(col("stream_name")).contains("GDPR") &
-    ~upper(col("stream_name")).contains("HOUSEKEEPING")
+    ~upper(col("stream_name")).contains("HOUSEKEEPING") &
+    ~upper(col("stream_name")).isin(outofscope_stream_names_list)
 )
+
+# COMMAND ----------
+
+dependency_df_filtered.count()
+
+# COMMAND ----------
+
+dependency_df_filtered.filter(upper(col('table_type')).contains("TGT")).count()
+
+# COMMAND ----------
+
+# DBTITLE 1,Considering all TGT tables as SRC
+# Considering all TGT tables as SRC as well due to a gap in ODAT output
+tgt_as_source = dependency_df_filtered.filter(upper(col('table_type')).contains("TGT")).replace({"TGT" : "SRC", "Tgt_Trns" : "Src_Trns"}, subset=["table_type"])
+dependency_df = dependency_df_filtered.union(tgt_as_source)
+dependency_df.count()
 
 # COMMAND ----------
 
@@ -83,7 +137,7 @@ display(dependency_df)
 print(f"Total number of records is {dependency_df.count()}")
 print(f"Total number of distinct records is {dependency_df.distinct().count()}")
 
-# There are no duplicate records in the input dataset
+# There are duplicate records in the input dataset
 
 # COMMAND ----------
 
@@ -93,7 +147,7 @@ print(f"Total number of distinct records is {dependency_df.distinct().count()}")
 # COMMAND ----------
 
 # DBTITLE 1,analysis: Check if there are any trns src or tgt tables part of non transactional DBs
-cleaned_dependency_df = dependency_df.select('stream_name', col('ref_object_name').alias('table_name'),col('ref_object_dbname').alias('db_name'), 'table_type')
+cleaned_dependency_df = dependency_df.distinct().select('stream_name', col('ref_object_name').alias('table_name'),col('ref_object_dbname').alias('db_name'), 'table_type')
 
 display(cleaned_dependency_df.filter(col('table_type').contains('Trns') & ~ col('db_name').contains('TRANS')))
 
@@ -165,7 +219,7 @@ display(non_filtered_self_join_result)
 # DBTITLE 1,analysis: See results count with transactional count dependencies
 non_filtered_self_join_result.count()
 
-# RESULT: There are ~120 inter stream dependencies more with transactional tables included. So we will use dataset without filtering
+# RESULT: There are ~100 inter stream dependencies more with transactional tables included. So we will use dataset without filtering
 # Result -> Except for archiving streams, this shouldn't be the case. Dig deeper. Send ex to micheal if there are outliers.
 
 # COMMAND ----------
@@ -201,6 +255,17 @@ display(stream_stream_dependency_df)
 
 # DBTITLE 1,Analysis: Stream-stream dependency count
 stream_stream_dependency_df.count()
+
+# COMMAND ----------
+
+# DBTITLE 1,Analysis: Number of distinct streams
+
+
+# Number of distinct streams in the dependency map
+total_distinct_streams = stream_stream_dependency_df.select("from").union(stream_stream_dependency_df.select("to")).distinct()
+
+display(total_distinct_streams)
+print(f"Total distinct streams (from + to): {total_distinct_streams.count()}")
 
 # COMMAND ----------
 
@@ -284,21 +349,11 @@ display(stream_stream_dependency_df.filter((col("to") == "INT_IDM_INVENTORY") & 
 
 # COMMAND ----------
 
-# output = output.union(depend_df)
-# # Show the output
-# result = output.groupBy('from','to').count().select('from','to',col('count').alias('weight'))
-# result1 = result.filter(col('from') != col('to'))
-# edges = result1.toPandas()
-# edges = edges.groupby(['from', 'to'])['weight'].sum().reset_index()
-# G_directed = nx.from_pandas_edgelist(edges, source='from', target='to',edge_attr=True, create_using=nx.DiGraph())
-
-# COMMAND ----------
-
 # DBTITLE 1,Analysis: Total number of stream to stream connections
 merged_dependency_df.filter(col("weight")<=3).count()
 
-# Total number of connecttions = 3800
-# Stream - stream dependecies where weight <= 3, aka only 3 or less tables has connection between 2 streams = 2861
+# Total number of connecttions = 3607
+# Stream - stream dependecies where weight <= 3, aka only 3 or less tables has connection between 2 streams = 2713
 # ~75% stream - stream connections are loosely coupled
 
 
@@ -306,7 +361,7 @@ merged_dependency_df.filter(col("weight")<=3).count()
 
 # Only use for small data!
 edges_df = merged_dependency_df.toPandas()
-edges_df.to_csv("/Volumes/users/jince_james/lufthansa/community_detection/edges.csv", index=False)
+edges_df.to_csv(f"{volume_path}edges.csv", index=False)
 
 # COMMAND ----------
 
@@ -649,7 +704,7 @@ summary
 # MAGIC
 # MAGIC ## Recommended next steps
 # MAGIC
-# MAGIC - Select a representative γ in the **0.5–1.0 range** for a single, defensible partition.
+# MAGIC - Select a representative γ in the **0.8–2 range** for a single, defensible partition.
 # MAGIC - PLotting
 # MAGIC
 
@@ -675,8 +730,8 @@ import matplotlib.pyplot as plt
 
 def select_resolutions(
     summary: pd.DataFrame,
-    ari_target: float = 1.0,
-    max_largest_comm_share: float = 0.50,
+    ari_target: float = 0.93,
+    max_largest_comm_share: float = 0.25,
     sort_by: str = "resolution",
 ):
     """
@@ -700,7 +755,7 @@ def select_resolutions(
         Resolution values to plot.
     """
     selected = summary[
-        (summary["stability_ari"] == ari_target) &
+        (summary["stability_ari"] >= ari_target) &
         (summary["largest_comm_share_avg"] <= max_largest_comm_share)
     ].sort_values(sort_by)
 
@@ -916,7 +971,7 @@ def plot_leiden_resolutions(
 
 # Example usage (matches your current flow):
 
-selected, selected_resolutions = select_resolutions(summary, ari_target=1.0, max_largest_comm_share=0.50)
+selected, selected_resolutions = select_resolutions(summary, ari_target=0.93, max_largest_comm_share=0.25)
 print("Selected resolutions:", selected_resolutions)
 print(selected[["resolution", "largest_comm_share_avg", "stability_ari", "n_communities_avg"]])
 
@@ -1068,7 +1123,7 @@ def plot_communities_induced_subgraphs(
 
 # Example usage
 
-resolution = 1.2
+resolution = 1.8
 leiden_df, meta = get_leiden_df(resolution, rep_by_res, igraph_names)
 print(meta)
 
