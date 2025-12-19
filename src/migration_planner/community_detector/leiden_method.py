@@ -5,11 +5,11 @@
 
 # COMMAND ----------
 
-!pip install python-igraph adjustText infomap netgraph networkx python-louvain igraph leidenalg
+# !pip install python-igraph adjustText infomap netgraph networkx python-louvain igraph leidenalg
 
 # COMMAND ----------
 
-dbutils.library.restartPython()
+# dbutils.library.restartPython()
 
 # COMMAND ----------
 
@@ -31,11 +31,10 @@ from sklearn.preprocessing import MinMaxScaler
 from scipy.cluster.hierarchy import dendrogram, linkage
 from netgraph import Graph
 from infomap import Infomap
-from pyspark.sql.functions import col, lit, when
+from pyspark.sql.functions import col, lit, when, upper, lower
 from sklearn.metrics import adjusted_rand_score
 from collections import Counter
-
-
+from pyspark.sql.functions import ceil, sum, when, array, sort_array
 
 # COMMAND ----------
 
@@ -45,7 +44,7 @@ current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 dbutils.widgets.text(
     "volume_name",
-    "/Volumes/users/jince_james/lufthansa/community_detection/",
+    "/Volumes/odp_adw_mvp_n/migration/utilities/community_detection/",
     "Input Volume Path"
 )
 
@@ -67,30 +66,40 @@ dbutils.widgets.text(
 
 # COMMAND ----------
 
+dbutils.widgets.text(
+    "report_dependency_file_name",
+    "stream_to_report_mapping.csv",
+    "report Dependency file name"
+)
+
+dbutils.widgets.text(
+    "table_size",
+    "table-space-in-gb_20251201_1352.csv",
+    "Table size file name"
+)
+
+# COMMAND ----------
+
+volume_path = dbutils.widgets.get("volume_name")
+dependency_input_path = volume_path + dbutils.widgets.get("input_dependency_name")
+outofscope_stream_path = volume_path + dbutils.widgets.get("outofscope_stream_file_name")
+report_dependency = volume_path + dbutils.widgets.get("report_dependency_file_name")
+table_size = volume_path + dbutils.widgets.get("table_size")
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Loading Datasets:
 
 # COMMAND ----------
 
-volume_path = dbutils.widgets.get("volume_name")
-
-# COMMAND ----------
-
-input_path = volume_path + dbutils.widgets.get("input_dependency_name")
-
-# COMMAND ----------
-
-outofscope_stream_path = volume_path + dbutils.widgets.get("outofscope_stream_file_name")
-
-# COMMAND ----------
-
 # DBTITLE 1,Reading input stream - table dependency file
-dependency_df_full = spark.read.format("csv").option("header", "true").load(input_path)
-dependency_df_full.count()
+dependency_df_full = spark.read.format("csv").option("header", "true").load(dependency_input_path)
+display(dependency_df_full)
 
 # COMMAND ----------
 
-# DBTITLE 1,Reading duplicates stream names
+# DBTITLE 1,Reading out of scope stream names
 outofscope_stream_names_df = spark.read.format("csv").option("header","true").load(outofscope_stream_path).select(col("stream_name"))
 outofscope_stream_names_rows_list = outofscope_stream_names_df.collect()
 outofscope_stream_names_list = [x['stream_name'] for x in outofscope_stream_names_rows_list]
@@ -101,7 +110,31 @@ print(outofscope_stream_names_list)
 
 # COMMAND ----------
 
-from pyspark.sql.functions import col, upper
+# DBTITLE 1,Reading report to table dependency
+# Read report to stream dependency and standardize values and column names
+# Each table is marked as a Src, since reports only create tables and do not write to tables (or only exceptions)
+# Filtering two reports wrt corona and gdpr, since they skew the community creation due to high number of dependencies
+report_dependency_df = (
+    spark.read.format("csv")
+    .option("header", "true")
+    .load(report_dependency)
+    .select(
+        col("report_name").alias("stream_name"),
+        upper(col("table_name")).alias("table_name"),
+        lit("Src").alias('table_type'),
+    )
+    .filter(~lower(col("stream_name")).contains("corona") & ~lower(col("stream_name")).contains("gdpr"))
+)
+display(report_dependency_df.dropDuplicates(["stream_name"]).count())
+display(report_dependency_df)
+
+# COMMAND ----------
+
+# DBTITLE 1,Reading table size in GB records
+table_size_df = spark.read.format("csv").option("header","true").load(table_size).select(upper(col("DB_Table_Name")).alias("table_name"), col("SPACE_IN_GB").alias("size"))
+display(table_size_df)
+
+# COMMAND ----------
 
 # Removing streams associated with acrchiving, GDPR, housekeeping and out of scope streams
 dependency_df_filtered = dependency_df_full.filter(
@@ -155,7 +188,7 @@ display(cleaned_dependency_df.filter(col('table_type').contains('Trns') & ~ col(
 
 # COMMAND ----------
 
-# DBTITLE 1,analysis: #ToDo : Check if the DDL of tables with same name, same across 2 different DBs
+# DBTITLE 1,analysis: Check if the DDL of tables with same name, same across 2 different DBs
 duplicate_tables = (
     cleaned_dependency_df.alias("cdf1")
     .join(cleaned_dependency_df.alias("cdf2"), col("cdf1.table_name") == col("cdf2.table_name"))
@@ -200,7 +233,7 @@ filtered_self_join_result.count()
 
 # COMMAND ----------
 
-# DBTITLE 1,Analysis: Without filtering transactional tables
+# DBTITLE 1,Without filtering transactional tables
 dependency_with_transactional_df = dependency_df.select(
     'stream_name', col('DB_Table_Name').alias('table_name'), 'table_type'
 ).distinct()
@@ -212,7 +245,7 @@ non_filtered_self_join_result = (
     .join(dependency_with_transactional_df.alias("df2"), col("df1.table_name") == col("df2.table_name"))
     .filter(col("df1.stream_name") != col("df2.stream_name"))
 )
-display(non_filtered_self_join_result)
+
 
 # COMMAND ----------
 
@@ -224,12 +257,38 @@ non_filtered_self_join_result.count()
 
 # COMMAND ----------
 
+report_join_result = (
+    report_dependency_df.alias("df2")
+    .join(dependency_with_transactional_df.alias("df1"), upper(col("df1.table_name")) == upper(col("df2.table_name")))
+)
+display(report_join_result)
+
+# COMMAND ----------
+
+# DBTITLE 1,Merging reports and streams
+self_join_result_without_size = report_join_result.union(non_filtered_self_join_result)
+display(self_join_result_without_size)
+
+# COMMAND ----------
+
+self_join_result = self_join_result_without_size.join(
+    table_size_df.alias("table_size"),
+    col("df1.table_name") == col("table_size.table_name")
+).select(
+    "df1.*",
+    "df2.*",
+    col("table_size.size")
+)
+display(self_join_result)
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Forming Stream - Stream Dependencies
 
 # COMMAND ----------
 
-src_tgt_dependencies = non_filtered_self_join_result.filter(
+src_tgt_dependencies = self_join_result.filter(
     (
         (upper(col("df1.table_type").cast("string")) == "TGT") |
         (upper(col("df1.table_type").cast("string")) == "TGT_TRNS") |
@@ -246,7 +305,7 @@ stream_stream_dependency_df = src_tgt_dependencies.select(
     col("df1.stream_name").alias("from"),
     col("df2.stream_name").alias("to"),
     col("df1.table_name").alias("table"),
-    lit('dependent').alias('relation'),
+    col("table_size.size").alias("size")
 )
 
 display(stream_stream_dependency_df)
@@ -265,24 +324,40 @@ stream_stream_dependency_df.count()
 total_distinct_streams = stream_stream_dependency_df.select("from").union(stream_stream_dependency_df.select("to")).distinct()
 
 display(total_distinct_streams)
-print(f"Total distinct streams (from + to): {total_distinct_streams.count()}")
+print(f"Total distinct streams, reports (from + to): {total_distinct_streams.count()}")
 
 # COMMAND ----------
 
-# Group by 'from' and 'to', count occurrences, and compute weights
-weighted_stream_stream_dependency_df = stream_stream_dependency_df.groupBy('from', 'to').count().select('from', 'to', col('count').alias('weight'))
+# For each (from, to, table), compute table_weight = ceil(size/100), min 1
+# If "to" contains "tableau", set table_weight = 2 regardless of size, this is to give slightly high preference to reports
+table_weight_df = stream_stream_dependency_df.withColumn(
+    "table_weight",
+    when(
+        lower(col("to")).contains("tableau"),
+        2
+    ).otherwise(
+        ceil((col("size").cast("double") / 100)).cast("int")
+    )
+).withColumn(
+    "table_weight",
+    when(col("table_weight") < 1, 1).otherwise(col("table_weight"))
+)
+
+# Remove duplicate (from, to, table) combinations
+unique_table_weights = table_weight_df.dropDuplicates(["from", "to", "table"])
+
+# Group by (from, to), sum the table_weight as the edge weight
+weighted_stream_stream_dependency_df = unique_table_weights.groupBy("from", "to").agg(
+    sum("table_weight").alias("weight")
+)
+
 display(weighted_stream_stream_dependency_df)
 
-#<ToDo> Add table size into weight calculation
-
 #<ToDo> CLarify why ARCHIVE is used as a source stream (read that is read from) / which usecases use this? -> This should be only archive to archive. Check if there are any other instances. This also could be the case some cleanup is happening.
-
-# RESULT: There are duplicated archivals
 
 # COMMAND ----------
 
 # DBTITLE 1,Merge bidirectional dependencies with summed weights
-from pyspark.sql.functions import when, array, sort_array
 
 # Step 1: Identify bidirectional pairs and sum their weights, keeping only one direction
 bidirectional_merged = (
@@ -350,10 +425,10 @@ display(stream_stream_dependency_df.filter((col("to") == "INT_IDM_INVENTORY") & 
 # COMMAND ----------
 
 # DBTITLE 1,Analysis: Total number of stream to stream connections
-merged_dependency_df.filter(col("weight")<=3).count()
+merged_dependency_df.filter(col("weight")<=4).count()
 
-# Total number of connecttions = 3607
-# Stream - stream dependecies where weight <= 3, aka only 3 or less tables has connection between 2 streams = 2713
+# Total number of connections = 4093
+# Stream - stream dependecies where weight <= 4, aka only 4 or less tables (2 incase of reports) has connection between 2 streams = 2628
 # ~75% stream - stream connections are loosely coupled
 
 
@@ -721,12 +796,6 @@ summary
 
 # COMMAND ----------
 
-import os
-import numpy as np
-import pandas as pd
-import networkx as nx
-import matplotlib.pyplot as plt
-
 
 def select_resolutions(
     summary: pd.DataFrame,
@@ -1002,7 +1071,6 @@ plot_leiden_resolutions(
 # COMMAND ----------
 
 
-
 # Helper to build leiden_df from a stored membership array (no re-run)
 def membership_to_leiden_df(membership, igraph_names):
     return pd.DataFrame({
@@ -1038,9 +1106,12 @@ def edge_style(subG, weight_attr="weight", min_w=0.2, max_w=3.2):
     return widths, alphas
 
 
-def plot_communities_induced_subgraphs(
+def plot_communities_with_analysis(
     G,
     leiden_df,
+    stream_table_dependency_df,
+    merged_edges_df,
+    resolution,
     outdir="leiden_community_plots",
     layout_seed=42,
     layout_k=None,
@@ -1052,11 +1123,15 @@ def plot_communities_induced_subgraphs(
     cmap=plt.cm.tab20,
     show=True,
     save=True,
-    filename_prefix="community",
 ):
     """
-    Plot each community as its induced subgraph (and optionally save each figure).
-    Uses an existing Leiden solution.
+    Plot each community as its induced subgraph and generate analysis files.
+    Creates subfolders per community with plot and analysis file.
+    
+    Parameters:
+    - stream_table_dependency_df: DataFrame with columns [from, to, table, size] showing stream-to-stream dependencies via tables
+      where 'from' writes to 'table' (table is TGT of 'from') and 'to' reads from 'table' (table is SRC of 'to')
+    - merged_edges_df: DataFrame with columns [streamA, streamB, weight] for the graph edges
     """
     os.makedirs(outdir, exist_ok=True)
 
@@ -1071,16 +1146,141 @@ def plot_communities_induced_subgraphs(
 
     communities = sorted(leiden_df["community"].unique())
     saved_files = []
+    
+    # Convert DataFrames to pandas for analysis
+    stream_table_pdf = stream_table_dependency_df.toPandas()
+    merged_edges_pdf = merged_edges_df.toPandas()
 
     for c in communities:
+        # Create subfolder for this community
+        comm_dir = os.path.join(outdir, f"community_{c}")
+        os.makedirs(comm_dir, exist_ok=True)
+        
         # Nodes in this community
         comm_nodes = [n for n in labeled_nodes if node_to_comm[n] == c]
+        streams_in_community = set(comm_nodes)
 
         # Induced subgraph: only edges between nodes in the community
         H = G.subgraph(comm_nodes).copy()
 
-        print(f"Community {c}: nodes={H.number_of_nodes()}, edges={H.number_of_edges()}")
+        print(f"\nCommunity {c}: nodes={H.number_of_nodes()}, edges={H.number_of_edges()}")
 
+        # === Generate Analysis ===
+        
+        # 1. List of streams in community
+        streams_list = sorted(list(streams_in_community))
+        
+        # 2. Find tables that are SRC of streams inside but TGT of streams outside
+        # In stream_table_dependency_df:
+        #   - 'from' stream writes to 'table' (table is TGT of 'from' stream)
+        #   - 'to' stream reads from 'table' (table is SRC of 'to' stream)
+        # So we want: 'from' OUTSIDE community AND 'to' INSIDE community
+        
+        # Tables that are SRC of inside streams, TGT of outside streams
+        # (produced outside, consumed inside)
+        tables_src_inside_tgt_outside = stream_table_pdf[
+            (~stream_table_pdf['from'].isin(streams_in_community)) & 
+            (stream_table_pdf['to'].isin(streams_in_community))
+        ][['table', 'from', 'to', 'size']].drop_duplicates(subset=['table'])
+        
+        # Tables that are TGT of inside streams, SRC of outside streams
+        # (produced inside, consumed outside)
+        tables_tgt_inside_src_outside = stream_table_pdf[
+            (stream_table_pdf['from'].isin(streams_in_community)) & 
+            (~stream_table_pdf['to'].isin(streams_in_community))
+        ][['table', 'from', 'to', 'size']].drop_duplicates(subset=['table'])
+        
+        # Get aggregated edge connections (for summary)
+        outgoing_edges = merged_edges_pdf[
+            (merged_edges_pdf['streamA'].isin(streams_in_community)) & 
+            (~merged_edges_pdf['streamB'].isin(streams_in_community))
+        ]
+        
+        incoming_edges = merged_edges_pdf[
+            (~merged_edges_pdf['streamA'].isin(streams_in_community)) & 
+            (merged_edges_pdf['streamB'].isin(streams_in_community))
+        ]
+        
+        # Create analysis output
+        analysis_content = f"""Community {c} Analysis (Resolution γ={resolution})
+{'='*80}
+
+1. STREAMS IN COMMUNITY ({len(streams_list)} streams):
+{'-'*80}
+"""
+        for i, stream in enumerate(streams_list, 1):
+            analysis_content += f"{i}. {stream}\n"
+        
+        analysis_content += f"""\n2. TABLES - SRC OF STREAMS INSIDE, TGT OF STREAMS OUTSIDE:
+{'-'*80}
+These are tables that streams in this community READ FROM, but are WRITTEN BY streams outside.
+(Dependencies flowing INTO the community)
+Total: {len(tables_src_inside_tgt_outside)} unique tables\n\n"""
+        
+        if len(tables_src_inside_tgt_outside) > 0:
+            for idx, row in tables_src_inside_tgt_outside.iterrows():
+                analysis_content += f"  Table: {row['table']}\n"
+                analysis_content += f"    - Written by (outside): {row['from']}\n"
+                analysis_content += f"    - Read by (inside): {row['to']}\n"
+                analysis_content += f"    - Size: {row['size']} GB\n\n"
+        else:
+            analysis_content += "  (No such tables found)\n"
+        
+        analysis_content += f"""\n3. TABLES - TGT OF STREAMS INSIDE, SRC OF STREAMS OUTSIDE:
+{'-'*80}
+These are tables that streams in this community WRITE TO, but are READ BY streams outside.
+(Dependencies flowing OUT OF the community)
+Total: {len(tables_tgt_inside_src_outside)} unique tables\n\n"""
+        
+        if len(tables_tgt_inside_src_outside) > 0:
+            for idx, row in tables_tgt_inside_src_outside.iterrows():
+                analysis_content += f"  Table: {row['table']}\n"
+                analysis_content += f"    - Written by (inside): {row['from']}\n"
+                analysis_content += f"    - Read by (outside): {row['to']}\n"
+                analysis_content += f"    - Size: {row['size']} GB\n\n"
+        else:
+            analysis_content += "  (No such tables found)\n"
+        
+        analysis_content += f"""\n4. AGGREGATED STREAM CONNECTIONS:
+{'-'*80}
+
+4a. Outgoing Stream Connections (Inside → Outside):
+"""
+        if len(outgoing_edges) > 0:
+            analysis_content += f"Total: {len(outgoing_edges)} connections\n\n"
+            for idx, row in outgoing_edges.iterrows():
+                analysis_content += f"  {row['streamA']} → {row['streamB']} (weight: {row['weight']})\n"
+        else:
+            analysis_content += "  (No outgoing connections)\n"
+        
+        analysis_content += f"""\n4b. Incoming Stream Connections (Outside → Inside):
+"""
+        if len(incoming_edges) > 0:
+            analysis_content += f"Total: {len(incoming_edges)} connections\n\n"
+            for idx, row in incoming_edges.iterrows():
+                analysis_content += f"  {row['streamA']} → {row['streamB']} (weight: {row['weight']})\n"
+        else:
+            analysis_content += "  (No incoming connections)\n"
+        
+        analysis_content += f"""\n5. SUMMARY:
+{'-'*80}
+  - Total streams in community: {len(streams_list)}
+  - Internal edges (within community): {H.number_of_edges()}
+  - Tables flowing INTO community (SRC inside, TGT outside): {len(tables_src_inside_tgt_outside)}
+  - Tables flowing OUT OF community (TGT inside, SRC outside): {len(tables_tgt_inside_src_outside)}
+  - Aggregated outgoing stream connections: {len(outgoing_edges)}
+  - Aggregated incoming stream connections: {len(incoming_edges)}
+"""
+        
+        # Save analysis file
+        analysis_file = os.path.join(comm_dir, f"community_{c}_analysis.txt")
+        with open(analysis_file, 'w') as f:
+            f.write(analysis_content)
+        print(f"  Saved analysis: {analysis_file}")
+        saved_files.append(analysis_file)
+        
+        # === Generate Plot ===
+        
         # Use global positions (consistent across plots)
         pos = {n: pos_global[n] for n in H.nodes()}
 
@@ -1103,15 +1303,20 @@ def plot_communities_induced_subgraphs(
         # Labels
         nx.draw_networkx_labels(H, pos, font_size=font_size)
 
-        plt.title(f"Community {c} — nodes={H.number_of_nodes()} edges={H.number_of_edges()}", fontsize=16)
+        title_text = (
+            f"Community {c} (γ={resolution})\n"
+            f"Streams: {H.number_of_nodes()} | Internal Edges: {H.number_of_edges()} | "
+            f"Outside Tables (SRC inside): {len(tables_src_inside_tgt_outside)}"
+        )
+        plt.title(title_text, fontsize=16)
         plt.axis("off")
         plt.tight_layout()
 
         if save:
-            outfile = os.path.join(outdir, f"{filename_prefix}_{c}.png")
-            plt.savefig(outfile, bbox_inches="tight")
-            saved_files.append(outfile)
-            print(f"Saved: {outfile}")
+            plot_file = os.path.join(comm_dir, f"community_{c}_plot.png")
+            plt.savefig(plot_file, bbox_inches="tight")
+            saved_files.append(plot_file)
+            print(f"  Saved plot: {plot_file}")
 
         if show:
             plt.show()
@@ -1125,16 +1330,22 @@ def plot_communities_induced_subgraphs(
 
 resolution = 1.8
 leiden_df, meta = get_leiden_df(resolution, rep_by_res, igraph_names)
-print(meta)
+print(f"\nUsing resolution γ={resolution}")
+print(f"Metadata: {meta}")
 
-saved = plot_communities_induced_subgraphs(
+saved = plot_communities_with_analysis(
     G=G,
     leiden_df=leiden_df,
-    outdir=f"leiden_community_plots_gamma_{resolution}",
+    stream_table_dependency_df=stream_stream_dependency_df,
+    merged_edges_df=merged_dependency_df,
+    resolution=resolution,
+    outdir=f"{volume_path}leiden_community_plots_gamma_{resolution}",
     layout_seed=42,
     layout_k=None,
-    show=True,
+    show=False,
     save=True,
-    filename_prefix=f"gamma_{resolution}_comm"
 )
-print("Saved files:")
+print(f"\n{'='*80}")
+print(f"COMPLETE: Generated {len(saved)} files across {len(leiden_df['community'].unique())} community subfolders")
+print(f"Output directory: {volume_path}leiden_community_plots_gamma_{resolution}")
+print(f"{'='*80}")
