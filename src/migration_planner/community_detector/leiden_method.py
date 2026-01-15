@@ -5,16 +5,16 @@
 
 # COMMAND ----------
 
-!pip install python-igraph adjustText infomap netgraph networkx python-louvain igraph leidenalg
+# DBTITLE 1,Install required libraries
+# MAGIC %skip
+# MAGIC !pip install python-igraph adjustText infomap netgraph networkx python-louvain igraph leidenalg
+# MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
 
-dbutils.library.restartPython()
+# DBTITLE 1,Library imports
+import pandas as pd
 
-# COMMAND ----------
-
-# Import libraries
-import pandas as pd  # For reading dataset files
 import networkx as nx  # For network creation/analysis
 from networkx.algorithms import community
 import matplotlib.pyplot as plt  # For plotting graphs
@@ -38,37 +38,25 @@ from pyspark.sql.functions import ceil, sum, when, array, sort_array
 
 # COMMAND ----------
 
-current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-# COMMAND ----------
-
+# DBTITLE 1,Widgets
 dbutils.widgets.text(
     "volume_name",
-    "/Volumes/users/jince_james/lufthansa/community_detection/",
+    "/Volumes/odp_adw_mvp_n/migration/utilities/community_detection/",
     "Input Volume Path"
 )
-
-# COMMAND ----------
-
 dbutils.widgets.text(
     "input_dependency_name",
     "ETL-table-dependencies_20251223_1218.csv",
     "Input CSV file name"
 )
-
-# COMMAND ----------
-
 dbutils.widgets.text(
     "outofscope_stream_file_name",
     "out-of-scopte-streams.csv",
     "Out of scope streams file name"
 )
-
-# COMMAND ----------
-
 dbutils.widgets.text(
     "report_dependency_file_name",
-    "stream_to_report_mapping.csv",
+    "stream_to_report_mapping_new.csv",
     "report Dependency file name"
 )
 
@@ -80,11 +68,25 @@ dbutils.widgets.text(
 
 # COMMAND ----------
 
+# DBTITLE 1,Common variables & output directory operation
 volume_path = dbutils.widgets.get("volume_name")
 dependency_input_path = volume_path + dbutils.widgets.get("input_dependency_name")
 outofscope_stream_path = volume_path + dbutils.widgets.get("outofscope_stream_file_name")
 report_dependency = volume_path + dbutils.widgets.get("report_dependency_file_name")
 table_size = volume_path + dbutils.widgets.get("table_size")
+
+# Output path with date and hour
+output_dir_name = "community_detection_output_" + datetime.now().strftime("%d%m%Y_%H")
+output_path = volume_path + "community_detection_output_latest/" + output_dir_name + "/"
+
+# Move existing folders from 'latest' one level up (to volume_path)
+latest_path = volume_path + "community_detection_output_latest/"
+folders = [f.name for f in dbutils.fs.ls(latest_path) if f.isDir()]
+for folder in folders:
+    dbutils.fs.mv(latest_path + folder, volume_path + folder, recurse=True)
+
+# Create the new output directory under 'latest'
+dbutils.fs.mkdirs(output_path)
 
 # COMMAND ----------
 
@@ -95,7 +97,6 @@ table_size = volume_path + dbutils.widgets.get("table_size")
 
 # DBTITLE 1,Reading input stream - table dependency file
 dependency_df_full = spark.read.format("csv").option("header", "true").load(dependency_input_path)
-display(dependency_df_full)
 
 # COMMAND ----------
 
@@ -103,10 +104,6 @@ display(dependency_df_full)
 outofscope_stream_names_df = spark.read.format("csv").option("header","true").load(outofscope_stream_path).select(col("stream_name"))
 outofscope_stream_names_rows_list = outofscope_stream_names_df.collect()
 outofscope_stream_names_list = [x['stream_name'] for x in outofscope_stream_names_rows_list]
-
-# COMMAND ----------
-
-print(outofscope_stream_names_list)
 
 # COMMAND ----------
 
@@ -125,14 +122,11 @@ report_dependency_df = (
     )
     .filter(~lower(col("stream_name")).contains("corona") & ~lower(col("stream_name")).contains("gdpr"))
 )
-display(report_dependency_df.dropDuplicates(["stream_name"]).count())
-display(report_dependency_df)
 
 # COMMAND ----------
 
 # DBTITLE 1,Reading table size in GB records
 table_size_df = spark.read.format("csv").option("header","true").load(table_size).select(upper(col("DB_Table_Name")).alias("table_name"), col("SPACE_IN_GB").alias("size"))
-display(table_size_df)
 
 # COMMAND ----------
 
@@ -146,31 +140,10 @@ dependency_df_filtered = dependency_df_full.filter(
 
 # COMMAND ----------
 
-dependency_df_filtered.count()
-
-# COMMAND ----------
-
-dependency_df_filtered.filter(upper(col('table_type')).contains("TGT")).count()
-
-# COMMAND ----------
-
 # DBTITLE 1,Considering all TGT tables as SRC
 # Considering all TGT tables as SRC as well due to a gap in ODAT output
-tgt_as_source = dependency_df_filtered.filter(upper(col('table_type')).contains("TGT")).replace({"TGT" : "SRC", "Tgt_Trns" : "Src_Trns"}, subset=["table_type"])
-dependency_df = dependency_df_filtered.union(tgt_as_source)
-dependency_df.count()
-
-# COMMAND ----------
-
-display(dependency_df)
-
-# COMMAND ----------
-
-# DBTITLE 1,analysis
-print(f"Total number of records is {dependency_df.count()}")
-print(f"Total number of distinct records is {dependency_df.distinct().count()}")
-
-# There are duplicate records in the input dataset
+tgt_as_source = dependency_df_filtered.filter(upper(col('table_type')).contains("TGT")).replace({"Tgt" : "Src", "Tgt_Trns" : "Src_Trns"}, subset=["table_type"])
+dependency_df = dependency_df_filtered.union(tgt_as_source).distinct()
 
 # COMMAND ----------
 
@@ -179,61 +152,7 @@ print(f"Total number of distinct records is {dependency_df.distinct().count()}")
 
 # COMMAND ----------
 
-# DBTITLE 1,analysis: Check if there are any trns src or tgt tables part of non transactional DBs
-cleaned_dependency_df = dependency_df.distinct().select('stream_name', col('ref_object_name').alias('table_name'),col('ref_object_dbname').alias('db_name'), 'table_type')
-
-display(cleaned_dependency_df.filter(col('table_type').contains('Trns') & ~ col('db_name').contains('TRANS')))
-
-# There are no transactional tables in the dataset that are part of a non transactional DB - Verified
-
-# COMMAND ----------
-
-# DBTITLE 1,analysis: Check if the DDL of tables with same name, same across 2 different DBs
-duplicate_tables = (
-    cleaned_dependency_df.alias("cdf1")
-    .join(cleaned_dependency_df.alias("cdf2"), col("cdf1.table_name") == col("cdf2.table_name"))
-    .filter(col("cdf1.db_name") != col("cdf2.db_name"))
-    .filter(~col("cdf1.stream_name").contains("ARCHIVE") & ~col("cdf2.stream_name").contains("ARCHIVE"))
-    .select(
-        col("cdf1.db_name").alias("db_name1"),
-        col("cdf1.table_name").alias("table_name1"),
-        col("cdf2.db_name").alias("db_name2"),
-        col("cdf2.table_name").alias("table_name2")
-    ).distinct()
-)
-duplicate_tables.groupBy("table_name1", "db_name1").count().display()
-# duplicate_tables.display(False)
-
-# There are tables with same table name, are the DDLs same for duplicates? Are they 2 different instances? or same?
-# RESULT -> If they are present in 2 different DBs, they should be also different table instances. 
-
-# COMMAND ----------
-
-# DBTITLE 1,Filtering Transactional Tables
-dependency_without_transactional_df = (
-    dependency_df.filter(~col('table_type').contains('Trns'))
-    .select('stream_name', col('DB_Table_Name').alias('table_name'), 'table_type')
-    .distinct()
-)
-
-
-# Self join to find dependencies and filter intra stream dependency
-filtered_self_join_result = (
-    dependency_without_transactional_df.alias("df1")
-    .join(dependency_without_transactional_df.alias("df2"), col("df1.table_name") == col("df2.table_name"))
-    .filter(col("df1.stream_name") != col("df2.stream_name"))
-)
-
-display(filtered_self_join_result)
-
-# COMMAND ----------
-
-# DBTITLE 1,Analysis: See results count with transactional tables filtered self join
-filtered_self_join_result.count()
-
-# COMMAND ----------
-
-# DBTITLE 1,Without filtering transactional tables
+# DBTITLE 1,Filter out intra stream (self) dependency
 dependency_with_transactional_df = dependency_df.select(
     'stream_name', col('DB_Table_Name').alias('table_name'), 'table_type'
 ).distinct()
@@ -249,28 +168,20 @@ non_filtered_self_join_result = (
 
 # COMMAND ----------
 
-# DBTITLE 1,analysis: See results count with transactional count dependencies
-non_filtered_self_join_result.count()
-
-# RESULT: There are ~100 inter stream dependencies more with transactional tables included. So we will use dataset without filtering
-# Result -> Except for archiving streams, this shouldn't be the case. Dig deeper. Send ex to micheal if there are outliers.
-
-# COMMAND ----------
-
+# DBTITLE 1,Joining reports to the stream data
 report_join_result = (
     report_dependency_df.alias("df2")
     .join(dependency_with_transactional_df.alias("df1"), upper(col("df1.table_name")) == upper(col("df2.table_name")))
 )
-display(report_join_result)
 
 # COMMAND ----------
 
 # DBTITLE 1,Merging reports and streams
 self_join_result_without_size = report_join_result.union(non_filtered_self_join_result)
-display(self_join_result_without_size)
 
 # COMMAND ----------
 
+# DBTITLE 1,Adding table size information
 self_join_result = self_join_result_without_size.join(
     table_size_df.alias("table_size"),
     col("df1.table_name") == col("table_size.table_name")
@@ -279,7 +190,6 @@ self_join_result = self_join_result_without_size.join(
     "df2.*",
     col("table_size.size")
 )
-display(self_join_result)
 
 # COMMAND ----------
 
@@ -288,6 +198,7 @@ display(self_join_result)
 
 # COMMAND ----------
 
+# DBTITLE 1,Forming Stream - Stream dependency
 src_tgt_dependencies = self_join_result.filter(
     (
         (upper(col("df1.table_type").cast("string")) == "TGT") |
@@ -308,153 +219,118 @@ stream_stream_dependency_df = src_tgt_dependencies.select(
     col("table_size.size").alias("size")
 )
 
-display(stream_stream_dependency_df)
+stream_stream_dependency_df.toPandas().to_csv(output_path + "stream_stream_dependencies.csv", index=False)
 
 # COMMAND ----------
 
-# DBTITLE 1,Analysis: Verify created community
-stream_list = [
-    "EXP_PARTNERS_LG",
-    "EXP_PARTNERS_LHG",
-    "EXP_PARTNERS_LO",
-    "EXP_PARTNERS_OS",
-    "EXP_PARTNER_MAM_REVENUE",
-    "EXP_PGR_FEEDBACK",
-    "EXP_PGR_PROFILE",
-    "EXP_RESPONSYS",
-    "IMP_ANTITERROR_LIST",
-    "IMP_EMAIL_TRACKING",
-    "IMP_FFP_BIT",
-    "IMP_KFM",
-    "IMP_MAM_AIA",
-    "IMP_SAMBA",
-    "INT_FFP_DAY",
-    "INT_FFP_MON",
-    "INT_FFP_REP",
-    "INT_KFM_FACT",
-    "INT_UNIFIED_REPORTING_DAILY",
-    "INT_WEBQUERY",
-]
-display(
-    stream_stream_dependency_df.filter((col("to").isin(stream_list)) & (~col("from").isin(stream_list))).sort(
-        "from", "to"
+# DBTITLE 1,Option 1 - Weight Calculation
+# For each (from, to, table), compute table_weight = ceil(size/100), min 1
+# If "to" contains "json", set table_weight = 2 regardless of size, this is to give slightly high preference to reports
+table_weight_df = stream_stream_dependency_df.withColumn(
+    "table_weight",
+    when(
+        lower(col("to")).contains("json"),
+        2
+    ).otherwise(
+        ceil((col("size").cast("double") / 100)).cast("int")
     )
+).withColumn(
+    "table_weight",
+    when(col("table_weight") < 1, 1).otherwise(col("table_weight"))
 )
 
-# COMMAND ----------
+# Remove duplicate (from, to, table) combinations
+unique_table_weights = table_weight_df.dropDuplicates(["from", "to", "table"])
 
-# DBTITLE 1,Analysis: Stream-stream dependency count
-stream_stream_dependency_df.count()
-
-# COMMAND ----------
-
-# DBTITLE 1,Analysis: Number of distinct streams
-
-
-# Number of distinct streams in the dependency map
-total_distinct_streams = stream_stream_dependency_df.select("from").union(stream_stream_dependency_df.select("to")).distinct()
-
-display(total_distinct_streams)
-print(f"Total distinct streams, reports (from + to): {total_distinct_streams.count()}")
-
-# COMMAND ----------
-
-# # For each (from, to, table), compute table_weight = ceil(size/100), min 1
-# # If "to" contains "tableau", set table_weight = 2 regardless of size, this is to give slightly high preference to reports
-# table_weight_df = stream_stream_dependency_df.withColumn(
-#     "table_weight",
-#     when(
-#         lower(col("to")).contains("tableau"),
-#         2
-#     ).otherwise(
-#         ceil((col("size").cast("double") / 100)).cast("int")
-#     )
-# ).withColumn(
-#     "table_weight",
-#     when(col("table_weight") < 1, 1).otherwise(col("table_weight"))
-# )
-
-# # Remove duplicate (from, to, table) combinations
-# unique_table_weights = table_weight_df.dropDuplicates(["from", "to", "table"])
-
-# # Group by (from, to), sum the table_weight as the edge weight
-# weighted_stream_stream_dependency_df = unique_table_weights.groupBy("from", "to").agg(
-#     sum("table_weight").alias("weight")
-# )
-
-# display(weighted_stream_stream_dependency_df)
-
-# #<ToDo> CLarify why ARCHIVE is used as a source stream (read that is read from) / which usecases use this? -> This should be only archive to archive. Check if there are any other instances. This also could be the case some cleanup is happening.
-
-# COMMAND ----------
-
-# DBTITLE 1,Scaling and weight calculation
-from pyspark.sql.functions import (
-    col, when, lower, lit,
-    min as spark_min, max as spark_max, sum as spark_sum,
-    log1p
-)
-
-# ---- CONFIG ----
-SCALED_MIN = 0.0
-SCALED_MAX = 1.0
-TABLEAU_MULTIPLIER = 1.5
-USE_LOG = True   # <-- set False to disable log transform
-
-# 1) Raw per-table value = size
-df = stream_stream_dependency_df.withColumn("raw_table_weight", col("size").cast("double"))
-
-# (optional) guard against null/negative sizes (log1p requires >= 0)
-df = df.withColumn(
-    "raw_table_weight",
-    when(col("raw_table_weight").isNull() | (col("raw_table_weight") < 0), lit(0.0))
-    .otherwise(col("raw_table_weight"))
-)
-
-# 2) Optional log transform (log1p)
-if USE_LOG:
-    df = df.withColumn("raw_for_scaling", log1p(col("raw_table_weight")))
-else:
-    df = df.withColumn("raw_for_scaling", col("raw_table_weight"))
-
-# 3) Min–Max stats on the scaling column
-stats = df.agg(
-    spark_min("raw_for_scaling").alias("mn"),
-    spark_max("raw_for_scaling").alias("mx")
-).collect()[0]
-
-mn = float(stats["mn"])
-mx = float(stats["mx"])
-den = (mx - mn) if (mx - mn) != 0 else 1.0
-
-# 4) Min–Max scale into [0, 1] then map to [SCALED_MIN, SCALED_MAX]
-df = df.withColumn("mm01", (col("raw_for_scaling") - lit(mn)) / lit(den))
-
-df = df.withColumn(
-    "scaled_table_weight",
-    lit(SCALED_MIN) + (lit(SCALED_MAX - SCALED_MIN) * col("mm01"))
-)
-
-# 5) Tableau boost AFTER scaling
-df = df.withColumn(
-    "scaled_table_weight",
-    when(lower(col("to")).contains("tableau"),
-         col("scaled_table_weight") * lit(TABLEAU_MULTIPLIER)
-    ).otherwise(col("scaled_table_weight"))
-)
-
-# 6) Drop duplicates per (from, to, table)
-unique_table_weights = df.dropDuplicates(["from", "to", "table"])
-
-# 7) Aggregate stream–stream edge weights
-weighted_stream_stream_dependency_df = (
-    unique_table_weights
-    .groupBy("from", "to")
-    .agg(spark_sum("scaled_table_weight").alias("weight"))
+# Group by (from, to), sum the table_weight as the edge weight
+weighted_stream_stream_dependency_df = unique_table_weights.groupBy("from", "to").agg(
+    sum("table_weight").alias("weight")
 )
 
 display(weighted_stream_stream_dependency_df)
 
+
+# COMMAND ----------
+
+# DBTITLE 1,[Backup] Option 2 - Scaling and weight calculation
+# MAGIC %skip
+# MAGIC from pyspark.sql.functions import (
+# MAGIC     col, when, lower, lit,
+# MAGIC     min as spark_min, max as spark_max, sum as spark_sum,
+# MAGIC     log1p
+# MAGIC )
+# MAGIC
+# MAGIC # ---- CONFIG ----
+# MAGIC SCALED_MIN = 0.0001  # Minimum weight to ensure non-zero weights for existing connections
+# MAGIC SCALED_MAX = 1.0
+# MAGIC TABLEAU_MULTIPLIER = 1.5
+# MAGIC USE_LOG = True   # <-- set False to disable log transform
+# MAGIC
+# MAGIC # 1) Raw per-table value = size
+# MAGIC df = stream_stream_dependency_df.withColumn("raw_table_weight", col("size").cast("double"))
+# MAGIC
+# MAGIC # (optional) guard against null/negative sizes (log1p requires >= 0)
+# MAGIC df = df.withColumn(
+# MAGIC     "raw_table_weight",
+# MAGIC     when(col("raw_table_weight").isNull() | (col("raw_table_weight") < 0), lit(0.0))
+# MAGIC     .otherwise(col("raw_table_weight"))
+# MAGIC )
+# MAGIC
+# MAGIC # 2) Optional log transform (log1p)
+# MAGIC if USE_LOG:
+# MAGIC     df = df.withColumn("raw_for_scaling", log1p(col("raw_table_weight")))
+# MAGIC else:
+# MAGIC     df = df.withColumn("raw_for_scaling", col("raw_table_weight"))
+# MAGIC
+# MAGIC # 3) Min–Max stats on the scaling column
+# MAGIC stats = df.agg(
+# MAGIC     spark_min("raw_for_scaling").alias("mn"),
+# MAGIC     spark_max("raw_for_scaling").alias("mx")
+# MAGIC ).collect()[0]
+# MAGIC
+# MAGIC mn = float(stats["mn"])
+# MAGIC mx = float(stats["mx"])
+# MAGIC den = (mx - mn) if (mx - mn) != 0 else 1.0
+# MAGIC
+# MAGIC # 4) Min–Max scale into [0, 1] then map to [SCALED_MIN, SCALED_MAX]
+# MAGIC df = df.withColumn("mm01", (col("raw_for_scaling") - lit(mn)) / lit(den))
+# MAGIC
+# MAGIC df = df.withColumn(
+# MAGIC     "scaled_table_weight",
+# MAGIC     lit(SCALED_MIN) + (lit(SCALED_MAX - SCALED_MIN) * col("mm01"))
+# MAGIC )
+# MAGIC
+# MAGIC # Ensure scaled_table_weight is never less than SCALED_MIN (guard against float error)
+# MAGIC df = df.withColumn(
+# MAGIC     "scaled_table_weight",
+# MAGIC     when(col("scaled_table_weight") < SCALED_MIN, lit(SCALED_MIN)).otherwise(col("scaled_table_weight"))
+# MAGIC )
+# MAGIC
+# MAGIC # 5) Tableau/BI report boost AFTER scaling
+# MAGIC df = df.withColumn(
+# MAGIC     "scaled_table_weight",
+# MAGIC     when(lower(col("to")).contains("json"),
+# MAGIC          col("scaled_table_weight") * lit(TABLEAU_MULTIPLIER)
+# MAGIC     ).otherwise(col("scaled_table_weight"))
+# MAGIC )
+# MAGIC
+# MAGIC # 6) Drop duplicates per (from, to, table)
+# MAGIC unique_table_weights = df.dropDuplicates(["from", "to", "table"])
+# MAGIC
+# MAGIC # 7) Aggregate stream–stream edge weights
+# MAGIC weighted_stream_stream_dependency_df = (
+# MAGIC     unique_table_weights
+# MAGIC     .groupBy("from", "to")
+# MAGIC     .agg(spark_sum("scaled_table_weight").alias("weight"))
+# MAGIC )
+# MAGIC
+# MAGIC # 8) Final safeguard: ensure aggregated weight is never 0 for existing connections
+# MAGIC weighted_stream_stream_dependency_df = weighted_stream_stream_dependency_df.withColumn(
+# MAGIC     "weight",
+# MAGIC     when(col("weight") < SCALED_MIN, lit(SCALED_MIN)).otherwise(col("weight"))
+# MAGIC )
+# MAGIC
+# MAGIC display(weighted_stream_stream_dependency_df)
 
 # COMMAND ----------
 
@@ -508,40 +384,15 @@ print(f"\nTotal edges after merging: {merged_dependency_df.count()}")
 print(f"Original edges: {weighted_stream_stream_dependency_df.count()}")
 print(f"Reduction: {weighted_stream_stream_dependency_df.count() - merged_dependency_df.count()} edges")
 
-display(merged_dependency_df.orderBy("streamA", "streamB"))
-
 # COMMAND ----------
 
-# DBTITLE 1,Analysis: Src Streams for INT_IDM_INVENTORY Stream. To Verify Correctness
-# display(stream_stream_dependency_df.filter((col("to") == "INT_IDM_INVENTORY")).sort("from"))
-
-stream_list = ["IMP_APLUS_SDH", "IMP_CAFE_CURRENCY", "IMP_TCURRENCY", "INT_IDM_REF_CURRENCY"]
-display(merged_dependency_df.filter((col("streamA").isin(stream_list))|(col("streamB").isin(stream_list))).sort("streamA","streamB"))
-# Result -> Verified with Micheal for 2 streams.
-
-# COMMAND ----------
-
-# DBTITLE 1,Analysis: Non IMP_INV* Src Streams for INT_IDM_INVENTORY stream. To Verify Correctness
-display(stream_stream_dependency_df.filter((col("to") == "INT_IDM_INVENTORY") & ~col("from").contains("IMP_INVENTORY")).select("from","table").distinct().sort("from"))
-
-# COMMAND ----------
-
-# DBTITLE 1,Analysis: Total number of stream to stream connections
-# merged_dependency_df.filter(col("weight")<=4).count()
-
-# Total number of connections = 4093
-# Stream - stream dependecies where weight <= 4, aka only 4 or less tables (2 incase of reports) has connection between 2 streams = 2628
-# ~75% stream - stream connections are loosely coupled
-
-
-# COMMAND ----------
-
-# Only use for small data!
+# DBTITLE 1,Create Edges of the graph in Pandas
 edges_df = merged_dependency_df.toPandas()
-edges_df.to_csv(f"{volume_path}edges.csv", index=False)
+edges_df.to_csv(f"{output_path}edges.csv", index=False)
 
 # COMMAND ----------
 
+# DBTITLE 1,Aggregate weights - safety step
 # Aggregate weights if necessary (depends on whether the grouping already handles this)
 edges = edges_df.groupby(['streamA', 'streamB'])['weight'].sum().reset_index()
 
@@ -568,6 +419,7 @@ edges = edges_df.groupby(['streamA', 'streamB'])['weight'].sum().reset_index()
 
 # COMMAND ----------
 
+# DBTITLE 1,Community Detection
 
 # Build an undirected weighted igraph graph from the edge list
 # edges is a pandas DataFrame with columns:
@@ -702,10 +554,10 @@ def membership_to_leiden_df(membership):
 
 #Scan over resolutions (gamma) and many random seeds per resolution
 #Resolution grid: controls granularity (higher -> more communities)
-resolutions = [0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0, 1.2, 1.5, 1.8, 2.2, 2.6, 3.0]
+resolutions = [0.4, 0.8, 1.0, 1.2, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.6]
 
 #Multiple random restarts at each resolution to test robustness
-seeds = [1, 7, 43, 99, 123, 11, 28, 37, 45, 672, 42, 10, 100, 178, 2, 3, 5]
+seeds = [1, 3, 7, 43, 99, 123, 11, 28, 37, 45, 672, 42, 10, 100, 178]
 
 # Store one representative run per resolution (so plotting does not re-run Leiden)
 # If ARI==1.0 at a resolution, any seed is equivalent; otherwise this still gives a consistent choice.
@@ -769,8 +621,7 @@ summary
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ## What the columns tell us (brief reminder)
-# MAGIC
+# MAGIC ## What the columns tell us 
 # MAGIC - **n_communities_avg / min / max**  
 # MAGIC   Number of communities found across seeds.  
 # MAGIC   Equality of min = max indicates a fixed scale; divergence indicates multiple competing solutions.
@@ -798,7 +649,7 @@ summary
 # MAGIC
 # MAGIC **Interpretation:**  
 # MAGIC The graph supports a very coarse, highly stable structure. At γ = 0.2 the solution is almost trivial (one giant cluster plus a few small ones). γ = 0.3–0.4 reveals more structure while remaining extremely stable.
-# MAGIC
+# MAGIC But due to high number of nodes in each community these are not practical
 # MAGIC ---
 # MAGIC
 # MAGIC ### **Moderate resolution: γ = 0.5–1.0**
@@ -812,23 +663,13 @@ summary
 # MAGIC - node assignments are identical across seeds,
 # MAGIC - communities are neither too coarse nor excessively fragmented.
 # MAGIC
-# MAGIC This range represents the strongest evidence for a “natural” community structure in the graph.
+# MAGIC This range represents the strongest evidence for a “natural” community structure in the graph. Yet due to high number of nodes in each community these are not practical
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### **Near-transition resolution: γ = 1.2**
-# MAGIC - **8 communities**, fixed count
-# MAGIC - **ARI ≈ 0.99**
-# MAGIC - Minor node reassignment across seeds
-# MAGIC
-# MAGIC **Interpretation:**  
-# MAGIC Still highly stable, but approaching a structural transition. A small number of boundary nodes begin to move, though the global structure remains intact.
-# MAGIC
-# MAGIC ---
-# MAGIC
-# MAGIC ### **Degenerate regime: γ = 1.5**
+# MAGIC ### **Degenerate regime: γ = 1.2 - 1.8**
 # MAGIC - **10–12 communities** across seeds
-# MAGIC - **ARI ≈ 0.86**
+# MAGIC - **ARI > 0.92**
 # MAGIC - Low fragmentation, but multiple distinct partitions
 # MAGIC
 # MAGIC **Interpretation:**  
@@ -838,18 +679,10 @@ summary
 # MAGIC - no single partition can be considered uniquely “correct.”
 # MAGIC
 # MAGIC At this resolution, results should be treated as *one of several plausible clusterings*.
+# MAGIC Due to manageble number of nodes in each community and acceptable stability, this could be the most practical clustering for migration.
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### **Higher resolution: γ = 1.8**
-# MAGIC - **14–15 communities**
-# MAGIC - **ARI ≈ 0.97**
-# MAGIC - Instability is localized (mostly small splits/merges)
-# MAGIC
-# MAGIC **Interpretation:**  
-# MAGIC Stability largely returns at a finer scale. Most node assignments are consistent; variability is confined to small communities. This resolution is defensible if fine granularity is required.
-# MAGIC
-# MAGIC ---
 # MAGIC
 # MAGIC ### **Very high resolution: γ = 2.2–3.0**
 # MAGIC - **24–37 communities**
@@ -861,28 +694,7 @@ summary
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ## Overall conclusions
 # MAGIC
-# MAGIC - **Most stable and well-supported resolutions:**  
-# MAGIC   **γ ≈ 0.5–1.0**  
-# MAGIC   (perfect node-level stability and fixed community counts)
-# MAGIC
-# MAGIC - **Transition / ambiguity zone:**  
-# MAGIC   **γ ≈ 1.5**  
-# MAGIC   (multiple competing partitions; no unique solution)
-# MAGIC
-# MAGIC - **Fine-scale but fragmented structure:**  
-# MAGIC   **γ ≥ 1.8**  
-# MAGIC   (mostly stable, but many small communities)
-# MAGIC
-# MAGIC In summary, your graph exhibits a **clear, reproducible community structure at moderate resolutions**, with instability emerging only when forcing finer-grained partitions than the data naturally supports.
-# MAGIC
-# MAGIC ---
-# MAGIC
-# MAGIC ## Recommended next steps
-# MAGIC
-# MAGIC - Select a representative γ in the **0.8–2 range** for a single, defensible partition.
-# MAGIC - PLotting
 # MAGIC
 
 # COMMAND ----------
@@ -898,345 +710,346 @@ summary
 
 # COMMAND ----------
 
-from adjustText import adjust_text
-
-def select_resolutions(
-    summary: pd.DataFrame,
-    ari_target: float = 0.93,
-    max_largest_comm_share: float = 0.2,
-    sort_by: str = "resolution",
-):
-    """
-    Select resolutions from the summary table using simple filters.
-
-    Parameters
-    ----------
-    summary : pd.DataFrame
-    ari_target : float
-        Keep resolutions whose stability_ari equals this value (default 1.0).
-    max_largest_comm_share : float
-        Keep resolutions with average largest community share <= this threshold (default 0.50).
-    sort_by : str
-        Column to sort the result by (default "resolution").
-
-    Returns
-    -------
-    selected : pd.DataFrame
-        Filtered summary.
-    selected_resolutions : list[float]
-        Resolution values to plot.
-    """
-    selected = summary[
-        (summary["stability_ari"] >= ari_target) &
-        (summary["largest_comm_share_avg"] <= max_largest_comm_share)
-    ].sort_values(sort_by)
-
-    selected_resolutions = selected["resolution"].tolist()
-    return selected, selected_resolutions
-
-
-def precompute_layout(
-    G: nx.Graph,
-    seed: int = 42,
-    k=3.0,  # Increased for more spacing
-):
-    """
-    Precompute a single spring layout (so plots are comparable).
-
-    Parameters
-    ----------
-    G : nx.Graph
-        Graph to layout.
-    seed : int
-        Random seed for deterministic layout.
-    k : float or None
-        Spring layout distance parameter. Higher = more spacing.
-
-    Returns
-    -------
-    pos : dict
-        Node -> (x, y) layout positions.
-    """
-    print(f"Computing layout with k={k} for better node spacing...")
-    pos = nx.spring_layout(G, seed=seed, k=k, iterations=100)
-    return pos
-
-
-def precompute_edge_style(
-    G: nx.Graph,
-    weight_attr: str = "weight",
-    width_min: float = 0.2,
-    width_scale: float = 3.0,
-    alpha_min: float = 0.05,
-    alpha_scale: float = 0.45,
-):
-    """
-    Precompute edge widths and alphas from edge weights.
-
-    Parameters
-    ----------
-    G : nx.Graph
-        Graph whose edges will be styled.
-    weight_attr : str
-        Edge attribute name to use as weights.
-    width_min, width_scale : float
-        width = width_min + width_scale * normalized_weight
-    alpha_min, alpha_scale : float
-        alpha = alpha_min + alpha_scale * normalized_weight
-
-    Returns
-    -------
-    edge_widths : np.ndarray
-        Width per edge in the order of G.edges().
-    edge_alphas : np.ndarray
-        Alpha per edge in the order of G.edges().
-    """
-    w = np.array([G[u][v].get(weight_attr, 1.0) for u, v in G.edges()], dtype=float)
-
-    # Handle empty graph or single-weight graph safely
-    if w.size == 0:
-        return np.array([]), np.array([])
-
-    w_min, w_max = float(w.min()), float(w.max())
-    den = (w_max - w_min) if (w_max - w_min) > 0 else 1.0
-    w_norm = (w - w_min) / den
-
-    edge_widths = width_min + width_scale * w_norm
-    edge_alphas = alpha_min + alpha_scale * w_norm
-    return edge_widths, edge_alphas
-
-
-def plot_leiden_resolutions(
-    G: nx.Graph,
-    g_igraph,
-    selected_resolutions,
-    rep_by_res: dict,
-    membership_to_leiden_df,
-    pos: dict = None,
-    edge_widths=None,
-    edge_alphas=None,
-    outdir: str = "leiden_plots",
-    figsize=(50, 40),  # Much larger figure
-    dpi: int = 400,  # Higher resolution
-    label_fontsize: int = 11,  # Larger font
-    node_size: int = 800,  # Larger nodes
-    cmap=plt.cm.tab20,
-    draw_labels: bool = True,
-    save: bool = True,
-    show: bool = True,
-    use_adjust_text: bool = True,  # Use adjustText for label positioning
-):
-    """
-    Plot each selected resolution using stored memberships.
-
-    Parameters
-    ----------
-    G : nx.Graph
-        Graph to plot (NetworkX).
-    g_igraph : igraph.Graph
-        Graph used for Leiden (only used here for g_igraph.vcount()).
-    selected_resolutions : list
-        Resolutions to plot.
-    rep_by_res : dict
-        resolution -> dict containing at least: "membership", "quality", "seed"
-    membership_to_leiden_df : callable
-        Function that maps membership -> DataFrame with columns ["stream","community"]
-    pos : dict or None
-        Node positions. If None, will compute nx.spring_layout(G, seed=42).
-    edge_widths, edge_alphas : array-like or None
-        If None, will compute from weights with defaults.
-    outdir : str
-        Output directory for PNGs.
-    figsize, dpi, label_fontsize : plotting params
-    node_size, cmap : node styling
-    draw_labels : bool
-        Whether to draw node labels.
-    save, show : bool
-        Save figures and/or display them.
-    use_adjust_text : bool
-        Use adjustText library to prevent label overlap.
-
-    Returns
-    -------
-    outputs : list[str]
-        Paths of saved files (may be empty if save=False).
-    """
-    if pos is None:
-        pos = nx.spring_layout(G, seed=42, k=3.0, iterations=100)
-
-    if edge_widths is None or edge_alphas is None:
-        edge_widths, edge_alphas = precompute_edge_style(G)
-
-    os.makedirs(outdir, exist_ok=True)
-    outputs = []
-
-    for res in selected_resolutions:
-        print(f"\nGenerating plot for resolution γ={res}...")
-        rep = rep_by_res[res]
-        membership = rep["membership"]
-        quality = rep["quality"]
-
-        leiden_df = membership_to_leiden_df(membership)
-
-        # Map stream -> community
-        node_to_comm = dict(zip(leiden_df["stream"], leiden_df["community"]))
-
-        # Color nodes by community id
-        node_colors = [node_to_comm.get(n, -1) for n in G.nodes()]
-
-        # Compute a few plot annotations
-        counts = np.bincount(membership)
-        n_comms = len(counts)
-        largest_share = counts.max() / g_igraph.vcount()
-        tiny_lt5 = int((counts < 5).sum())
-
-        # --- Create figure ---
-        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-
-        # Draw edges first (behind nodes)
-        print(f"  Drawing {G.number_of_edges()} edges...")
-        for (u, v), lw, a in zip(G.edges(), edge_widths, edge_alphas):
-            nx.draw_networkx_edges(
-                G, pos,
-                edgelist=[(u, v)],
-                width=float(lw),
-                alpha=float(a),
-                ax=ax,
-                edge_color='gray'
-            )
-
-        # Draw nodes
-        print(f"  Drawing {G.number_of_nodes()} nodes...")
-        nx.draw_networkx_nodes(
-            G, pos,
-            node_color=node_colors,
-            node_size=node_size,
-            cmap=cmap,
-            linewidths=2.0,
-            edgecolors='black',
-            ax=ax
-        )
-
-        # Draw labels
-        if draw_labels:
-            if use_adjust_text:
-                print(f"  Adding labels with overlap prevention...")
-                texts = []
-                for node, (x, y) in pos.items():
-                    texts.append(
-                        ax.text(
-                            x, y, str(node),
-                            fontsize=label_fontsize,
-                            ha='center',
-                            va='center',
-                            fontweight='bold',
-                            bbox=dict(
-                                boxstyle='round,pad=0.4',
-                                facecolor='white',
-                                edgecolor='gray',
-                                linewidth=0.5,
-                                alpha=0.85
-                            )
-                        )
-                    )
-                
-                # Adjust text positions to avoid overlap
-                adjust_text(
-                    texts,
-                    arrowprops=dict(arrowstyle='->', color='gray', lw=0.8, alpha=0.6),
-                    expand_points=(2.0, 2.0),
-                    expand_text=(1.5, 1.5),
-                    force_points=(0.8, 0.8),
-                    force_text=(0.8, 0.8),
-                    ax=ax,
-                    lim=500
-                )
-            else:
-                # Standard labels with background
-                for node, (x, y) in pos.items():
-                    ax.text(
-                        x, y, str(node),
-                        fontsize=label_fontsize,
-                        ha='center',
-                        va='center',
-                        fontweight='bold',
-                        bbox=dict(
-                            boxstyle='round,pad=0.4',
-                            facecolor='white',
-                            edgecolor='gray',
-                            linewidth=0.5,
-                            alpha=0.85
-                        )
-                    )
-
-        title = (
-            f"Leiden (RBConfiguration) — resolution γ={res} (seed={rep['seed']})\n"
-            f"#communities={n_comms}, largest_comm_share={largest_share:.3f}, "
-            f"small_comms<5={tiny_lt5}, quality={quality:.2f}"
-        )
-        ax.set_title(title, fontsize=22, fontweight='bold', pad=30)
-        ax.axis("off")
-        ax.margins(0.1)  # Add margin around plot
-        
-        plt.tight_layout()
-
-        if save:
-            outfile = os.path.join(outdir, f"leiden_rb_gamma_{res}.png")
-            print(f"  Saving high-resolution plot...")
-            plt.savefig(outfile, bbox_inches="tight", dpi=dpi, facecolor='white')
-            outputs.append(outfile)
-            print(f"  Saved: {outfile}")
-
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
-
-    return outputs
-
-
-
-
-selected, selected_resolutions = select_resolutions(summary, ari_target=0.93, max_largest_comm_share=0.25)
-print("Selected resolutions:", selected_resolutions)
-print(selected[["resolution", "largest_comm_share_avg", "stability_ari", "n_communities_avg"]])
-
-print("\nGenerating high-resolution plots with improved readability...")
-print("This may take several minutes depending on graph size.\n")
-
-# Ensure we're using the volume path from the widget parameter
-output_dir = os.path.join(volume_path, "leiden_plots")
-print(f"Output directory: {output_dir}")
-print(f"Saving plots to volume location (not git folder)\n")
-
-pos = precompute_layout(G, seed=42, k=3.0)  # More spacing
-edge_widths, edge_alphas = precompute_edge_style(G)
-
-plot_leiden_resolutions(
-    G=G,
-    g_igraph=g,
-    selected_resolutions=selected_resolutions,
-    rep_by_res=rep_by_res,
-    membership_to_leiden_df=membership_to_leiden_df,
-    pos=pos,
-    edge_widths=edge_widths,
-    edge_alphas=edge_alphas,
-    outdir=output_dir,  # Using volume path
-    figsize=(50, 40),  # Very large figure
-    dpi=400,  # High resolution
-    label_fontsize=11,  # Larger font
-    node_size=800,  # Larger nodes
-    draw_labels=True,
-    save=True,
-    show=False,
-    use_adjust_text=True,  # Prevent label overlap
-)
-
-print("\n" + "="*80)
-print("COMPLETE: All plots saved with high resolution (400 DPI)")
-print(f"Output directory: {output_dir}")
-print("Plots can be zoomed in with full clarity.")
-print("="*80)
+# MAGIC %skip
+# MAGIC from adjustText import adjust_text
+# MAGIC
+# MAGIC def select_resolutions(
+# MAGIC     summary: pd.DataFrame,
+# MAGIC     ari_target: float = 0.93,
+# MAGIC     max_largest_comm_share: float = 0.2,
+# MAGIC     sort_by: str = "resolution",
+# MAGIC ):
+# MAGIC     """
+# MAGIC     Select resolutions from the summary table using simple filters.
+# MAGIC
+# MAGIC     Parameters
+# MAGIC     ----------
+# MAGIC     summary : pd.DataFrame
+# MAGIC     ari_target : float
+# MAGIC         Keep resolutions whose stability_ari equals this value (default 0.93).
+# MAGIC     max_largest_comm_share : float
+# MAGIC         Keep resolutions with average largest community share <= this threshold (default 0.20).
+# MAGIC     sort_by : str
+# MAGIC         Column to sort the result by (default "resolution").
+# MAGIC
+# MAGIC     Returns
+# MAGIC     -------
+# MAGIC     selected : pd.DataFrame
+# MAGIC         Filtered summary.
+# MAGIC     selected_resolutions : list[float]
+# MAGIC         Resolution values to plot.
+# MAGIC     """
+# MAGIC     selected = summary[
+# MAGIC         (summary["stability_ari"] >= ari_target) &
+# MAGIC         (summary["largest_comm_share_avg"] <= max_largest_comm_share)
+# MAGIC     ].sort_values(sort_by)
+# MAGIC
+# MAGIC     selected_resolutions = selected["resolution"].tolist()
+# MAGIC     return selected, selected_resolutions
+# MAGIC
+# MAGIC
+# MAGIC def precompute_layout(
+# MAGIC     G: nx.Graph,
+# MAGIC     seed: int = 42,
+# MAGIC     k=3.0,  # Increased for more spacing
+# MAGIC ):
+# MAGIC     """
+# MAGIC     Precompute a single spring layout (so plots are comparable).
+# MAGIC
+# MAGIC     Parameters
+# MAGIC     ----------
+# MAGIC     G : nx.Graph
+# MAGIC         Graph to layout.
+# MAGIC     seed : int
+# MAGIC         Random seed for deterministic layout.
+# MAGIC     k : float or None
+# MAGIC         Spring layout distance parameter. Higher = more spacing.
+# MAGIC
+# MAGIC     Returns
+# MAGIC     -------
+# MAGIC     pos : dict
+# MAGIC         Node -> (x, y) layout positions.
+# MAGIC     """
+# MAGIC     print(f"Computing layout with k={k} for better node spacing...")
+# MAGIC     pos = nx.spring_layout(G, seed=seed, k=k, iterations=100)
+# MAGIC     return pos
+# MAGIC
+# MAGIC
+# MAGIC def precompute_edge_style(
+# MAGIC     G: nx.Graph,
+# MAGIC     weight_attr: str = "weight",
+# MAGIC     width_min: float = 0.2,
+# MAGIC     width_scale: float = 3.0,
+# MAGIC     alpha_min: float = 0.05,
+# MAGIC     alpha_scale: float = 0.45,
+# MAGIC ):
+# MAGIC     """
+# MAGIC     Precompute edge widths and alphas from edge weights.
+# MAGIC
+# MAGIC     Parameters
+# MAGIC     ----------
+# MAGIC     G : nx.Graph
+# MAGIC         Graph whose edges will be styled.
+# MAGIC     weight_attr : str
+# MAGIC         Edge attribute name to use as weights.
+# MAGIC     width_min, width_scale : float
+# MAGIC         width = width_min + width_scale * normalized_weight
+# MAGIC     alpha_min, alpha_scale : float
+# MAGIC         alpha = alpha_min + alpha_scale * normalized_weight
+# MAGIC
+# MAGIC     Returns
+# MAGIC     -------
+# MAGIC     edge_widths : np.ndarray
+# MAGIC         Width per edge in the order of G.edges().
+# MAGIC     edge_alphas : np.ndarray
+# MAGIC         Alpha per edge in the order of G.edges().
+# MAGIC     """
+# MAGIC     w = np.array([G[u][v].get(weight_attr, 1.0) for u, v in G.edges()], dtype=float)
+# MAGIC
+# MAGIC     # Handle empty graph or single-weight graph safely
+# MAGIC     if w.size == 0:
+# MAGIC         return np.array([]), np.array([])
+# MAGIC
+# MAGIC     w_min, w_max = float(w.min()), float(w.max())
+# MAGIC     den = (w_max - w_min) if (w_max - w_min) > 0 else 1.0
+# MAGIC     w_norm = (w - w_min) / den
+# MAGIC
+# MAGIC     edge_widths = width_min + width_scale * w_norm
+# MAGIC     edge_alphas = alpha_min + alpha_scale * w_norm
+# MAGIC     return edge_widths, edge_alphas
+# MAGIC
+# MAGIC
+# MAGIC def plot_leiden_resolutions(
+# MAGIC     G: nx.Graph,
+# MAGIC     g_igraph,
+# MAGIC     selected_resolutions,
+# MAGIC     rep_by_res: dict,
+# MAGIC     membership_to_leiden_df,
+# MAGIC     pos: dict = None,
+# MAGIC     edge_widths=None,
+# MAGIC     edge_alphas=None,
+# MAGIC     outdir: str = "leiden_plots",
+# MAGIC     figsize=(50, 40),  # Much larger figure
+# MAGIC     dpi: int = 400,  # Higher resolution
+# MAGIC     label_fontsize: int = 11,  # Larger font
+# MAGIC     node_size: int = 800,  # Larger nodes
+# MAGIC     cmap=plt.cm.tab20,
+# MAGIC     draw_labels: bool = True,
+# MAGIC     save: bool = True,
+# MAGIC     show: bool = True,
+# MAGIC     use_adjust_text: bool = True,  # Use adjustText for label positioning
+# MAGIC ):
+# MAGIC     """
+# MAGIC     Plot each selected resolution using stored memberships.
+# MAGIC
+# MAGIC     Parameters
+# MAGIC     ----------
+# MAGIC     G : nx.Graph
+# MAGIC         Graph to plot (NetworkX).
+# MAGIC     g_igraph : igraph.Graph
+# MAGIC         Graph used for Leiden (only used here for g_igraph.vcount()).
+# MAGIC     selected_resolutions : list
+# MAGIC         Resolutions to plot.
+# MAGIC     rep_by_res : dict
+# MAGIC         resolution -> dict containing at least: "membership", "quality", "seed"
+# MAGIC     membership_to_leiden_df : callable
+# MAGIC         Function that maps membership -> DataFrame with columns ["stream","community"]
+# MAGIC     pos : dict or None
+# MAGIC         Node positions. If None, will compute nx.spring_layout(G, seed=42).
+# MAGIC     edge_widths, edge_alphas : array-like or None
+# MAGIC         If None, will compute from weights with defaults.
+# MAGIC     outdir : str
+# MAGIC         Output directory for PNGs.
+# MAGIC     figsize, dpi, label_fontsize : plotting params
+# MAGIC     node_size, cmap : node styling
+# MAGIC     draw_labels : bool
+# MAGIC         Whether to draw node labels.
+# MAGIC     save, show : bool
+# MAGIC         Save figures and/or display them.
+# MAGIC     use_adjust_text : bool
+# MAGIC         Use adjustText library to prevent label overlap.
+# MAGIC
+# MAGIC     Returns
+# MAGIC     -------
+# MAGIC     outputs : list[str]
+# MAGIC         Paths of saved files (may be empty if save=False).
+# MAGIC     """
+# MAGIC     if pos is None:
+# MAGIC         pos = nx.spring_layout(G, seed=42, k=3.0, iterations=100)
+# MAGIC
+# MAGIC     if edge_widths is None or edge_alphas is None:
+# MAGIC         edge_widths, edge_alphas = precompute_edge_style(G)
+# MAGIC
+# MAGIC     os.makedirs(outdir, exist_ok=True)
+# MAGIC     outputs = []
+# MAGIC
+# MAGIC     for res in selected_resolutions:
+# MAGIC         print(f"\nGenerating plot for resolution γ={res}...")
+# MAGIC         rep = rep_by_res[res]
+# MAGIC         membership = rep["membership"]
+# MAGIC         quality = rep["quality"]
+# MAGIC
+# MAGIC         leiden_df = membership_to_leiden_df(membership)
+# MAGIC
+# MAGIC         # Map stream -> community
+# MAGIC         node_to_comm = dict(zip(leiden_df["stream"], leiden_df["community"]))
+# MAGIC
+# MAGIC         # Color nodes by community id
+# MAGIC         node_colors = [node_to_comm.get(n, -1) for n in G.nodes()]
+# MAGIC
+# MAGIC         # Compute a few plot annotations
+# MAGIC         counts = np.bincount(membership)
+# MAGIC         n_comms = len(counts)
+# MAGIC         largest_share = counts.max() / g_igraph.vcount()
+# MAGIC         tiny_lt5 = int((counts < 5).sum())
+# MAGIC
+# MAGIC         # --- Create figure ---
+# MAGIC         fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+# MAGIC
+# MAGIC         # Draw edges first (behind nodes)
+# MAGIC         print(f"  Drawing {G.number_of_edges()} edges...")
+# MAGIC         for (u, v), lw, a in zip(G.edges(), edge_widths, edge_alphas):
+# MAGIC             nx.draw_networkx_edges(
+# MAGIC                 G, pos,
+# MAGIC                 edgelist=[(u, v)],
+# MAGIC                 width=float(lw),
+# MAGIC                 alpha=float(a),
+# MAGIC                 ax=ax,
+# MAGIC                 edge_color='gray'
+# MAGIC             )
+# MAGIC
+# MAGIC         # Draw nodes
+# MAGIC         print(f"  Drawing {G.number_of_nodes()} nodes...")
+# MAGIC         nx.draw_networkx_nodes(
+# MAGIC             G, pos,
+# MAGIC             node_color=node_colors,
+# MAGIC             node_size=node_size,
+# MAGIC             cmap=cmap,
+# MAGIC             linewidths=2.0,
+# MAGIC             edgecolors='black',
+# MAGIC             ax=ax
+# MAGIC         )
+# MAGIC
+# MAGIC         # Draw labels
+# MAGIC         if draw_labels:
+# MAGIC             if use_adjust_text:
+# MAGIC                 print(f"  Adding labels with overlap prevention...")
+# MAGIC                 texts = []
+# MAGIC                 for node, (x, y) in pos.items():
+# MAGIC                     texts.append(
+# MAGIC                         ax.text(
+# MAGIC                             x, y, str(node),
+# MAGIC                             fontsize=label_fontsize,
+# MAGIC                             ha='center',
+# MAGIC                             va='center',
+# MAGIC                             fontweight='bold',
+# MAGIC                             bbox=dict(
+# MAGIC                                 boxstyle='round,pad=0.4',
+# MAGIC                                 facecolor='white',
+# MAGIC                                 edgecolor='gray',
+# MAGIC                                 linewidth=0.5,
+# MAGIC                                 alpha=0.85
+# MAGIC                             )
+# MAGIC                         )
+# MAGIC                     )
+# MAGIC                 
+# MAGIC                 # Adjust text positions to avoid overlap
+# MAGIC                 adjust_text(
+# MAGIC                     texts,
+# MAGIC                     arrowprops=dict(arrowstyle='->', color='gray', lw=0.8, alpha=0.6),
+# MAGIC                     expand_points=(2.0, 2.0),
+# MAGIC                     expand_text=(1.5, 1.5),
+# MAGIC                     force_points=(0.8, 0.8),
+# MAGIC                     force_text=(0.8, 0.8),
+# MAGIC                     ax=ax,
+# MAGIC                     lim=500
+# MAGIC                 )
+# MAGIC             else:
+# MAGIC                 # Standard labels with background
+# MAGIC                 for node, (x, y) in pos.items():
+# MAGIC                     ax.text(
+# MAGIC                         x, y, str(node),
+# MAGIC                         fontsize=label_fontsize,
+# MAGIC                         ha='center',
+# MAGIC                         va='center',
+# MAGIC                         fontweight='bold',
+# MAGIC                         bbox=dict(
+# MAGIC                             boxstyle='round,pad=0.4',
+# MAGIC                             facecolor='white',
+# MAGIC                             edgecolor='gray',
+# MAGIC                             linewidth=0.5,
+# MAGIC                             alpha=0.85
+# MAGIC                         )
+# MAGIC                     )
+# MAGIC
+# MAGIC         title = (
+# MAGIC             f"Leiden (RBConfiguration) — resolution γ={res} (seed={rep['seed']})\n"
+# MAGIC             f"#communities={n_comms}, largest_comm_share={largest_share:.3f}, "
+# MAGIC             f"small_comms<5={tiny_lt5}, quality={quality:.2f}"
+# MAGIC         )
+# MAGIC         ax.set_title(title, fontsize=22, fontweight='bold', pad=30)
+# MAGIC         ax.axis("off")
+# MAGIC         ax.margins(0.1)  # Add margin around plot
+# MAGIC         
+# MAGIC         plt.tight_layout()
+# MAGIC
+# MAGIC         if save:
+# MAGIC             outfile = os.path.join(outdir, f"leiden_rb_gamma_{res}.png")
+# MAGIC             print(f"  Saving high-resolution plot...")
+# MAGIC             plt.savefig(outfile, bbox_inches="tight", dpi=dpi, facecolor='white')
+# MAGIC             outputs.append(outfile)
+# MAGIC             print(f"  Saved: {outfile}")
+# MAGIC
+# MAGIC         if show:
+# MAGIC             plt.show()
+# MAGIC         else:
+# MAGIC             plt.close(fig)
+# MAGIC
+# MAGIC     return outputs
+# MAGIC
+# MAGIC
+# MAGIC
+# MAGIC
+# MAGIC selected, selected_resolutions = select_resolutions(summary, ari_target=0.93, max_largest_comm_share=0.25)
+# MAGIC print("Selected resolutions:", selected_resolutions)
+# MAGIC print(selected[["resolution", "largest_comm_share_avg", "stability_ari", "n_communities_avg"]])
+# MAGIC
+# MAGIC print("\nGenerating high-resolution plots with improved readability...")
+# MAGIC print("This may take several minutes depending on graph size.\n")
+# MAGIC
+# MAGIC # Ensure we're using the volume path from the widget parameter
+# MAGIC output_dir = os.path.join(output_path, "leiden_plots")
+# MAGIC print(f"Output directory: {output_dir}")
+# MAGIC print(f"Saving plots to volume location (not git folder)\n")
+# MAGIC
+# MAGIC pos = precompute_layout(G, seed=42, k=3.0)  # More spacing
+# MAGIC edge_widths, edge_alphas = precompute_edge_style(G)
+# MAGIC
+# MAGIC plot_leiden_resolutions(
+# MAGIC     G=G,
+# MAGIC     g_igraph=g,
+# MAGIC     selected_resolutions=selected_resolutions,
+# MAGIC     rep_by_res=rep_by_res,
+# MAGIC     membership_to_leiden_df=membership_to_leiden_df,
+# MAGIC     pos=pos,
+# MAGIC     edge_widths=edge_widths,
+# MAGIC     edge_alphas=edge_alphas,
+# MAGIC     outdir=output_dir,  # Using volume path
+# MAGIC     figsize=(50, 40),  # Very large figure
+# MAGIC     dpi=400,  # High resolution
+# MAGIC     label_fontsize=11,  # Larger font
+# MAGIC     node_size=800,  # Larger nodes
+# MAGIC     draw_labels=True,
+# MAGIC     save=True,
+# MAGIC     show=False,
+# MAGIC     use_adjust_text=True,  # Prevent label overlap
+# MAGIC )
+# MAGIC
+# MAGIC print("\n" + "="*80)
+# MAGIC print("COMPLETE: All plots saved with high resolution (400 DPI)")
+# MAGIC print(f"Output directory: {output_dir}")
+# MAGIC print("Plots can be zoomed in with full clarity.")
+# MAGIC print("="*80)
 
 # COMMAND ----------
 
@@ -1245,18 +1058,16 @@ print("="*80)
 
 # COMMAND ----------
 
-import os
-import numpy as np
-import pandas as pd
-import networkx as nx
-import matplotlib.pyplot as plt
-
+# DBTITLE 1,Analysis & Plotting
 # Helper to build leiden_df from a stored membership array
 def membership_to_leiden_df(membership, igraph_names):
-    return pd.DataFrame({
-        "stream": np.array(igraph_names),
-        "community": np.array(membership, dtype=int),
-    })
+    return pd.DataFrame(
+        {
+            "stream": np.array(igraph_names),
+            "community": np.array(membership, dtype=int),
+        }
+    )
+
 
 # Choose which solution to visualize
 def get_leiden_df(resolution, rep_by_res, igraph_names):
@@ -1269,6 +1080,7 @@ def get_leiden_df(resolution, rep_by_res, igraph_names):
     }
     return leiden_df, meta
 
+
 # Helper: scale edge widths/alphas for a given graph
 def edge_style(subG, weight_attr="weight", min_w=0.2, max_w=3.2):
     if subG.number_of_edges() == 0:
@@ -1278,6 +1090,7 @@ def edge_style(subG, weight_attr="weight", min_w=0.2, max_w=3.2):
     widths = min_w + (max_w - min_w) * (w - w_min) / (w_max - w_min + 1e-9)
     alphas = 0.10 + 0.60 * (w - w_min) / (w_max - w_min + 1e-9)
     return widths, alphas
+
 
 def plot_communities_with_analysis_safe(
     G,
@@ -1299,24 +1112,20 @@ def plot_communities_with_analysis_safe(
     save=True,
     filename_prefix="community",
     max_labels=120,
+    enable_plotting=False,
 ):
-    import os
-    import numpy as np
-    import networkx as nx
-    import matplotlib.pyplot as plt
 
     os.makedirs(outdir, exist_ok=True)
 
     node_to_comm = dict(zip(leiden_df["stream"], leiden_df["community"]))
     labeled_nodes = [n for n in G.nodes() if n in node_to_comm]
 
-    # Global layout (works for most nodes)
-    pos_global = nx.spring_layout(
-        G.subgraph(labeled_nodes),
-        seed=layout_seed,
-        k=layout_k,
-        iterations=layout_iterations
-    )
+    # Global layout (only compute if plotting is enabled)
+    pos_global = None
+    if enable_plotting:
+        pos_global = nx.spring_layout(
+            G.subgraph(labeled_nodes), seed=layout_seed, k=layout_k, iterations=layout_iterations
+        )
 
     stream_table_pdf = stream_table_dependency_df.toPandas().copy()
     merged_edges_pdf = merged_edges_df.toPandas().copy()
@@ -1324,179 +1133,220 @@ def plot_communities_with_analysis_safe(
     communities = sorted(leiden_df["community"].unique())
     saved_files = []
 
+    # Convert DataFrames to pandas for analysis
+    stream_table_pdf = stream_table_dependency_df.toPandas()
+    merged_edges_pdf = merged_edges_df.toPandas()
+
     for c in communities:
         comm_dir = os.path.join(outdir, f"community_{c}")
         os.makedirs(comm_dir, exist_ok=True)
 
         comm_nodes = [n for n in labeled_nodes if node_to_comm[n] == c]
-        streams_in_comm = set(comm_nodes)
+        streams_in_community = set(comm_nodes)
 
-        H = G.subgraph(comm_nodes).copy()
-        print(f"Community {c}: nodes={H.number_of_nodes()}, edges={H.number_of_edges()}")
+        if enable_plotting:
+            H = G.subgraph(comm_nodes).copy()
+            print(f"Community {c}: nodes={H.number_of_nodes()}, edges={H.number_of_edges()}")
 
-        # ---- analysis (same as before) ----
-        incoming_rows = stream_table_pdf[
-            (~stream_table_pdf["from"].isin(streams_in_comm)) &
-            (stream_table_pdf["to"].isin(streams_in_comm))
-        ][["table", "from", "to"]].drop_duplicates()
+        # ---- ANALYSIS (always runs regardless of plotting) ----
 
-        outgoing_rows = stream_table_pdf[
-            (stream_table_pdf["from"].isin(streams_in_comm)) &
-            (~stream_table_pdf["to"].isin(streams_in_comm))
-        ][["table", "from", "to"]].drop_duplicates()
+        # === Generate Analysis ===
 
-        incoming_tables = sorted(incoming_rows["table"].unique().tolist())
-        outgoing_tables = sorted(outgoing_rows["table"].unique().tolist())
+        # 1. List of streams in community
+        streams_list = sorted(list(streams_in_community))
 
-        cross_edges = merged_edges_pdf[
-            (merged_edges_pdf["streamA"].isin(streams_in_comm) & ~merged_edges_pdf["streamB"].isin(streams_in_comm)) |
-            (~merged_edges_pdf["streamA"].isin(streams_in_comm) & merged_edges_pdf["streamB"].isin(streams_in_comm))
-        ].copy()
+        # 2. Find tables that are SRC of streams inside but TGT of streams outside
+        # In stream_table_dependency_df:
+        #   - 'from' stream writes to 'table' (table is TGT of 'from' stream)
+        #   - 'to' stream reads from 'table' (table is SRC of 'to' stream)
+        # So we want: 'from' OUTSIDE community AND 'to' INSIDE community
 
-        streams_sorted = sorted(list(streams_in_comm))
+        # Tables that are SRC of inside streams, TGT of outside streams
+        # (produced outside, consumed inside)
+        tables_src_inside_tgt_outside = stream_table_pdf[
+            (~stream_table_pdf['from'].isin(streams_in_community)) & (stream_table_pdf['to'].isin(streams_in_community))
+        ][['table', 'from', 'to', 'size']].drop_duplicates(subset=['table'])
 
-        analysis_lines = []
-        analysis_lines.append(f"Community {c} Analysis (Resolution γ={resolution})")
-        analysis_lines.append("=" * 80)
-        analysis_lines.append("")
-        analysis_lines.append(f"1) STREAMS IN COMMUNITY ({len(streams_sorted)}):")
-        analysis_lines.append("-" * 80)
-        for i, s in enumerate(streams_sorted, 1):
-            analysis_lines.append(f"{i}. {s}")
+        # Tables that are TGT of inside streams, SRC of outside streams
+        # (produced inside, consumed outside)
+        tables_tgt_inside_src_outside = stream_table_pdf[
+            (stream_table_pdf['from'].isin(streams_in_community)) & (~stream_table_pdf['to'].isin(streams_in_community))
+        ][['table', 'from', 'to', 'size']].drop_duplicates(subset=['table'])
 
-        analysis_lines.append("")
-        analysis_lines.append("2) TABLES FLOWING INTO COMMUNITY (produced outside → consumed inside)")
-        analysis_lines.append("-" * 80)
-        analysis_lines.append(f"Unique tables: {len(incoming_tables)}")
-        if len(incoming_rows) > 0:
-            for _, r in incoming_rows.iterrows():
-                analysis_lines.append(
-                    f"  Table: {r['table']} | Produced by (outside): {r['from']} | Consumed by (inside): {r['to']}"
-                )
+        # Get aggregated edge connections (for summary)
+        outgoing_edges = merged_edges_pdf[
+            (merged_edges_pdf['streamA'].isin(streams_in_community))
+            & (~merged_edges_pdf['streamB'].isin(streams_in_community))
+        ]
+
+        incoming_edges = merged_edges_pdf[
+            (~merged_edges_pdf['streamA'].isin(streams_in_community))
+            & (merged_edges_pdf['streamB'].isin(streams_in_community))
+        ]
+
+        # Create analysis output
+        analysis_content = f"""Community {c} Analysis (Resolution γ={resolution})
+{'='*80}
+
+1. STREAMS IN COMMUNITY ({len(streams_list)} streams):
+{'-'*80}
+"""
+        for i, stream in enumerate(streams_list, 1):
+            analysis_content += f"{i}. {stream}\n"
+
+        analysis_content += f"""\n2. TABLES - SRC OF STREAMS INSIDE, TGT OF STREAMS OUTSIDE:
+{'-'*80}
+These are tables that streams in this community READ FROM, but are WRITTEN BY streams outside.
+(Dependencies flowing INTO the community)
+Total: {len(tables_src_inside_tgt_outside)} unique tables\n\n"""
+
+        if len(tables_src_inside_tgt_outside) > 0:
+            for idx, row in tables_src_inside_tgt_outside.iterrows():
+                analysis_content += f"  Table: {row['table']}\n"
+                analysis_content += f"    - Written by (outside): {row['from']}\n"
+                analysis_content += f"    - Read by (inside): {row['to']}\n"
+                analysis_content += f"    - Size: {row['size']} GB\n\n"
         else:
-            analysis_lines.append("  (None)")
+            analysis_content += "  (No such tables found)\n"
 
-        analysis_lines.append("")
-        analysis_lines.append("3) TABLES FLOWING OUT OF COMMUNITY (produced inside → consumed outside)")
-        analysis_lines.append("-" * 80)
-        analysis_lines.append(f"Unique tables: {len(outgoing_tables)}")
-        if len(outgoing_rows) > 0:
-            for _, r in outgoing_rows.iterrows():
-                analysis_lines.append(
-                    f"  Table: {r['table']} | Produced by (inside): {r['from']} | Consumed by (outside): {r['to']}"
-                )
+        analysis_content += f"""\n3. TABLES - TGT OF STREAMS INSIDE, SRC OF STREAMS OUTSIDE:
+{'-'*80}
+These are tables that streams in this community WRITE TO, but are READ BY streams outside.
+(Dependencies flowing OUT OF the community)
+Total: {len(tables_tgt_inside_src_outside)} unique tables\n\n"""
+
+        if len(tables_tgt_inside_src_outside) > 0:
+            for idx, row in tables_tgt_inside_src_outside.iterrows():
+                analysis_content += f"  Table: {row['table']}\n"
+                analysis_content += f"    - Written by (inside): {row['from']}\n"
+                analysis_content += f"    - Read by (outside): {row['to']}\n"
+                analysis_content += f"    - Size: {row['size']} GB\n\n"
+
         else:
-            analysis_lines.append("  (None)")
+            analysis_content += "  (No such tables found)\n"
 
-        analysis_lines.append("")
-        analysis_lines.append("4) CROSS-COMMUNITY STREAM CONNECTIONS (from merged edges)")
-        analysis_lines.append("-" * 80)
-        analysis_lines.append(f"Cross edges: {len(cross_edges)}")
-        if len(cross_edges) > 0:
-            cross_edges_sorted = cross_edges.sort_values("weight", ascending=False)
-            for _, r in cross_edges_sorted.iterrows():
-                analysis_lines.append(f"  {r['streamA']} — {r['streamB']} (weight={r['weight']})")
+        analysis_content += f"""\n4. AGGREGATED STREAM CONNECTIONS:
+{'-'*80}
+
+4a. Outgoing Stream Connections (Inside → Outside):
+"""
+        if len(outgoing_edges) > 0:
+            analysis_content += f"Total: {len(outgoing_edges)} connections\n\n"
+            for idx, row in outgoing_edges.iterrows():
+                analysis_content += f"  {row['streamA']} → {row['streamB']} (weight: {row['weight']})\n"
         else:
-            analysis_lines.append("  (None)")
+            analysis_content += "  (No outgoing connections)\n"
 
-        analysis_lines.append("")
-        analysis_lines.append("5) SUMMARY")
-        analysis_lines.append("-" * 80)
-        analysis_lines.append(f"Streams: {len(streams_sorted)}")
-        analysis_lines.append(f"Internal edges: {H.number_of_edges()}")
-        analysis_lines.append(f"Incoming unique tables: {len(incoming_tables)}")
-        analysis_lines.append(f"Outgoing unique tables: {len(outgoing_tables)}")
-        analysis_lines.append(f"Cross-community edges: {len(cross_edges)}")
+        analysis_content += f"""\n4b. Incoming Stream Connections (Outside → Inside):
+"""
+        if len(incoming_edges) > 0:
+            analysis_content += f"Total: {len(incoming_edges)} connections\n\n"
+            for idx, row in incoming_edges.iterrows():
+                analysis_content += f"  {row['streamA']} → {row['streamB']} (weight: {row['weight']})\n"
+        else:
+            analysis_content += "  (No incoming connections)\n"
 
-        analysis_file = os.path.join(comm_dir, f"{filename_prefix}_{c}_analysis.txt")
-        with open(analysis_file, "w") as f:
-            f.write("\n".join(analysis_lines))
+        analysis_content += f"""\n5. SUMMARY:
+{'-'*80}
+  - Total streams in community: {len(streams_list)}
+  - Tables flowing INTO community (SRC inside, TGT outside): {len(tables_src_inside_tgt_outside)}
+  - Tables flowing OUT OF community (TGT inside, SRC outside): {len(tables_tgt_inside_src_outside)}
+  - Aggregated outgoing stream connections: {len(outgoing_edges)}
+  - Aggregated incoming stream connections: {len(incoming_edges)}
+"""
+
+        # Save analysis file
+        analysis_file = os.path.join(comm_dir, f"community_{c}_analysis.txt")
+        with open(analysis_file, 'w') as f:
+            f.write(analysis_content)
+        print(f"  Saved analysis: {analysis_file}")
         saved_files.append(analysis_file)
 
-        # ---- plot ----
-        # Build pos from global layout where possible
-        pos = {n: pos_global[n] for n in H.nodes() if n in pos_global}
+        # ---- PLOTTING (only if enabled) ----
+        if enable_plotting:
+            # Build pos from global layout where possible
+            pos = {n: pos_global[n] for n in H.nodes() if n in pos_global}
 
-        # Patch missing positions with local layout (prevents KeyError)
-        missing = [n for n in H.nodes() if n not in pos]
-        if missing:
-            pos_local = nx.spring_layout(H, seed=layout_seed, k=layout_k, iterations=20)
-            for n in missing:
-                pos[n] = pos_local[n]
+            # Patch missing positions with local layout (prevents KeyError)
+            missing = [n for n in H.nodes() if n not in pos]
+            if missing:
+                pos_local = nx.spring_layout(H, seed=layout_seed, k=layout_k, iterations=20)
+                for n in missing:
+                    pos[n] = pos_local[n]
 
-        widths, alphas = edge_style(H, weight_attr=weight_attr)
+            widths, alphas = edge_style(H, weight_attr=weight_attr)
 
-        plt.figure(figsize=figsize, dpi=dpi)
+            plt.figure(figsize=figsize, dpi=dpi)
 
-        nx.draw_networkx_nodes(
-            H, pos,
-            node_size=node_size,
-            node_color=[c] * H.number_of_nodes(),
-            cmap=cmap
-        )
+            nx.draw_networkx_nodes(H, pos, node_size=node_size, node_color=[c] * H.number_of_nodes(), cmap=cmap)
 
-        for (u, v), lw, a in zip(H.edges(), widths, alphas):
-            nx.draw_networkx_edges(H, pos, edgelist=[(u, v)], width=float(lw), alpha=float(a))
+            for (u, v), lw, a in zip(H.edges(), widths, alphas):
+                nx.draw_networkx_edges(H, pos, edgelist=[(u, v)], width=float(lw), alpha=float(a))
 
-        # Label only nodes we definitely have positions for
-        label_nodes = [n for n in H.nodes() if n in pos]
-        if len(label_nodes) <= max_labels:
-            nx.draw_networkx_labels(H, pos, font_size=font_size)
+            # Label only nodes we definitely have positions for
+            label_nodes = [n for n in H.nodes() if n in pos]
+            if len(label_nodes) <= max_labels:
+                # Create labels dict with only nodes that have positions
+                labels = {n: n for n in label_nodes}
+                nx.draw_networkx_labels(H, pos, labels=labels, font_size=font_size)
+            else:
+                subset = label_nodes[:max_labels]
+                labels = {n: n for n in subset}
+                nx.draw_networkx_labels(H, pos, labels=labels, font_size=font_size)
+
+            plt.title(f"Community {c} — nodes={H.number_of_nodes()} edges={H.number_of_edges()}", fontsize=16)
+            plt.axis("off")
+            plt.tight_layout()
+
+            if save:
+                plot_file = os.path.join(comm_dir, f"{filename_prefix}_{c}.png")
+                plt.savefig(plot_file, bbox_inches="tight")
+                saved_files.append(plot_file)
+
+            if show:
+                plt.show()
+            else:
+                plt.close()
         else:
-            subset = label_nodes[:max_labels]
-            nx.draw_networkx_labels(H, {n: pos[n] for n in subset}, font_size=font_size)
-
-        plt.title(f"Community {c} — nodes={H.number_of_nodes()} edges={H.number_of_edges()}", fontsize=16)
-        plt.axis("off")
-        plt.tight_layout()
-
-        if save:
-            plot_file = os.path.join(comm_dir, f"{filename_prefix}_{c}.png")
-            plt.savefig(plot_file, bbox_inches="tight")
-            saved_files.append(plot_file)
-
-        if show:
-            plt.show()
-        else:
-            plt.close()
+            print(f"  Skipping plot generation (enable_plotting=False)")
 
     return saved_files
 
 
 # ---- Example usage  ----
-resolution = 2.6
-leiden_df, meta = get_leiden_df(resolution, rep_by_res, igraph_names)
-print(meta)
+resolution = [1.4, 1.7]
+for res in resolution:
+    leiden_df, meta = get_leiden_df(res, rep_by_res, igraph_names)
+    print(meta)
 
-saved = plot_communities_with_analysis_safe(
-    G=G,
-    leiden_df=leiden_df,
-    stream_table_dependency_df=stream_stream_dependency_df,
-    merged_edges_df=merged_dependency_df,
-    resolution=resolution,
-    outdir=f"{volume_path}leiden_community_plots_gamma_{resolution}",
-    layout_seed=42,
-    layout_k=None,                 # same as your working code
-    layout_iterations=30,          # safer than 100
-    figsize=(24, 18),              # safer than (40,32)
-    dpi=220,                       # safer than 300
-    node_size=220,
-    font_size=8,
-    show=False,
-    save=True,
-    filename_prefix=f"gamma_{resolution}_comm",
-    max_labels=120                 # guardrail
-)
-print(f"Saved {len(saved)} files")
-
+    saved = plot_communities_with_analysis_safe(
+        G=G,
+        leiden_df=leiden_df,
+        stream_table_dependency_df=stream_stream_dependency_df,
+        merged_edges_df=merged_dependency_df,
+        resolution=res,
+        outdir=f"{output_path}leiden_community_plots_gamma_{res}",
+        layout_seed=42,
+        layout_k=None,
+        layout_iterations=30,
+        figsize=(24, 18),
+        dpi=220,
+        node_size=220,
+        font_size=8,
+        show=False,
+        save=True,
+        filename_prefix=f"gamma_{res}_comm",
+        max_labels=120,
+        enable_plotting=False,
+    )
+    print(f"Saved {len(saved)} files")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC
 # MAGIC # Community Ordering Optimization
 # MAGIC
-# MAGIC This module determines an execution order for communities at a fixed Leiden resolution in order to **minimize total data synchronization effort** between communities.
+# MAGIC This module determines an execution order for communities at a fixed Leiden resolution to **minimize total data synchronization effort** between communities.
 # MAGIC
 # MAGIC The goal is to ensure that, as communities are processed sequentially, the amount of external data that must be synchronized into each community is as small as possible.
 # MAGIC
@@ -1504,9 +1354,7 @@ print(f"Saved {len(saved)} files")
 # MAGIC
 # MAGIC ## Objective
 # MAGIC
-# MAGIC Order communities such that the **cumulative synchronization cost** across all communities is minimized.
-# MAGIC
-# MAGIC Unlike earlier versions, the optimization is performed on the **same scaled table weights** that are used to construct the community graph itself, ensuring full consistency between clustering and execution ordering.
+# MAGIC Order communities so that the **cumulative synchronization cost** across all communities is minimized.
 # MAGIC
 # MAGIC ---
 # MAGIC
@@ -1514,26 +1362,19 @@ print(f"Saved {len(saved)} files")
 # MAGIC
 # MAGIC For a given ordering of communities:
 # MAGIC
-# MAGIC * For each community in sequence, identify the set of tables that  
-# MAGIC   **streams inside the community READ FROM** but are **WRITTEN BY streams outside**.
+# MAGIC - For each community in sequence, identify the set of tables that **streams inside the community read from** but are **written by streams outside**.
+# MAGIC - Tables already produced by previously ordered communities are considered **already available** and do **not** incur any cost.
+# MAGIC - The **sync cost for a community** is defined as:
 # MAGIC
-# MAGIC * Tables that have already been produced by previously ordered communities are considered **already available** and do **not** incur any cost.
+# MAGIC   $$
+# MAGIC   \mathrm{SyncCost(community)} = \sum_{t \in \mathrm{TablesToSync}} \mathrm{weight}(t)
+# MAGIC   $$
 # MAGIC
-# MAGIC * The **sync cost for a community** is defined as:
-# MAGIC
-# MAGIC \[
-# MAGIC \text{SyncCost(community)} = \sum_{t \in \text{TablesToSync}} \text{ScaledTableWeight}(t)
-# MAGIC \]
-# MAGIC
-# MAGIC where `ScaledTableWeight` is the **min–max scaled and Tableau-adjusted table weight** used in the Leiden graph construction.
-# MAGIC
-# MAGIC * The **total cost of an ordering** is the sum of sync costs over all communities in that order.
+# MAGIC - The **total cost of an ordering** is the sum of sync costs over all communities in that order.
 # MAGIC
 # MAGIC This formulation naturally penalizes both:
-# MAGIC - **many tables** (large cardinality), and
-# MAGIC - **large tables** (high data volume),
-# MAGIC
-# MAGIC without requiring separate weighting terms.
+# MAGIC - **Many tables** (large cardinality)
+# MAGIC - **Large tables** (high data volume)
 # MAGIC
 # MAGIC ---
 # MAGIC
@@ -1541,30 +1382,119 @@ print(f"Saved {len(saved)} files")
 # MAGIC
 # MAGIC Because the search space grows factorially, the optimization is performed in two independent phases:
 # MAGIC
-# MAGIC 1. **Brute-force optimization of the 10 largest communities**, guaranteeing an optimal ordering for the most impactful portion of the graph.
+# MAGIC 1. **Brute-force optimization of the N largest communities**, guaranteeing an optimal ordering for the most impactful portion of the graph.
 # MAGIC 2. **Brute-force optimization of the remaining communities**.
 # MAGIC
 # MAGIC The final execution order is obtained by concatenating both optimal orderings:
 # MAGIC
-# MAGIC \[
-# MAGIC \text{FinalOrder} = \text{Order}_{\text{Top10}} \;\Vert\; \text{Order}_{\text{Rest}}
-# MAGIC \]
+# MAGIC   $$
+# MAGIC   \mathrm{FinalOrder} = \mathrm{Order}_{\mathrm{Rest}} \;\Vert\; \mathrm{Order}_{\mathrm{TopN}}
+# MAGIC   $$
 # MAGIC
 # MAGIC This split preserves optimality where it matters most while keeping the computation tractable.
-# MAGIC
-# MAGIC ---
-# MAGIC
-# MAGIC ## Key Properties
-# MAGIC
-# MAGIC * Cost function is **fully aligned with community detection weights**  
-# MAGIC * No heuristic mixing of size and table count  
-# MAGIC * Deterministic optimal solutions within each optimization block  
-# MAGIC * Directly reflects actual data movement requirements
-# MAGIC
-# MAGIC
 
 # COMMAND ----------
 
+# DBTITLE 1,Split communities by total weight 
+def split_communities_topN(leiden_df, top_n=9):
+    """
+    Split communities into top N heaviest and the rest based on total incoming table weight
+    (sum of table weights for tables read by streams in the community, but written by streams outside).
+    
+    OPTIMIZED VERSION: Uses Spark distributed computing instead of pandas loops.
+    
+    Parameters
+    ----------
+    leiden_df : pd.DataFrame
+        DataFrame with columns ['stream', 'community']
+    top_n : int
+        Number of top communities to select (default 9)
+    
+    Returns
+    -------
+    top_n_ids : list
+        Community IDs for the top N heaviest communities
+    rest_ids : list
+        Community IDs for the remaining communities
+    community_weights : dict
+        Dictionary mapping community ID to total incoming table weight
+    """
+    from pyspark.sql.functions import col, sum as spark_sum, broadcast
+    
+    print(f"Splitting communities into top {top_n} by incoming table weight...")
+
+    # Convert leiden_df to Spark DataFrame for distributed join
+    leiden_spark = spark.createDataFrame(leiden_df)
+    
+    # Broadcast the small leiden mapping for efficient joins
+    leiden_broadcast = broadcast(leiden_spark)
+    
+    # Join unique_table_weights with community assignments for both 'from' and 'to' streams
+    # This adds community labels to each edge
+    edges_with_communities = (
+        unique_table_weights
+        .select("from", "to", "table", "table_weight")
+        .join(
+            leiden_broadcast.selectExpr("stream as from", "community as from_community"),
+            on="from",
+            how="inner"
+        )
+        .join(
+            leiden_broadcast.selectExpr("stream as to", "community as to_community"),
+            on="to",
+            how="inner"
+        )
+    )
+    
+    # Filter for incoming edges: tables read by streams in a community but written by streams outside
+    # (from_community != to_community)
+    incoming_edges = edges_with_communities.filter(
+        col("from_community") != col("to_community")
+    )
+    
+    # Aggregate: sum weight by to_community (the community receiving the data)
+    community_weights_spark = (
+        incoming_edges
+        .groupBy("to_community")
+        .agg(spark_sum("table_weight").alias("total_incoming_weight"))
+        .orderBy(col("total_incoming_weight").desc())
+    )
+    
+    # Convert only the small aggregated result to pandas
+    community_weights_pdf = community_weights_spark.toPandas()
+    
+    # Create dictionary mapping community -> weight
+    community_weights = dict(
+        zip(community_weights_pdf['to_community'], community_weights_pdf['total_incoming_weight'])
+    )
+    
+    # Handle communities with no incoming edges (weight = 0)
+    all_communities = set(leiden_df['community'].unique())
+    for comm in all_communities:
+        if comm not in community_weights:
+            community_weights[comm] = 0.0
+    
+    # Sort communities by weight (descending)
+    sorted_comms = sorted(community_weights.items(), key=lambda x: x[1], reverse=True)
+    top_n_actual = min(top_n, len(sorted_comms))
+    top_n_ids = [comm_id for comm_id, _ in sorted_comms[:top_n_actual]]
+    rest_ids = [comm_id for comm_id, _ in sorted_comms[top_n_actual:]]
+
+    print(f"\n=== Community Split (top_n={top_n}) ===")
+    print(f"Total communities: {len(sorted_comms)}")
+    print(f"Top {top_n_actual} communities: {top_n_ids}")
+    print(f"Remaining communities: {len(rest_ids)}")
+    print(f"\nTop {top_n_actual} community incoming weights:")
+    for comm_id, weight in sorted_comms[:top_n_actual]:
+        num_streams = len(leiden_df[leiden_df['community'] == comm_id])
+        print(f"  Community {comm_id}: incoming_weight={weight:.2f}, streams={num_streams}")
+
+    print(f"\nCommunities split into top {top_n_actual} communities: {top_n_ids} and {len(rest_ids)} others")
+    return top_n_ids, rest_ids, community_weights
+
+# COMMAND ----------
+
+# DBTITLE 1,BruteForceCommunityOrdering with pre-available tables support
 import itertools
 import time
 from math import factorial
@@ -1573,21 +1503,40 @@ import pandas as pd
 import numpy as np
 
 
-class BruteForceCommunityOrderingScaledWeight:
+class BruteForceCommunityOrdering:
     """
     Brute force search over all community orderings (for a given subset of communities).
 
-    Cost = SUM of per-table 'scaled_table_weight' that must be synced at each step:
+    Cost = SUM of per-table 'weight' that must be synced at each step:
       to_sync(step) = incoming_tables[community] - available_tables_so_far
       step_cost     = sum(table_weight[table] for table in to_sync)
       total_cost    = sum(step_cost)
+      
+    Supports pre-available tables: when optimizing a subset of communities,
+    you can specify other communities whose produced tables should be considered
+    already available (e.g., when optimizing top N after rest communities).
     """
 
-    def __init__(self, stream_table_dependency_df_scaled, leiden_df, communities_subset=None):
+    def __init__(self, stream_table_dependency_df_scaled, leiden_df, communities_subset=None, 
+                 pre_available_communities=None):
+        """
+        Parameters
+        ----------
+        stream_table_dependency_df_scaled : Spark DataFrame
+            DataFrame with columns: from, to, table, table_weight
+        leiden_df : pd.DataFrame
+            DataFrame with columns: stream, community
+        communities_subset : list or None
+            List of community IDs to optimize. If None, uses all communities.
+        pre_available_communities : list or None
+            List of community IDs whose produced tables should be considered
+            already available at the start of optimization. Useful when optimizing
+            top N communities after rest communities have been ordered.
+        """
 
         self.dep = (
             stream_table_dependency_df_scaled
-            .select("from", "to", "table", "scaled_table_weight")
+            .select("from", "to", "table", "table_weight")
             .toPandas()
             .copy()
         )
@@ -1595,33 +1544,37 @@ class BruteForceCommunityOrderingScaledWeight:
         self.dep["from"] = self.dep["from"].astype(str)
         self.dep["to"] = self.dep["to"].astype(str)
         self.dep["table"] = self.dep["table"].astype(str)
-        self.dep["scaled_table_weight"] = pd.to_numeric(self.dep["scaled_table_weight"], errors="coerce").fillna(0.0)
+        self.dep["table_weight"] = pd.to_numeric(self.dep["table_weight"], errors="coerce").fillna(0.0)
 
         # table → single weight (max)
         self.table_weight = (
-            self.dep.groupby("table")["scaled_table_weight"].max().to_dict()
+            self.dep.groupby("table")["table_weight"].max().to_dict()
         )
 
-        # choose communities
+        # choose communities to optimize
         all_comms = sorted(leiden_df["community"].unique().astype(int).tolist())
         if communities_subset is None:
             comms = all_comms
         else:
             comms = sorted([int(c) for c in communities_subset])
 
-        self.community_streams = {
+        # Build community_streams for ALL communities (needed for pre-available calculation)
+        all_community_streams = {
             int(c): set(leiden_df.loc[leiden_df["community"] == c, "stream"].astype(str).tolist())
-            for c in comms
+            for c in all_comms
         }
+        
+        # Store only the subset we're optimizing
+        self.community_streams = {c: all_community_streams[c] for c in comms}
 
-        # produced tables per community
+        # produced tables per community (for communities we're optimizing)
         self.produced_tables = {}
         for c, streams in self.community_streams.items():
             self.produced_tables[c] = set(
                 self.dep[self.dep["from"].isin(streams)]["table"].unique()
             )
 
-        # incoming tables per community
+        # incoming tables per community (for communities we're optimizing)
         self.incoming_tables = {}
         for c, streams in self.community_streams.items():
             incoming = self.dep[
@@ -1631,9 +1584,44 @@ class BruteForceCommunityOrderingScaledWeight:
             self.incoming_tables[c] = set(incoming)
 
         self.communities = list(self.community_streams.keys())
+        
+        # Calculate pre-available tables from other communities
+        self.pre_available_tables = set()
+        if pre_available_communities is not None:
+            print(f"  Pre-available communities: {sorted(pre_available_communities)}")
+            for c in pre_available_communities:
+                if c in all_community_streams:
+                    streams = all_community_streams[c]
+                    tables = set(
+                        self.dep[self.dep["from"].isin(streams)]["table"].unique()
+                    )
+                    self.pre_available_tables |= tables
+            print(f"  Pre-available tables count: {len(self.pre_available_tables)}")
 
-    def evaluate_ordering_cost(self, ordering):
-        available = set()
+    def evaluate_ordering_cost(self, ordering, initial_available=None):
+        """
+        Evaluate the total sync cost for a given ordering.
+        
+        Parameters
+        ----------
+        ordering : tuple or list
+            Sequence of community IDs
+        initial_available : set or None
+            Set of tables that are already available at the start.
+            If None, uses self.pre_available_tables.
+        
+        Returns
+        -------
+        total : float
+            Total sync cost
+        step_costs : list
+            Cost at each step
+        """
+        if initial_available is None:
+            available = self.pre_available_tables.copy()
+        else:
+            available = initial_available.copy()
+            
         total = 0.0
         step_costs = []
 
@@ -1647,7 +1635,21 @@ class BruteForceCommunityOrderingScaledWeight:
         return total, step_costs
 
     def brute_force(self, log_every=5000, label="subset"):
-
+        """
+        Perform brute force search over all permutations.
+        
+        Parameters
+        ----------
+        log_every : int
+            Print progress every N permutations
+        label : str
+            Label for logging
+        
+        Returns
+        -------
+        dict
+            Results including best_cost, best_order, best_step_costs, total_time_sec, total_perms
+        """
         n = len(self.communities)
         total_perms = factorial(n)
 
@@ -1658,6 +1660,8 @@ class BruteForceCommunityOrderingScaledWeight:
         start = time.time()
 
         print(f"\n=== Brute force ({label}) | communities={n} | perms={total_perms} ===")
+        if len(self.pre_available_tables) > 0:
+            print(f"  Starting with {len(self.pre_available_tables)} pre-available tables")
 
         for i, perm in enumerate(itertools.permutations(self.communities), 1):
 
@@ -1695,737 +1699,77 @@ class BruteForceCommunityOrderingScaledWeight:
             "total_perms": total_perms
         }
 
-
 # COMMAND ----------
 
-resolution = 1.8
-leiden_df, meta = get_leiden_df(resolution, rep_by_res, igraph_names)
+# DBTITLE 1,Run order optimization for selected resolutions
+resolutions = [1.4, 1.7]
 
-top10_ids, rest_ids, _ = split_communities_topN(leiden_df, top_n=10)
+order_rows = []
 
-dep_scaled_df = unique_table_weights.select("from", "to", "table", "scaled_table_weight")
+for resolution in resolutions:
+    print(f"\n=== Processing resolution: {resolution} ===")
+    leiden_df, meta = get_leiden_df(resolution, rep_by_res, igraph_names)
 
-bf_top = BruteForceCommunityOrderingScaledWeight(dep_scaled_df, leiden_df, top10_ids)
-res_top = bf_top.brute_force(log_every=5000, label="TOP10")
+    topN_ids, rest_ids, _ = split_communities_topN(leiden_df, top_n=10)
 
-bf_rest = BruteForceCommunityOrderingScaledWeight(dep_scaled_df, leiden_df, rest_ids)
-res_rest = bf_rest.brute_force(log_every=5000, label="REST")
+    dep_scaled_df = unique_table_weights.select("from", "to", "table", "table_weight")
 
-final_order = res_top["best_order"] + res_rest["best_order"]
+    # Step 1: Optimize REST communities (no pre-available tables)
+    print(f"\n--- Step 1: Optimizing REST communities ---")
+    bf_rest = BruteForceCommunityOrdering(
+        dep_scaled_df, 
+        leiden_df, 
+        rest_ids,
+        pre_available_communities=None  # No pre-available tables for rest
+    )
+    res_rest = bf_rest.brute_force(log_every=5000, label=f"REST_gamma_{resolution}")
 
-print("\nFINAL MERGED ORDER:", final_order)
+    # Step 2: Optimize TOP N communities with REST tables as pre-available
+    print(f"\n--- Step 2: Optimizing TOP N communities (with REST tables pre-available) ---")
+    bf_top = BruteForceCommunityOrdering(
+        dep_scaled_df, 
+        leiden_df, 
+        topN_ids,
+        pre_available_communities=rest_ids  # REST tables are already available
+    )
+    res_top = bf_top.brute_force(log_every=5000, label=f"TOPN_gamma_{resolution}")
 
+    # Final order: REST first, then TOP N
+    final_order = res_rest["best_order"] + res_top["best_order"]
+    total_cost = res_rest['best_cost'] + res_top['best_cost']
 
-# COMMAND ----------
+    print(f"\n=== FINAL MERGED ORDER for γ={resolution} ===")
+    print(f"  REST order: {res_rest['best_order']}")
+    print(f"  TOP N order: {res_top['best_order']}")
+    print(f"  FINAL order: {final_order}")
+    print(f"  REST cost: {res_rest['best_cost']:.2f}")
+    print(f"  TOP N cost (with REST pre-available): {res_top['best_cost']:.2f}")
+    print(f"  Total cost: {total_cost:.2f}")
+    
+    # Format output with costs
+    order_line = (
+        f"gamma={resolution}: {final_order} | "
+        f"REST_cost={res_rest['best_cost']:.2f}, "
+        f"TOPN_cost={res_top['best_cost']:.2f}, "
+        f"TOTAL_cost={total_cost:.2f}"
+    )
+    order_rows.append(order_line)
 
-# DBTITLE 1,Community Ordering Functions
-# import itertools
-# from typing import Dict, List, Tuple, Set
-# import pandas as pd
-# import numpy as np
+# Write all orders to a text file in output_path
+orders_output_path = output_path + "community_execution_orders.txt"
+print(f"\n=== Writing results to: {orders_output_path} ===")
 
-# class CommunityOrderingOptimizer:
-#     """
-#     Optimizes the ordering of communities to minimize data synchronization costs.
-#     """
-    
-#     def __init__(self, stream_table_dependency_df, merged_edges_df, leiden_df, size_weight=0.75, count_weight=0.25):
-#         """
-#         Initialize the optimizer.
-        
-#         Parameters:
-#         -----------
-#         stream_table_dependency_df : DataFrame
-#             Spark DataFrame with columns [from, to, table, size]
-#             'from' writes to 'table', 'to' reads from 'table'
-#         merged_edges_df : DataFrame
-#             Spark DataFrame with columns [streamA, streamB, weight]
-#         leiden_df : DataFrame
-#             Pandas DataFrame with columns [stream, community]
-#         size_weight : float
-#             Weight for table size in cost calculation (default 0.75)
-#         count_weight : float
-#             Weight for table count in cost calculation (default 0.25)
-#         """
-#         self.stream_table_pdf = stream_table_dependency_df.toPandas().copy()
-#         self.merged_edges_pdf = merged_edges_df.toPandas().copy()
-#         self.leiden_df = leiden_df
-#         self.size_weight = size_weight
-#         self.count_weight = count_weight
-        
-#         # Build community -> streams mapping
-#         self.community_streams = {}
-#         for comm in leiden_df['community'].unique():
-#             self.community_streams[comm] = set(leiden_df[leiden_df['community'] == comm]['stream'].tolist())
-        
-#         # Precompute dependencies for each community
-#         self._precompute_dependencies()
-    
-#     def _precompute_dependencies(self):
-#         """
-#         Precompute for each community:
-#         - Tables that need to be synced (read by inside, written by outside)
-#         - Which communities produce those tables
-#         """
-#         self.community_dependencies = {}
-        
-#         for comm, streams_in_comm in self.community_streams.items():
-#             # Find tables that are SRC of streams inside but TGT of streams outside
-#             # (Dependencies flowing INTO the community)
-#             # Convert set to list for .isin() compatibility
-#             streams_list = list(streams_in_comm)
-#             incoming_tables = self.stream_table_pdf[
-#                 (~self.stream_table_pdf['from'].isin(streams_list)) & 
-#                 (self.stream_table_pdf['to'].isin(streams_list))
-#             ].copy()
-            
-#             # For each table, find which community produces it
-#             table_info = {}
-#             for _, row in incoming_tables.iterrows():
-#                 table = row['table']
-#                 producer_stream = row['from']
-#                 size = float(row['size']) if pd.notna(row['size']) else 0.0
-                
-#                 # Find which community the producer belongs to
-#                 producer_comm = None
-#                 for c, streams in self.community_streams.items():
-#                     if producer_stream in streams:
-#                         producer_comm = c
-#                         break
-                
-#                 if table not in table_info:
-#                     table_info[table] = {
-#                         'size': size,
-#                         'producer_communities': set(),
-#                         'producer_streams': set()
-#                     }
-                
-#                 if producer_comm is not None:
-#                     table_info[table]['producer_communities'].add(producer_comm)
-#                 table_info[table]['producer_streams'].add(producer_stream)
-            
-#             self.community_dependencies[comm] = table_info
-    
-#     def calculate_sync_cost(self, community, already_available_tables: Set[str]) -> Tuple[float, int, float, List[str]]:
-#         """
-#         Calculate sync cost for a community given already available tables.
-        
-#         Returns:
-#         --------
-#         (total_cost, num_tables_to_sync, total_size_to_sync, tables_to_sync)
-#         """
-#         table_info = self.community_dependencies[community]
-        
-#         tables_to_sync = []
-#         total_size = 0.0
-        
-#         for table, info in table_info.items():
-#             if table not in already_available_tables:
-#                 tables_to_sync.append(table)
-#                 total_size += info['size']
-        
-#         num_tables = len(tables_to_sync)
-        
-#         # Normalize for scoring (to make size and count comparable)
-#         # Use simple weighted sum
-#         cost = (self.size_weight * total_size) + (self.count_weight * num_tables)
-        
-#         return cost, num_tables, total_size, tables_to_sync
-    
-#     def get_tables_produced_by_community(self, community) -> Set[str]:
-#         """
-#         Get all tables that are produced (written) by streams in this community.
-#         """
-#         streams_in_comm = self.community_streams[community]
-        
-#         # Convert set to list for .isin() compatibility
-#         streams_list = list(streams_in_comm)
-#         # Tables where 'from' is in this community
-#         produced_tables = self.stream_table_pdf[
-#             self.stream_table_pdf['from'].isin(streams_list)
-#         ]['table'].unique()
-        
-#         return set(produced_tables)
-    
-#     def calculate_benefit_to_remaining(self, candidate_comm, remaining_comms, available_tables):
-#         """
-#         Calculate how much selecting candidate_comm would reduce sync costs for remaining communities.
-        
-#         Returns:
-#         --------
-#         (total_benefit, num_communities_helped, benefit_details)
-#         """
-#         # Get tables that would become available if we select candidate_comm
-#         tables_produced = self.get_tables_produced_by_community(candidate_comm)
-#         new_available = available_tables.union(tables_produced)
-        
-#         total_benefit = 0.0
-#         communities_helped = 0
-#         benefit_details = []
-        
-#         for remaining_comm in remaining_comms:
-#             # Calculate cost with current available tables
-#             cost_before, _, _, _ = self.calculate_sync_cost(remaining_comm, available_tables)
-            
-#             # Calculate cost with new available tables (after selecting candidate)
-#             cost_after, _, _, _ = self.calculate_sync_cost(remaining_comm, new_available)
-            
-#             benefit = cost_before - cost_after
-            
-#             if benefit > 0:
-#                 communities_helped += 1
-#                 total_benefit += benefit
-#                 benefit_details.append({
-#                     'community': remaining_comm,
-#                     'benefit': benefit,
-#                     'cost_before': cost_before,
-#                     'cost_after': cost_after
-#                 })
-        
-#         return total_benefit, communities_helped, benefit_details
-    
-#     def lookahead_greedy_ordering(self, initial_top_k=3, lookahead_top_k=4, min_communities_helped=1, max_communities_helped=3) -> Tuple[List[int], Dict]:
-#         """
-#         Lookahead greedy strategy:
-#         1. Start with top K communities with least sync cost
-#         2. Then select from top M lowest cost communities, choosing the one that
-#            maximizes benefit to 1-3 remaining communities
-        
-#         Parameters:
-#         -----------
-#         initial_top_k : int
-#             Number of initial communities to select based purely on lowest cost (default 3)
-#         lookahead_top_k : int
-#             Number of candidates to consider at each step (default 4)
-#         min_communities_helped : int
-#             Minimum number of communities that should benefit (default 1)
-#         max_communities_helped : int
-#             Maximum number of communities to consider for benefit calculation (default 3)
-        
-#         Returns:
-#         --------
-#         (ordered_communities, metrics)
-#         """
-#         communities = list(self.community_streams.keys())
-#         ordered = []
-#         remaining = set(communities)
-#         available_tables = set()
-        
-#         metrics = {
-#             'ordering': [],
-#             'costs': [],
-#             'num_tables': [],
-#             'sizes': [],
-#             'cumulative_cost': 0.0,
-#             'cumulative_tables': 0,
-#             'cumulative_size': 0.0,
-#             'details': []
-#         }
-        
-#         # Phase 1: Select initial top K communities with lowest cost
-#         print(f"  Phase 1: Selecting top {initial_top_k} communities with lowest sync cost...")
-        
-#         for step in range(min(initial_top_k, len(remaining))):
-#             # Calculate costs for all remaining
-#             costs = {}
-#             for comm in remaining:
-#                 cost, num_tables, size, tables = self.calculate_sync_cost(comm, available_tables)
-#                 costs[comm] = (cost, num_tables, size, tables)
-            
-#             # Select the one with lowest cost
-#             best_comm = min(costs.keys(), key=lambda c: costs[c][0])
-#             cost, num_tables, size, tables = costs[best_comm]
-            
-#             # Add to ordering
-#             ordered.append(best_comm)
-#             remaining.remove(best_comm)
-            
-#             # Update available tables
-#             produced_tables = self.get_tables_produced_by_community(best_comm)
-#             available_tables.update(produced_tables)
-            
-#             # Record metrics
-#             metrics['ordering'].append(best_comm)
-#             metrics['costs'].append(cost)
-#             metrics['num_tables'].append(num_tables)
-#             metrics['sizes'].append(size)
-#             metrics['cumulative_cost'] += cost
-#             metrics['cumulative_tables'] += num_tables
-#             metrics['cumulative_size'] += size
-            
-#             metrics['details'].append({
-#                 'community': best_comm,
-#                 'num_streams': len(self.community_streams[best_comm]),
-#                 'tables_to_sync': tables,
-#                 'num_tables_to_sync': num_tables,
-#                 'size_to_sync_gb': size,
-#                 'cost': cost,
-#                 'selection_reason': f'Initial top-{initial_top_k} (lowest cost)'
-#             })
-        
-#         # Phase 2: Lookahead selection
-#         print(f"  Phase 2: Lookahead selection (considering top {lookahead_top_k} candidates, optimizing for benefit to {min_communities_helped}-{max_communities_helped} communities)...")
-        
-#         while remaining:
-#             # Calculate costs for all remaining
-#             costs = {}
-#             for comm in remaining:
-#                 cost, num_tables, size, tables = self.calculate_sync_cost(comm, available_tables)
-#                 costs[comm] = (cost, num_tables, size, tables)
-            
-#             # Get top M candidates with lowest cost
-#             sorted_candidates = sorted(costs.keys(), key=lambda c: costs[c][0])
-#             top_candidates = sorted_candidates[:min(lookahead_top_k, len(sorted_candidates))]
-            
-#             # For each candidate, calculate benefit to remaining communities
-#             best_candidate = None
-#             best_score = -float('inf')
-#             best_info = None
-            
-#             for candidate in top_candidates:
-#                 # Calculate benefit to remaining communities (excluding this candidate)
-#                 remaining_others = remaining - {candidate}
-#                 total_benefit, num_helped, benefit_details = self.calculate_benefit_to_remaining(
-#                     candidate, remaining_others, available_tables
-#                 )
-                
-#                 # Sort benefit details by benefit amount
-#                 benefit_details_sorted = sorted(benefit_details, key=lambda x: x['benefit'], reverse=True)
-                
-#                 # Consider benefit to top 1-3 communities that would benefit most
-#                 top_beneficiaries = benefit_details_sorted[:max_communities_helped]
-#                 top_benefit = sum(b['benefit'] for b in top_beneficiaries)
-                
-#                 # Score: prioritize candidates that help at least min_communities_helped
-#                 # and maximize benefit to top beneficiaries
-#                 if num_helped >= min_communities_helped:
-#                     # Score = benefit to top beneficiaries - own cost (to break ties)
-#                     score = top_benefit - (costs[candidate][0] * 0.1)  # Small penalty for own cost
-#                 else:
-#                     # If doesn't help enough communities, just use negative cost
-#                     score = -costs[candidate][0]
-                
-#                 if score > best_score:
-#                     best_score = score
-#                     best_candidate = candidate
-#                     best_info = {
-#                         'total_benefit': total_benefit,
-#                         'num_helped': num_helped,
-#                         'top_beneficiaries': top_beneficiaries,
-#                         'top_benefit': top_benefit
-#                     }
-            
-#             # Select best candidate
-#             cost, num_tables, size, tables = costs[best_candidate]
-            
-#             # Add to ordering
-#             ordered.append(best_candidate)
-#             remaining.remove(best_candidate)
-            
-#             # Update available tables
-#             produced_tables = self.get_tables_produced_by_community(best_candidate)
-#             available_tables.update(produced_tables)
-            
-#             # Record metrics
-#             metrics['ordering'].append(best_candidate)
-#             metrics['costs'].append(cost)
-#             metrics['num_tables'].append(num_tables)
-#             metrics['sizes'].append(size)
-#             metrics['cumulative_cost'] += cost
-#             metrics['cumulative_tables'] += num_tables
-#             metrics['cumulative_size'] += size
-            
-#             # Create selection reason
-#             if best_info and best_info['num_helped'] >= min_communities_helped:
-#                 helped_comms = [b['community'] for b in best_info['top_beneficiaries']]
-#                 selection_reason = f"Lookahead: helps {best_info['num_helped']} communities (top benefit to {helped_comms[:3]}), benefit={best_info['top_benefit']:.2f}"
-#             else:
-#                 selection_reason = f"Lookahead: lowest cost among top-{lookahead_top_k}"
-            
-#             metrics['details'].append({
-#                 'community': best_candidate,
-#                 'num_streams': len(self.community_streams[best_candidate]),
-#                 'tables_to_sync': tables,
-#                 'num_tables_to_sync': num_tables,
-#                 'size_to_sync_gb': size,
-#                 'cost': cost,
-#                 'selection_reason': selection_reason
-#             })
-        
-#         return ordered, metrics
-    
-#     def greedy_ordering(self) -> Tuple[List[int], Dict]:
-#         """
-#         Find a good ordering using greedy algorithm.
-#         At each step, choose the community with lowest sync cost given current available tables.
-        
-#         Returns:
-#         --------
-#         (ordered_communities, metrics)
-#         """
-#         communities = list(self.community_streams.keys())
-#         ordered = []
-#         remaining = set(communities)
-#         available_tables = set()
-        
-#         metrics = {
-#             'ordering': [],
-#             'costs': [],
-#             'num_tables': [],
-#             'sizes': [],
-#             'cumulative_cost': 0.0,
-#             'cumulative_tables': 0,
-#             'cumulative_size': 0.0,
-#             'details': []  # Added details list
-#         }
-        
-#         while remaining:
-#             # Calculate cost for each remaining community
-#             best_comm = None
-#             best_cost = float('inf')
-#             best_num_tables = 0
-#             best_size = 0.0
-#             best_tables_to_sync = []
-            
-#             for comm in remaining:
-#                 cost, num_tables, size, tables_to_sync = self.calculate_sync_cost(comm, available_tables)
-                
-#                 if cost < best_cost:
-#                     best_cost = cost
-#                     best_comm = comm
-#                     best_num_tables = num_tables
-#                     best_size = size
-#                     best_tables_to_sync = tables_to_sync
-            
-#             # Add best community to ordering
-#             ordered.append(best_comm)
-#             remaining.remove(best_comm)
-            
-#             # Update available tables
-#             produced_tables = self.get_tables_produced_by_community(best_comm)
-#             available_tables.update(produced_tables)
-            
-#             # Record metrics
-#             metrics['ordering'].append(best_comm)
-#             metrics['costs'].append(best_cost)
-#             metrics['num_tables'].append(best_num_tables)
-#             metrics['sizes'].append(best_size)
-#             metrics['cumulative_cost'] += best_cost
-#             metrics['cumulative_tables'] += best_num_tables
-#             metrics['cumulative_size'] += best_size
-            
-#             # Add detailed information
-#             metrics['details'].append({
-#                 'community': best_comm,
-#                 'num_streams': len(self.community_streams[best_comm]),
-#                 'tables_to_sync': best_tables_to_sync,
-#                 'num_tables_to_sync': best_num_tables,
-#                 'size_to_sync_gb': best_size,
-#                 'cost': best_cost
-#             })
-        
-#         return ordered, metrics
-    
-#     def evaluate_ordering(self, ordering: List[int]) -> Dict:
-#         """
-#         Evaluate a given ordering and return detailed metrics.
-#         """
-#         available_tables = set()
-        
-#         metrics = {
-#             'ordering': ordering,
-#             'costs': [],
-#             'num_tables': [],
-#             'sizes': [],
-#             'cumulative_cost': 0.0,
-#             'cumulative_tables': 0,
-#             'cumulative_size': 0.0,
-#             'details': []
-#         }
-        
-#         for comm in ordering:
-#             cost, num_tables, size, tables_to_sync = self.calculate_sync_cost(comm, available_tables)
-            
-#             metrics['costs'].append(cost)
-#             metrics['num_tables'].append(num_tables)
-#             metrics['sizes'].append(size)
-#             metrics['cumulative_cost'] += cost
-#             metrics['cumulative_tables'] += num_tables
-#             metrics['cumulative_size'] += size
-            
-#             metrics['details'].append({
-#                 'community': comm,
-#                 'num_streams': len(self.community_streams[comm]),
-#                 'tables_to_sync': tables_to_sync,
-#                 'num_tables_to_sync': num_tables,
-#                 'size_to_sync_gb': size,
-#                 'cost': cost
-#             })
-            
-#             # Update available tables
-#             produced_tables = self.get_tables_produced_by_community(comm)
-#             available_tables.update(produced_tables)
-        
-#         return metrics
-    
-#     def try_multiple_strategies(self) -> Dict[str, Tuple[List[int], Dict]]:
-#         """
-#         Try multiple ordering strategies and return results.
-#         """
-#         results = {}
-        
-#         # Strategy 1: Greedy (lowest cost first)
-#         print("Running greedy strategy...")
-#         ordered, metrics = self.greedy_ordering()
-#         results['greedy'] = (ordered, metrics)
-        
-#         # Strategy 2: Lookahead greedy (new strategy)
-#         print("Running lookahead-greedy strategy...")
-#         ordered_lookahead, metrics_lookahead = self.lookahead_greedy_ordering(
-#             initial_top_k=3,
-#             lookahead_top_k=4,
-#             min_communities_helped=1,
-#             max_communities_helped=3
-#         )
-#         results['lookahead_greedy'] = (ordered_lookahead, metrics_lookahead)
-        
-#         # Strategy 3: Smallest communities first
-#         print("Running smallest-first strategy...")
-#         communities = list(self.community_streams.keys())
-#         ordered_by_size = sorted(communities, key=lambda c: len(self.community_streams[c]))
-#         metrics_size = self.evaluate_ordering(ordered_by_size)
-#         results['smallest_first'] = (ordered_by_size, metrics_size)
-        
-#         # Strategy 4: Largest communities first
-#         print("Running largest-first strategy...")
-#         ordered_by_size_desc = sorted(communities, key=lambda c: len(self.community_streams[c]), reverse=True)
-#         metrics_size_desc = self.evaluate_ordering(ordered_by_size_desc)
-#         results['largest_first'] = (ordered_by_size_desc, metrics_size_desc)
-        
-#         # Strategy 5: Random baseline (for comparison)
-#         print("Running random baseline...")
-#         import random
-#         random_order = communities.copy()
-#         random.shuffle(random_order)
-#         metrics_random = self.evaluate_ordering(random_order)
-#         results['random'] = (random_order, metrics_random)
-        
-#         return results
+# Create new content with header and timestamp
+header = "\n" + "="*100 + "\n"
+header += f"Community Execution Orders - Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+header += "="*100 + "\n"
+new_content = header + "\n".join(order_rows) + "\n"
 
-# print("Community ordering optimizer module loaded successfully.")
+# Write to file (creates new or overwrites with complete new content)
+dbutils.fs.put(orders_output_path, new_content, overwrite=True)
 
-# COMMAND ----------
-
-# DBTITLE 1,Run Optimization for Selected Resolutions
-# # Helper function to get leiden_df from stored results
-# def get_leiden_df_for_optimization(resolution, rep_by_res, igraph_names):
-#     """
-#     Get leiden_df for a chosen resolution from already-computed results (rep_by_res).
-#     """
-#     rep = rep_by_res[resolution]
-#     leiden_df = pd.DataFrame({
-#         "stream": np.array(igraph_names),
-#         "community": np.array(rep["membership"], dtype=int),
-#     })
-    
-#     meta = {
-#         "resolution": float(rep.get("resolution", resolution)),
-#         "seed": int(rep["seed"]),
-#         "quality": float(rep.get("quality", np.nan)),
-#     }
-#     return leiden_df, meta
-
-# # Run optimization for selected resolutions
-# resolutions_to_optimize = [1.2, 1.8, 2.2]
-
-# optimization_results = {}
-
-# for res in resolutions_to_optimize:
-#     print(f"\n{'='*80}")
-#     print(f"OPTIMIZING COMMUNITY ORDERING FOR RESOLUTION γ={res}")
-#     print(f"{'='*80}\n")
-    
-#     # Get leiden_df for this resolution
-#     leiden_df, meta = get_leiden_df_for_optimization(res, rep_by_res, igraph_names)
-    
-#     print(f"Resolution: {res}")
-#     print(f"Number of communities: {leiden_df['community'].nunique()}")
-#     print(f"Number of streams: {len(leiden_df)}")
-#     print()
-    
-#     # Create optimizer
-#     optimizer = CommunityOrderingOptimizer(
-#         stream_table_dependency_df=stream_stream_dependency_df,
-#         merged_edges_df=merged_dependency_df,
-#         leiden_df=leiden_df,
-#         size_weight=0.75,
-#         count_weight=0.25
-#     )
-    
-#     # Try multiple strategies
-#     results = optimizer.try_multiple_strategies()
-    
-#     # Store results
-#     optimization_results[res] = results
-    
-#     # Print comparison
-#     print(f"\n{'='*80}")
-#     print(f"STRATEGY COMPARISON FOR γ={res}")
-#     print(f"{'='*80}\n")
-    
-#     comparison_data = []
-#     for strategy_name, (ordering, metrics) in results.items():
-#         comparison_data.append({
-#             'Strategy': strategy_name,
-#             'Total Cost': f"{metrics['cumulative_cost']:.2f}",
-#             'Total Tables to Sync': metrics['cumulative_tables'],
-#             'Total Size to Sync (GB)': f"{metrics['cumulative_size']:.2f}",
-#             'Ordering': str(ordering[:5]) + '...' if len(ordering) > 5 else str(ordering)
-#         })
-    
-#     comparison_df = pd.DataFrame(comparison_data)
-#     print(comparison_df.to_string(index=False))
-#     print()
-    
-#     # Find best strategy
-#     best_strategy = min(results.items(), key=lambda x: x[1][1]['cumulative_cost'])
-#     print(f"\n✓ BEST STRATEGY: {best_strategy[0].upper()}")
-#     print(f"  Total Cost: {best_strategy[1][1]['cumulative_cost']:.2f}")
-#     print(f"  Total Tables: {best_strategy[1][1]['cumulative_tables']}")
-#     print(f"  Total Size: {best_strategy[1][1]['cumulative_size']:.2f} GB")
-#     print()
-
-# print(f"\n{'='*80}")
-# print("OPTIMIZATION COMPLETE FOR ALL RESOLUTIONS")
-# print(f"{'='*80}")
-
-# COMMAND ----------
-
-# DBTITLE 1,Generate Detailed Reports
-# # Generate detailed reports for each resolution
-
-# for res in resolutions_to_optimize:
-#     print(f"\n{'='*80}")
-#     print(f"DETAILED REPORT FOR RESOLUTION γ={res}")
-#     print(f"{'='*80}\n")
-    
-#     results = optimization_results[res]
-#     best_strategy_name = min(results.items(), key=lambda x: x[1][1]['cumulative_cost'])[0]
-#     ordering, metrics = results[best_strategy_name]
-    
-#     print(f"Strategy: {best_strategy_name.upper()}")
-#     print(f"Number of communities: {len(ordering)}")
-#     print()
-    
-#     # Create detailed report DataFrame
-#     report_data = []
-#     for detail in metrics['details']:
-#         report_data.append({
-#             'Order': len(report_data) + 1,
-#             'Community': detail['community'],
-#             'Streams': detail['num_streams'],
-#             'Tables to Sync': detail['num_tables_to_sync'],
-#             'Size (GB)': f"{detail['size_to_sync_gb']:.2f}",
-#             'Cost': f"{detail['cost']:.2f}"
-#         })
-    
-#     report_df = pd.DataFrame(report_data)
-#     print("\nCOMMUNITY ORDERING WITH SYNC REQUIREMENTS:")
-#     print(report_df.to_string(index=False))
-    
-#     # Summary statistics
-#     print(f"\n\nSUMMARY STATISTICS:")
-#     print(f"{'─'*80}")
-#     print(f"Total communities: {len(ordering)}")
-#     print(f"Total tables to sync: {metrics['cumulative_tables']}")
-#     print(f"Total size to sync: {metrics['cumulative_size']:.2f} GB")
-#     print(f"Total cost: {metrics['cumulative_cost']:.2f}")
-#     print(f"Average tables per community: {metrics['cumulative_tables']/len(ordering):.2f}")
-#     print(f"Average size per community: {metrics['cumulative_size']/len(ordering):.2f} GB")
-#     print(f"Average cost per community: {metrics['cumulative_cost']/len(ordering):.2f}")
-    
-#     # Communities with highest sync requirements
-#     print(f"\n\nTOP 5 COMMUNITIES BY SYNC COST:")
-#     print(f"{'─'*80}")
-#     sorted_details = sorted(metrics['details'], key=lambda x: x['cost'], reverse=True)[:5]
-#     for i, detail in enumerate(sorted_details, 1):
-#         print(f"{i}. Community {detail['community']}: {detail['num_tables_to_sync']} tables, "
-#               f"{detail['size_to_sync_gb']:.2f} GB, cost={detail['cost']:.2f}")
-    
-#     # Communities with no sync requirements
-#     no_sync = [d for d in metrics['details'] if d['num_tables_to_sync'] == 0]
-#     print(f"\n\nCOMMUNITIES WITH NO SYNC REQUIREMENTS: {len(no_sync)}")
-#     if no_sync:
-#         print(f"Communities: {[d['community'] for d in no_sync]}")
-    
-#     print(f"\n{'─'*80}\n")
-
-# print(f"\n{'='*80}")
-# print("ALL REPORTS GENERATED SUCCESSFULLY")
-# print(f"{'='*80}")
-
-# COMMAND ----------
-
-# DBTITLE 1,Visualize Ordering Results
-# # Create visualizations for the optimization results
-
-# for res in resolutions_to_optimize:
-#     results = optimization_results[res]
-#     best_strategy_name = min(results.items(), key=lambda x: x[1][1]['cumulative_cost'])[0]
-#     ordering, metrics = results[best_strategy_name]
-    
-#     # Create figure with multiple subplots
-#     fig, axes = plt.subplots(2, 2, figsize=(20, 16))
-#     fig.suptitle(f'Community Ordering Optimization Results (γ={res}, Strategy: {best_strategy_name})', 
-#                  fontsize=16, fontweight='bold')
-    
-#     # Plot 1: Sync cost per community
-#     ax1 = axes[0, 0]
-#     communities = [d['community'] for d in metrics['details']]
-#     costs = [d['cost'] for d in metrics['details']]
-#     colors = plt.cm.viridis(np.linspace(0, 1, len(communities)))
-#     ax1.bar(range(len(communities)), costs, color=colors)
-#     ax1.set_xlabel('Order Position', fontsize=12)
-#     ax1.set_ylabel('Sync Cost', fontsize=12)
-#     ax1.set_title('Sync Cost per Community (in order)', fontsize=14, fontweight='bold')
-#     ax1.grid(axis='y', alpha=0.3)
-    
-#     # Plot 2: Cumulative cost
-#     ax2 = axes[0, 1]
-#     cumulative_costs = np.cumsum(costs)
-#     ax2.plot(range(len(communities)), cumulative_costs, marker='o', linewidth=2, markersize=6)
-#     ax2.fill_between(range(len(communities)), cumulative_costs, alpha=0.3)
-#     ax2.set_xlabel('Order Position', fontsize=12)
-#     ax2.set_ylabel('Cumulative Sync Cost', fontsize=12)
-#     ax2.set_title('Cumulative Sync Cost', fontsize=14, fontweight='bold')
-#     ax2.grid(alpha=0.3)
-    
-#     # Plot 3: Tables to sync per community
-#     ax3 = axes[1, 0]
-#     num_tables = [d['num_tables_to_sync'] for d in metrics['details']]
-#     ax3.bar(range(len(communities)), num_tables, color=colors)
-#     ax3.set_xlabel('Order Position', fontsize=12)
-#     ax3.set_ylabel('Number of Tables', fontsize=12)
-#     ax3.set_title('Tables to Sync per Community', fontsize=14, fontweight='bold')
-#     ax3.grid(axis='y', alpha=0.3)
-    
-#     # Plot 4: Size to sync per community
-#     ax4 = axes[1, 1]
-#     sizes = [d['size_to_sync_gb'] for d in metrics['details']]
-#     ax4.bar(range(len(communities)), sizes, color=colors)
-#     ax4.set_xlabel('Order Position', fontsize=12)
-#     ax4.set_ylabel('Size (GB)', fontsize=12)
-#     ax4.set_title('Data Size to Sync per Community', fontsize=14, fontweight='bold')
-#     ax4.grid(axis='y', alpha=0.3)
-    
-#     plt.tight_layout()
-    
-#     # Save figure
-#     viz_file = os.path.join(volume_path, f"community_ordering_visualization_gamma_{res}.png")
-#     plt.savefig(viz_file, dpi=300, bbox_inches='tight', facecolor='white')
-#     print(f"✓ Visualization saved: {viz_file}")
-#     plt.show()
-
-# print(f"\n{'='*80}")
-# print("ALL VISUALIZATIONS GENERATED")
-# print(f"{'='*80}")
+print(f"All community execution orders written to: {orders_output_path}")
+print(f"Total resolutions processed: {len(order_rows)}")
+print("\nWritten content:")
+for row in order_rows:
+    print(f"  {row}")
