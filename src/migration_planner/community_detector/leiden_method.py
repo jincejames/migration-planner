@@ -107,6 +107,45 @@ outofscope_stream_names_list = [x['stream_name'] for x in outofscope_stream_name
 
 # COMMAND ----------
 
+# DBTITLE 1,Read complexity by stream
+# Read complexity by stream with semicolon delimiter
+complexity_by_stream_df = spark.read.format("csv").option("header", "true").option("delimiter", ";").load(f"{volume_path}Complexity_by_Stream.csv")
+
+# Define complexity score weights
+COMPLEXITY_WEIGHTS = {
+    'low': 1,
+    'medium': 2,
+    'complex': 4,
+    'very_complex': 7
+}
+
+# Calculate complexity score for each stream
+# Score = (low * 1) + (medium * 2) + (complex * 4) + (very_complex * 7)
+# Using double to handle decimal values, then casting to int
+complexity_scores_df = complexity_by_stream_df.withColumn(
+    "complexity_score",
+    (col("low").cast("double").cast("int") * lit(COMPLEXITY_WEIGHTS['low'])) +
+    (col("medium").cast("double").cast("int") * lit(COMPLEXITY_WEIGHTS['medium'])) +
+    (col("complex").cast("double").cast("int") * lit(COMPLEXITY_WEIGHTS['complex'])) +
+    (col("very_complex").cast("double").cast("int") * lit(COMPLEXITY_WEIGHTS['very_complex']))
+).select(
+    col("stream_name"),
+    col("low").cast("double").cast("int").alias("low"),
+    col("medium").cast("double").cast("int").alias("medium"),
+    col("complex").cast("double").cast("int").alias("complex"),
+    col("very_complex").cast("double").cast("int").alias("very_complex"),
+    col("complexity_score")
+)
+
+# Calculate total complexity across all streams for percentage calculations
+total_complexity = complexity_scores_df.agg({"complexity_score": "sum"}).collect()[0][0]
+print(f"Total complexity score across all streams: {total_complexity}")
+
+print("\nTop 10 streams by complexity score:")
+display(complexity_scores_df.orderBy(col("complexity_score").desc()).limit(10))
+
+# COMMAND ----------
+
 # DBTITLE 1,Reading report to table dependency
 # Read report to stream dependency and standardize values and column names
 # Each table is marked as a Src, since reports only create tables and do not write to tables (or only exceptions)
@@ -1115,7 +1154,7 @@ summary
 # COMMAND ----------
 
 # DBTITLE 1,Choosing resolutions to progress with
-resolutions = [1.6, 1.8]
+resolutions = [1.8]
 
 # COMMAND ----------
 
@@ -1158,6 +1197,7 @@ def plot_communities_with_analysis_safe(
     leiden_df,
     stream_table_dependency_df,
     merged_edges_df,
+    complexity_scores_df,
     resolution,
     outdir="leiden_community_plots",
     layout_seed=42,
@@ -1197,6 +1237,7 @@ def plot_communities_with_analysis_safe(
     # Convert DataFrames to pandas for analysis
     stream_table_pdf = stream_table_dependency_df.toPandas()
     merged_edges_pdf = merged_edges_df.toPandas()
+    complexity_pdf = complexity_scores_df.toPandas()
 
     # Convert size column to numeric to avoid string concatenation issues
     stream_table_pdf['size'] = pd.to_numeric(stream_table_pdf['size'], errors='coerce').fillna(0.0)
@@ -1210,6 +1251,9 @@ def plot_communities_with_analysis_safe(
     etl_streams_global = [s for s in all_streams if "json" not in s.lower()]
     total_bi_reports_global = len(bi_reports_global)
     total_etl_streams_global = len(etl_streams_global)
+    
+    # Calculate total complexity across all streams
+    total_complexity_global = complexity_pdf['complexity_score'].sum()
 
     for c in communities:
         comm_dir = os.path.join(outdir, f"community_{c}")
@@ -1237,6 +1281,25 @@ def plot_communities_with_analysis_safe(
         pct_total = (len(streams_list) / total_streams_global * 100) if total_streams_global > 0 else 0.0
         pct_bi = (len(bi_reports) / total_bi_reports_global * 100) if total_bi_reports_global > 0 else 0.0
         pct_etl = (len(etl_streams) / total_etl_streams_global * 100) if total_etl_streams_global > 0 else 0.0
+        
+        # Calculate complexity scores for streams in this community
+        community_complexity_df = complexity_pdf[complexity_pdf['stream_name'].isin(streams_in_community)].copy()
+        
+        # Create a mapping of stream to complexity score
+        stream_complexity_map = dict(zip(community_complexity_df['stream_name'], community_complexity_df['complexity_score']))
+        
+        # Calculate total community complexity
+        total_community_complexity = community_complexity_df['complexity_score'].sum()
+        
+        # Calculate percentage of total complexity
+        pct_complexity = (total_community_complexity / total_complexity_global * 100) if total_complexity_global > 0 else 0.0
+        
+        # Separate complexity by BI and ETL
+        bi_complexity_df = community_complexity_df[community_complexity_df['stream_name'].isin(bi_reports)]
+        etl_complexity_df = community_complexity_df[community_complexity_df['stream_name'].isin(etl_streams)]
+        
+        total_bi_complexity = bi_complexity_df['complexity_score'].sum()
+        total_etl_complexity = etl_complexity_df['complexity_score'].sum()
 
         # 2. Find tables that are SRC of streams inside but TGT of streams outside
         # In stream_table_dependency_df:
@@ -1316,7 +1379,8 @@ def plot_communities_with_analysis_safe(
 """
         if len(bi_reports) > 0:
             for i, stream in enumerate(bi_reports, 1):
-                analysis_content += f"{i}. {stream}\n"
+                complexity = stream_complexity_map.get(stream, 0.0)
+                analysis_content += f"{i}. {stream} (complexity: {complexity:.2f})\n"
         else:
             analysis_content += "  (No BI reports/streams found)\n"
 
@@ -1325,11 +1389,20 @@ def plot_communities_with_analysis_safe(
 """
         if len(etl_streams) > 0:
             for i, stream in enumerate(etl_streams, 1):
-                analysis_content += f"{i}. {stream}\n"
+                complexity = stream_complexity_map.get(stream, 0.0)
+                analysis_content += f"{i}. {stream} (complexity: {complexity:.2f})\n"
         else:
             analysis_content += "  (No ETL streams found)\n"
 
-        analysis_content += f"""\n2. TABLES - SRC OF STREAMS INSIDE, TGT OF STREAMS OUTSIDE:
+        analysis_content += f"""\n2. COMPLEXITY ANALYSIS:
+{'-'*80}
+Total Community Complexity: {total_community_complexity:.2f}
+Percentage of Total Complexity: {pct_complexity:.2f}%
+  - BI Reports Complexity: {total_bi_complexity:.2f}
+  - ETL Streams Complexity: {total_etl_complexity:.2f}
+"""
+
+        analysis_content += f"""\n3. TABLES - SRC OF STREAMS INSIDE, TGT OF STREAMS OUTSIDE:
 {'-'*80}
 These are tables that streams in this community READ FROM, but are WRITTEN BY streams outside.
 (Dependencies flowing INTO the community - SYNC REQUIREMENTS)
@@ -1341,7 +1414,7 @@ Total Instances: {len(tables_src_inside_tgt_outside_all)}\n\n"""
         if len(tables_src_inside_tgt_outside_all) > 0:
             # Show BI tables first
             if len(tables_incoming_bi) > 0:
-                analysis_content += f"\n2a. FOR BI REPORTS ({len(tables_incoming_bi)} tables, {total_size_incoming_bi:.2f} GB):\n{'-'*80}\n"
+                analysis_content += f"\n3a. FOR BI REPORTS ({len(tables_incoming_bi)} tables, {total_size_incoming_bi:.2f} GB):\n{'-'*80}\n"
                 for table in tables_incoming_bi['table']:
                     table_instances = tables_incoming_details[tables_incoming_details['table'] == table]
                     size = table_instances['size'].iloc[0]
@@ -1354,7 +1427,7 @@ Total Instances: {len(tables_src_inside_tgt_outside_all)}\n\n"""
             
             # Show ETL tables
             if len(tables_incoming_etl) > 0:
-                analysis_content += f"\n2b. FOR ETL STREAMS ({len(tables_incoming_etl)} tables, {total_size_incoming_etl:.2f} GB):\n{'-'*80}\n"
+                analysis_content += f"\n3b. FOR ETL STREAMS ({len(tables_incoming_etl)} tables, {total_size_incoming_etl:.2f} GB):\n{'-'*80}\n"
                 for table in tables_incoming_etl['table']:
                     table_instances = tables_incoming_details[tables_incoming_details['table'] == table]
                     size = table_instances['size'].iloc[0]
@@ -1367,7 +1440,7 @@ Total Instances: {len(tables_src_inside_tgt_outside_all)}\n\n"""
         else:
             analysis_content += "  (No such tables found)\n"
 
-        analysis_content += f"""\n3. TABLES - TGT OF STREAMS INSIDE, SRC OF STREAMS OUTSIDE:
+        analysis_content += f"""\n4. TABLES - TGT OF STREAMS INSIDE, SRC OF STREAMS OUTSIDE:
 {'-'*80}
 These are tables that streams in this community WRITE TO, but are READ BY streams outside.
 (Dependencies flowing OUT OF the community)
@@ -1389,10 +1462,10 @@ Total Instances: {len(tables_tgt_inside_src_outside_all)}\n\n"""
         else:
             analysis_content += "  (No such tables found)\n"
 
-        analysis_content += f"""\n4. AGGREGATED STREAM CONNECTIONS:
+        analysis_content += f"""\n5. AGGREGATED STREAM CONNECTIONS:
 {'-'*80}
 
-4a. Outgoing Stream Connections (Inside → Outside):
+5a. Outgoing Stream Connections (Inside → Outside):
 """
         if len(outgoing_edges) > 0:
             analysis_content += f"Total: {len(outgoing_edges)} connections\n\n"
@@ -1401,7 +1474,7 @@ Total Instances: {len(tables_tgt_inside_src_outside_all)}\n\n"""
         else:
             analysis_content += "  (No outgoing connections)\n"
 
-        analysis_content += f"""\n4b. Incoming Stream Connections (Outside → Inside):
+        analysis_content += f"""\n5b. Incoming Stream Connections (Outside → Inside):
 """
         if len(incoming_edges) > 0:
             analysis_content += f"Total: {len(incoming_edges)} connections\n\n"
@@ -1410,11 +1483,14 @@ Total Instances: {len(tables_tgt_inside_src_outside_all)}\n\n"""
         else:
             analysis_content += "  (No incoming connections)\n"
 
-        analysis_content += f"""\n5. SUMMARY:
+        analysis_content += f"""\n6. SUMMARY:
 {'-'*80}
   - Total streams in community: {len(streams_list)} ({pct_total:.2f}% of {total_streams_global} total streams)
     * BI Reports/Streams (with 'json'): {len(bi_reports)} ({pct_bi:.2f}% of {total_bi_reports_global} total BI reports)
     * ETL Streams (without 'json'): {len(etl_streams)} ({pct_etl:.2f}% of {total_etl_streams_global} total ETL streams)
+  - Total Community Complexity: {total_community_complexity:.2f} ({pct_complexity:.2f}% of total complexity)
+    * BI Reports Complexity: {total_bi_complexity:.2f}
+    * ETL Streams Complexity: {total_etl_complexity:.2f}
   - Tables flowing INTO community (SYNC REQUIREMENTS): {len(tables_src_inside_tgt_outside_unique)} unique tables, {total_size_incoming:.2f} GB
     * For BI Reports: {len(tables_incoming_bi)} tables, {total_size_incoming_bi:.2f} GB
     * For ETL Streams: {len(tables_incoming_etl)} tables, {total_size_incoming_etl:.2f} GB
@@ -1492,6 +1568,7 @@ for res in resolutions:
         leiden_df=leiden_df,
         stream_table_dependency_df=stream_stream_dependency_df,
         merged_edges_df=merged_dependency_df,
+        complexity_scores_df=complexity_scores_df,
         resolution=res,
         outdir=f"{output_path}leiden_community_plots_gamma_{res}",
         layout_seed=42,
@@ -2433,18 +2510,35 @@ for resolution in resolutions:
         
         print(f"Created {len(rest_batches)} batches: {[len(b) for b in rest_batches]}")
         
-        # Print weight ranges for each batch to verify ordering
+        # Print weight ranges for each batch and identify zero-weight batches
+        zero_weight_batches = []
+        non_zero_weight_batches = []
+        
         for batch_idx, batch in enumerate(rest_batches):
             batch_weights = [community_weights.get(comm_id, 0.0) for comm_id in batch]
-            print(f"  Batch {batch_idx + 1}: weight range [{min(batch_weights):.2f} - {max(batch_weights):.2f}]")
+            max_weight = max(batch_weights)
+            min_weight = min(batch_weights)
+            print(f"  Batch {batch_idx + 1}: weight range [{min_weight:.2f} - {max_weight:.2f}]")
+            
+            # Check if this is a zero-weight batch (max weight is 0)
+            if max_weight == 0.0:
+                zero_weight_batches.append((batch_idx, batch))
+                print(f"    -> Zero-weight batch, will be migrated FIRST without optimization")
+            else:
+                non_zero_weight_batches.append((batch_idx, batch))
+                print(f"    -> Non-zero weight batch, will be optimized")
         
-        # Optimize each batch in reverse order (last batch first)
+        print(f"\nBatch classification:")
+        print(f"  Zero-weight batches: {len(zero_weight_batches)} (migrate first, no optimization)")
+        print(f"  Non-zero weight batches: {len(non_zero_weight_batches)} (optimize)")
+        
+        # Optimize only non-zero weight batches in reverse order (last batch first)
         # This ensures earlier batches can use later batches' tables as pre-available
         batch_results = []  # Will store results in order: batch3, batch2, batch1
         cumulative_pre_available = []  # Communities whose tables are already available
         
-        for batch_idx in range(len(rest_batches) - 1, -1, -1):
-            batch = rest_batches[batch_idx]
+        # Process non-zero weight batches in reverse order
+        for batch_idx, batch in reversed(non_zero_weight_batches):
             print(f"\n--- Optimizing REST batch {batch_idx + 1}/{len(rest_batches)} (communities: {batch}) ---")
             
             # Pre-available communities are all batches processed so far (later batches)
@@ -2469,16 +2563,22 @@ for resolution in resolutions:
             
             print(f"Batch {batch_idx + 1} optimized: order={res_batch['best_order']}, cost={res_batch['best_cost']:.2f}")
         
-        # batch_results is already in reverse order (batch3, batch2, batch1)
-        # Combine in this order: last batch first, then second-to-last, etc.
+        # Combine results: zero-weight batches first (in original order), then optimized batches
         rest_order = []
         rest_cost = 0.0
-        for result in batch_results:  # Iterate as-is: batch3, batch2, batch1
+        
+        # Add zero-weight batches first (in their original order, which is descending by batch index)
+        for batch_idx, batch in zero_weight_batches:
+            rest_order.extend(batch)
+            print(f"\nAdding zero-weight batch {batch_idx + 1} to order (no optimization): {batch}")
+        
+        # Add optimized batches (already in reverse order from optimization)
+        for result in batch_results:
             rest_order.extend(result['order'])
             rest_cost += result['cost']
         
-        print(f"\n--- Combined REST order (batch {len(rest_batches)} → batch 1): {rest_order} ---")
-        print(f"--- Combined REST cost (optimization metric): {rest_cost:.2f} ---")
+        print(f"\n--- Combined REST order (zero-weight batches → optimized batches): {rest_order} ---")
+        print(f"--- Combined REST cost (optimization metric, zero-weight batches excluded): {rest_cost:.2f} ---")
         
     else:
         # Original logic: optimize REST communities as a single batch
@@ -2503,7 +2603,7 @@ for resolution in resolutions:
     )
     res_top = bf_top.brute_force(log_every=7500, label=f"TOPN_gamma_{resolution}")
 
-    # Final order: REST first (batch3 + batch2 + batch1), then TOP N
+    # Final order: REST first (zero-weight batches + optimized batches), then TOP N
     final_order = rest_order + res_top["best_order"]
     
     print(f"\n=== FINAL MERGED ORDER for γ={resolution} ===")
@@ -2573,3 +2673,329 @@ print(f"Metadata CSV updated: {metadata_file}")
 print(f"Weight calculation method: {WEIGHT_METHOD}")
 print(f"Top N value: {top_n}")
 print(f"Resolutions and costs: {resolutions_costs}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC
+# MAGIC ## Report Migration Readiness Analysis
+# MAGIC
+# MAGIC Determining which reports can be migrated at each stage of the execution order based on:
+# MAGIC * Tables produced by migrated streams (TGT tables)
+# MAGIC * Tables that are currently synced (incoming dependencies)
+# MAGIC * Report-to-table dependencies from cell 9
+
+# COMMAND ----------
+
+# DBTITLE 1,Select resolution for report analysis
+# Select which resolution to use for report migration readiness analysis
+# This should match one of the resolutions processed in cell 40
+
+SELECTED_RESOLUTION = 1.8  # Change this to the desired resolution
+
+
+print(f"Selected resolution for report analysis: {SELECTED_RESOLUTION}")
+print(f"Available resolutions: {resolutions}")
+
+if SELECTED_RESOLUTION not in resolutions:
+    print(f"\n⚠️ WARNING: Selected resolution {SELECTED_RESOLUTION} was not processed in cell 40!")
+    print(f"Please choose from: {resolutions}")
+else:
+    print(f"✓ Resolution {SELECTED_RESOLUTION} is valid")
+
+# COMMAND ----------
+
+# DBTITLE 1,Load required data for report readiness analysis
+# Use the selected resolution to load the correct CSV file
+stream_ordering_file = f"{output_path}migration_order_analysis/stream_community_ordering_gamma_{SELECTED_RESOLUTION}.csv"
+
+try:
+    stream_ordering_pd = pd.read_csv(stream_ordering_file)
+    print(f"Loaded stream ordering from: {stream_ordering_file}")
+    print(f"Resolution: {SELECTED_RESOLUTION}")
+    print(f"Columns: {stream_ordering_pd.columns.tolist()}")
+    print(f"Total streams: {len(stream_ordering_pd)}")
+    display(stream_ordering_pd.head(10))
+except FileNotFoundError:
+    print(f"ERROR: File not found: {stream_ordering_file}")
+    print(f"Please ensure cell 40 has completed and generated output for resolution {SELECTED_RESOLUTION}")
+    print(f"\nAvailable files:")
+    !ls -t {output_path}migration_order_analysis/stream_community_ordering_gamma_*.csv 2>/dev/null
+
+# COMMAND ----------
+
+# DBTITLE 1,Prepare report-to-table dependencies
+# Convert report_dependency_df to Pandas for easier manipulation
+report_to_tables_pd = report_dependency_df.select(
+    col('stream_name').alias('report_name'),
+    upper(col('table_name')).alias('table_name')
+).distinct().toPandas()
+
+print(f"Total report-to-table dependencies: {len(report_to_tables_pd)}")
+print(f"Unique reports: {report_to_tables_pd['report_name'].nunique()}")
+print(f"Unique tables required by reports: {report_to_tables_pd['table_name'].nunique()}")
+
+# Group by report to get all tables required per report
+report_required_tables = report_to_tables_pd.groupby('report_name')['table_name'].apply(set).to_dict()
+
+print(f"\nExample - First 3 reports and their required tables:")
+for i, (report, tables) in enumerate(list(report_required_tables.items())[:3]):
+    print(f"  {report}: {len(tables)} tables - {list(tables)[:5]}{'...' if len(tables) > 5 else ''}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Extract table production by streams
+# Get which tables are produced (TGT) by which streams
+# From the original dependency_df, extract TGT tables per stream
+stream_produces_tables_df = dependency_df.filter(
+    (upper(col('table_type')) == 'TGT') |
+    (upper(col('table_type')) == 'TGT_TRNS')
+).select(
+    col('stream_name'),
+    upper(col('DB_Table_Name')).alias('table_name')
+).distinct()
+
+stream_produces_tables_pd = stream_produces_tables_df.toPandas()
+print(f"Total stream-produces-table mappings: {len(stream_produces_tables_pd)}")
+
+# Group by stream to get all tables produced per stream
+stream_produces = stream_produces_tables_pd.groupby('stream_name')['table_name'].apply(set).to_dict()
+
+print(f"Total streams that produce tables: {len(stream_produces)}")
+print(f"\nExample - First 3 streams and tables they produce:")
+for i, (stream, tables) in enumerate(list(stream_produces.items())[:3]):
+    print(f"  {stream}: {len(tables)} tables - {list(tables)[:5]}{'...' if len(tables) > 5 else ''}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Load sync requirements from migration analysis
+# Read the community sync details CSV that was generated in cell 48
+# Use the selected resolution to load the correct CSV file
+sync_details_file = f"{output_path}migration_order_analysis/community_sync_details_gamma_{SELECTED_RESOLUTION}.csv"
+
+try:
+    sync_details_pd = pd.read_csv(sync_details_file)
+    print(f"Loaded sync details from: {sync_details_file}")
+    print(f"Resolution: {SELECTED_RESOLUTION}")
+    print(f"Columns: {sync_details_pd.columns.tolist()}")
+    print(f"Total sync requirements: {len(sync_details_pd)}")
+    
+    # Extract tables that need to be synced for each community
+    # These are the incoming dependencies (tables needed but not yet available)
+    community_sync_tables = sync_details_pd.groupby('community_id')['table_name'].apply(set).to_dict()
+    
+    print(f"\nCommunities with sync requirements: {len(community_sync_tables)}")
+    display(sync_details_pd.head(10))
+except FileNotFoundError:
+    print(f"WARNING: File not found: {sync_details_file}")
+    print(f"Will assume all incoming tables are synced.")
+    print(f"\nAvailable files:")
+    !ls -t {output_path}migration_order_analysis/community_sync_details_gamma_*.csv 2>/dev/null
+    community_sync_tables = {}
+
+# COMMAND ----------
+
+# DBTITLE 1,Calculate report readiness at each execution stage
+# Get execution orders in the EXACT order they appear (preserving optimization order)
+# Do NOT sort - the order from the CSV reflects the optimized community ordering
+execution_stages = stream_ordering_pd['execution_order'].unique().tolist()
+
+print(f"Total execution stages: {len(execution_stages)}")
+print(f"Execution order (optimized): {execution_stages}")
+
+# Initialize tracking
+available_tables = set()  # Tables available from ALL migrated streams (cumulative)
+synced_tables = set()  # Tables that are synced (incoming dependencies, cumulative)
+reports_ready_by_stage = {}  # stage -> list of reports ready
+reports_migrated = set()  # Track which reports have been marked as ready
+
+# Process each execution stage IN THE OPTIMIZED ORDER
+for stage in execution_stages:
+    # Get communities being migrated at this stage
+    communities_at_stage = stream_ordering_pd[stream_ordering_pd['execution_order'] == stage]['community_id'].unique()
+    
+    # Get streams being migrated at this stage
+    streams_at_stage = stream_ordering_pd[stream_ordering_pd['execution_order'] == stage]['stream_name'].tolist()
+    
+    # Track new tables added at this stage
+    new_synced_tables = set()
+    new_produced_tables = set()
+    
+    # Add synced tables for these communities (incoming dependencies)
+    for comm_id in communities_at_stage:
+        if comm_id in community_sync_tables:
+            new_synced_tables.update(community_sync_tables[comm_id])
+    
+    # Add tables produced by streams at this stage
+    for stream in streams_at_stage:
+        if stream in stream_produces:
+            new_produced_tables.update(stream_produces[stream])
+    
+    # Update cumulative sets
+    synced_tables.update(new_synced_tables)
+    available_tables.update(new_produced_tables)
+    
+    # Combine all available tables: produced by migrated streams + synced tables
+    all_available_tables = available_tables.union(synced_tables)
+    
+    # Check which reports are now ready (all required tables available)
+    reports_ready_at_stage = []
+    for report, required_tables in report_required_tables.items():
+        if report not in reports_migrated:  # Only check reports not yet migrated
+            if required_tables.issubset(all_available_tables):
+                reports_ready_at_stage.append(report)
+                reports_migrated.add(report)
+    
+    reports_ready_by_stage[stage] = reports_ready_at_stage
+    
+    print(f"\nStage {stage}:")
+    print(f"  Communities: {list(communities_at_stage)}")
+    print(f"  Streams migrated at this stage: {len(streams_at_stage)}")
+    print(f"  New tables produced: {len(new_produced_tables)}")
+    print(f"  New tables synced: {len(new_synced_tables)}")
+    print(f"  Cumulative tables from migrated streams: {len(available_tables)}")
+    print(f"  Cumulative tables synced: {len(synced_tables)}")
+    print(f"  Total tables available: {len(all_available_tables)}")
+    print(f"  Reports ready at this stage: {len(reports_ready_at_stage)}")
+    if reports_ready_at_stage:
+        print(f"  Report names: {reports_ready_at_stage[:5]}{'...' if len(reports_ready_at_stage) > 5 else ''}")
+
+print(f"\n{'='*80}")
+print(f"SUMMARY:")
+print(f"Total reports analyzed: {len(report_required_tables)}")
+print(f"Total reports ready after all stages: {len(reports_migrated)}")
+print(f"Reports not ready: {len(report_required_tables) - len(reports_migrated)}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Generate detailed report readiness output
+# Create detailed output DataFrame
+report_readiness_data = []
+
+for stage in execution_stages:
+    for report in reports_ready_by_stage[stage]:
+        report_readiness_data.append({
+            'execution_order': stage,
+            'report_name': report,
+            'num_required_tables': len(report_required_tables[report]),
+            'required_tables': ', '.join(sorted(list(report_required_tables[report])[:10])) + 
+                             ('...' if len(report_required_tables[report]) > 10 else '')
+        })
+
+report_readiness_df = pd.DataFrame(report_readiness_data)
+
+# Save to CSV in the migration_order_analysis subdirectory with resolution in filename
+report_readiness_file = f"{output_path}migration_order_analysis/report_migration_readiness_gamma_{SELECTED_RESOLUTION}.csv"
+report_readiness_df.to_csv(report_readiness_file, index=False)
+print(f"Report readiness saved to: {report_readiness_file}")
+
+# Display summary statistics
+print(f"\nReport Readiness by Execution Stage:")
+stage_summary = report_readiness_df.groupby('execution_order').agg({
+    'report_name': 'count'
+}).rename(columns={'report_name': 'reports_ready'}).reset_index()
+
+stage_summary['cumulative_reports'] = stage_summary['reports_ready'].cumsum()
+
+display(stage_summary)
+
+print(f"\nFirst 20 reports ready:")
+display(report_readiness_df.head(20))
+
+# COMMAND ----------
+
+# DBTITLE 1,Generate detailed text report
+# Generate a detailed text report similar to the migration analysis
+report_readiness_text_file = f"{output_path}migration_order_analysis/report_migration_readiness_analysis_gamma_{SELECTED_RESOLUTION}.txt"
+
+with open(report_readiness_text_file, 'w') as f:
+    f.write("="*100 + "\n")
+    f.write("REPORT MIGRATION READINESS ANALYSIS\n")
+    f.write("="*100 + "\n\n")
+    
+    f.write(f"Analysis Date: {pd.Timestamp.now()}\n")
+    f.write(f"Resolution (gamma): {SELECTED_RESOLUTION}\n")
+    f.write(f"Weight Method: {WEIGHT_METHOD}\n")
+    f.write(f"Total Reports Analyzed: {len(report_required_tables)}\n")
+    f.write(f"Total Reports Ready: {len(reports_migrated)}\n")
+    f.write(f"Total Execution Stages: {len(execution_stages)}\n\n")
+    
+    f.write("="*100 + "\n")
+    f.write("REPORT READINESS BY EXECUTION STAGE\n")
+    f.write("="*100 + "\n\n")
+    
+    cumulative_reports = 0
+    for stage in execution_stages:
+        reports_at_stage = reports_ready_by_stage[stage]
+        cumulative_reports += len(reports_at_stage)
+        
+        communities_at_stage = stream_ordering_pd[stream_ordering_pd['execution_order'] == stage]['community_id'].unique()
+        streams_at_stage = stream_ordering_pd[stream_ordering_pd['execution_order'] == stage]['stream_name'].tolist()
+        
+        f.write(f"\n{'─'*100}\n")
+        f.write(f"EXECUTION STAGE {stage}\n")
+        f.write(f"{'─'*100}\n")
+        f.write(f"Communities Migrated: {list(communities_at_stage)}\n")
+        f.write(f"Number of Streams: {len(streams_at_stage)}\n")
+        f.write(f"Reports Ready at This Stage: {len(reports_at_stage)}\n")
+        f.write(f"Cumulative Reports Ready: {cumulative_reports}\n\n")
+        
+        if reports_at_stage:
+            f.write(f"Reports Ready:\n")
+            for report in sorted(reports_at_stage):
+                required_tables = report_required_tables[report]
+                f.write(f"  • {report}\n")
+                f.write(f"    Required Tables ({len(required_tables)}): {', '.join(sorted(list(required_tables)[:5]))}")
+                if len(required_tables) > 5:
+                    f.write(f" ... and {len(required_tables) - 5} more")
+                f.write(f"\n")
+        else:
+            f.write(f"  No reports ready at this stage.\n")
+    
+    # Reports not ready
+    reports_not_ready = set(report_required_tables.keys()) - reports_migrated
+    if reports_not_ready:
+        f.write(f"\n\n{'='*100}\n")
+        f.write(f"REPORTS NOT READY AFTER ALL STAGES ({len(reports_not_ready)})\n")
+        f.write(f"{'='*100}\n\n")
+        
+        for report in sorted(reports_not_ready):
+            required_tables = report_required_tables[report]
+            missing_tables = required_tables - available_tables.union(synced_tables)
+            f.write(f"  • {report}\n")
+            f.write(f"    Required Tables: {len(required_tables)}\n")
+            f.write(f"    Missing Tables: {len(missing_tables)}\n")
+            if missing_tables:
+                f.write(f"    Missing: {', '.join(sorted(list(missing_tables)[:10]))}")
+                if len(missing_tables) > 10:
+                    f.write(f" ... and {len(missing_tables) - 10} more")
+                f.write(f"\n")
+
+print(f"\nDetailed text report saved to: {report_readiness_text_file}")
+print(f"\nAnalysis complete!")
+print(f"\nOutput files:")
+print(f"  1. {report_readiness_file}")
+print(f"  2. {report_readiness_text_file}")
+
+# COMMAND ----------
+
+missing_tables = set()
+section_found = False
+with open(f"{output_path}migration_order_analysis/report_migration_readiness_analysis_gamma_1.8.txt", "r") as f:
+    for line in f:
+        if "REPORTS NOT READY AFTER ALL STAGES" in line:
+            section_found = True
+        elif section_found and line.strip().startswith("Missing:"):
+            tables_str = line.strip().split("Missing:")[1].split("...")[0]
+            tables = [t.strip() for t in tables_str.split(",") if t.strip()]
+            missing_tables.update(tables)
+        elif section_found and line.strip() == "":
+            continue
+
+missing_tables = sorted(missing_tables)
+print(",\n".join(missing_tables))
+
+pd.DataFrame({"table name": missing_tables}).to_csv(
+    f"{output_path}migration_order_analysis/missing_tables_for_reports.csv",
+    index=False
+)
