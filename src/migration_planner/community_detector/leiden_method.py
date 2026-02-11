@@ -639,12 +639,6 @@ def stability_ari(memberships):
 # igraph vertex "name" will be the original labels from TupleList
 igraph_names = np.array(g.vs["name"])
 
-def membership_to_leiden_df(membership):
-    return pd.DataFrame({
-        "stream": igraph_names,
-        "community": membership
-    })
-
 
 #Scan over resolutions (gamma) and many random seeds per resolution
 #Resolution grid: controls granularity (higher -> more communities)
@@ -1158,16 +1152,13 @@ resolutions = [1.8]
 
 # COMMAND ----------
 
-# DBTITLE 1,Analysis & Plotting
-# Helper to build leiden_df from a stored membership array
+# DBTITLE 1,Merge single-stream communities for all resolutions
+# Define helper function to convert membership to DataFrame
 def membership_to_leiden_df(membership, igraph_names):
-    return pd.DataFrame(
-        {
-            "stream": np.array(igraph_names),
-            "community": np.array(membership, dtype=int),
-        }
-    )
-
+    return pd.DataFrame({
+        "stream": np.array(igraph_names),
+        "community": np.array(membership, dtype=int),
+    })
 
 # Choose which solution to visualize
 def get_leiden_df(resolution, rep_by_res, igraph_names):
@@ -1180,7 +1171,65 @@ def get_leiden_df(resolution, rep_by_res, igraph_names):
     }
     return leiden_df, meta
 
+# Merge single-stream communities into one consolidated community
+# This operation is performed for all chosen resolutions before analysis
 
+print("=" * 100)
+print("MERGING SINGLE-STREAM COMMUNITIES")
+print("=" * 100)
+
+for resolution in resolutions:
+    print(f"\n=== Processing resolution: {resolution} ===")
+    
+    # Get the leiden dataframe for this resolution
+    leiden_df, meta = get_leiden_df(resolution, rep_by_res, igraph_names)
+    
+    # Get number of communities BEFORE merging
+    num_communities_before = leiden_df['community'].nunique()
+    print(f"Number of communities (before merging): {num_communities_before}")
+    
+    # Identify communities with only one stream
+    community_stream_counts = leiden_df.groupby('community').size()
+    single_stream_communities = community_stream_counts[community_stream_counts == 1].index.tolist()
+    
+    if len(single_stream_communities) > 1:
+        # Get the smallest community ID from single-stream communities
+        merged_community_id = min(single_stream_communities)
+        
+        print(f"\n--- Merging {len(single_stream_communities)} single-stream communities into community {merged_community_id} ---")
+        print(f"Single-stream communities to merge: {sorted(single_stream_communities)}")
+        
+        # Reassign all single-stream communities to the merged community ID
+        leiden_df.loc[leiden_df['community'].isin(single_stream_communities), 'community'] = merged_community_id
+        
+        # Update the rep_by_res dictionary with the modified membership
+        # Create a mapping from stream name to new community ID
+        stream_to_community = leiden_df.set_index('stream')['community'].to_dict()
+        
+        # Update the membership array in rep_by_res
+        # The membership array corresponds to igraph_names order
+        updated_membership = [stream_to_community[stream] for stream in igraph_names]
+        rep_by_res[resolution]["membership"] = updated_membership
+        
+        # Verify the merge
+        num_communities_after = leiden_df['community'].nunique()
+        merged_community_size = len(leiden_df[leiden_df['community'] == merged_community_id])
+        print(f"Merged community {merged_community_id} now contains {merged_community_size} streams")
+        print(f"Number of communities (after merging): {num_communities_after}")
+        print(f"Reduction: {num_communities_before - num_communities_after} communities merged")
+        
+    elif len(single_stream_communities) == 1:
+        print(f"\n--- Only 1 single-stream community found (community {single_stream_communities[0]}), no merging needed ---")
+    else:
+        print(f"\n--- No single-stream communities found, no merging needed ---")
+
+print(f"\n{'=' * 100}")
+print("MERGING COMPLETE FOR ALL RESOLUTIONS")
+print(f"{'=' * 100}\n")
+
+# COMMAND ----------
+
+# DBTITLE 1,Analysis & Plotting
 # Helper: scale edge widths/alphas for a given graph
 def edge_style(subG, weight_attr="weight", min_w=0.2, max_w=3.2):
     if subG.number_of_edges() == 0:
@@ -1641,12 +1690,10 @@ for res in resolutions:
 # COMMAND ----------
 
 # DBTITLE 1,Split communities by total weight 
-def split_communities_topN(leiden_df, top_n=9):
+def split_communities_topN(leiden_df, top_n=10):
     """
     Split communities into top N heaviest and the rest based on total incoming table weight
     (sum of table weights for tables read by streams in the community, but written by streams outside).
-    
-    OPTIMIZED VERSION: Uses Spark distributed computing instead of pandas loops.
     
     Parameters
     ----------
@@ -1956,19 +2003,14 @@ class BruteForceCommunityOrdering:
 
 # COMMAND ----------
 
-# DBTITLE 1,Migration Order Analysis Function
-import os
-from datetime import datetime
-
-def append_execution_metadata(output_path, weight_method, top_n, resolutions_dict):
+# DBTITLE 1,Execution metadata logging
+def append_execution_metadata(weight_method, top_n, resolutions_dict):
     """
     Append execution metadata to a managed table in Unity Catalog.
     Creates the table if it doesn't exist.
     
     Parameters
     ----------
-    output_path : str
-        Base output directory path (not used for table, kept for compatibility)
     weight_method : str
         Weight calculation method: "Factor based", "Min-max based", or "Log based"
     top_n : int
@@ -2017,13 +2059,16 @@ def append_execution_metadata(output_path, weight_method, top_n, resolutions_dic
     print(f"Appended {len(rows)} rows to {table_name}")
     return table_name
 
+# COMMAND ----------
 
+# DBTITLE 1,Migration Order Analysis Function
 def generate_migration_order_analysis(
     leiden_df,
     stream_table_dependency_df,
     merged_edges_df,
     optimized_order,
     resolution,
+    complexity_scores_df,
     outdir="migration_order_analysis",
 ):
     """
@@ -2042,6 +2087,8 @@ def generate_migration_order_analysis(
         Ordered list of community IDs for migration
     resolution : float
         Leiden resolution parameter
+    complexity_scores_df : Spark DataFrame
+        DataFrame with columns ['stream_name', 'complexity_score']
     outdir : str
         Output directory for reports
     
@@ -2059,9 +2106,19 @@ def generate_migration_order_analysis(
     # Convert to pandas
     stream_table_pdf = stream_table_dependency_df.toPandas()
     merged_edges_pdf = merged_edges_df.toPandas()
+    complexity_pdf = complexity_scores_df.select('stream_name', 'complexity_score').toPandas()
     
     # Convert size to numeric
     stream_table_pdf['size'] = pd.to_numeric(stream_table_pdf['size'], errors='coerce').fillna(0.0)
+    
+    # Merge leiden_df with complexity scores
+    leiden_with_complexity = leiden_df.merge(
+        complexity_pdf,
+        left_on='stream',
+        right_on='stream_name',
+        how='left'
+    )
+    leiden_with_complexity['complexity_score'] = leiden_with_complexity['complexity_score'].fillna(0)
     
     # Calculate global totals
     all_streams = set(leiden_df["stream"].tolist())
@@ -2071,11 +2128,19 @@ def generate_migration_order_analysis(
     total_bi_reports_global = len(bi_reports_global)
     total_etl_streams_global = len(etl_streams_global)
     
-    # Build community -> streams mapping
+    # Calculate total complexity across all communities
+    total_complexity_global = leiden_with_complexity['complexity_score'].sum()
+    
+    # Build community -> streams mapping with complexity
     community_streams = {}
+    community_complexity = {}
     for c in optimized_order:
         streams = leiden_df[leiden_df['community'] == c]['stream'].tolist()
         community_streams[c] = set(streams)
+        # Calculate community complexity
+        community_complexity[c] = leiden_with_complexity[
+            leiden_with_complexity['community'] == c
+        ]['complexity_score'].sum()
     
     # Track already migrated/available tables
     available_tables = set()
@@ -2092,6 +2157,7 @@ def generate_migration_order_analysis(
     cumulative_sync_size_bi = 0.0
     cumulative_sync_size_etl = 0.0
     cumulative_multi_producer_consumer_tables = 0
+    cumulative_complexity = 0.0
     
     # List to collect sync details for CSV
     sync_details_rows = []
@@ -2112,12 +2178,19 @@ Total Communities: {len(optimized_order)}
 Total Streams: {total_streams_global}
   - BI Reports: {total_bi_reports_global}
   - ETL Streams: {total_etl_streams_global}
+Total Complexity Score: {total_complexity_global:.0f}
 
 {'='*100}
 """
     
     for step, community_id in enumerate(optimized_order, 1):
         streams_in_community = community_streams[community_id]
+        community_complexity_score = community_complexity[community_id]
+        
+        # Get stream-level complexity for this community
+        stream_complexity_map = leiden_with_complexity[
+            leiden_with_complexity['community'] == community_id
+        ].set_index('stream')['complexity_score'].to_dict()
         
         # Add stream-to-community-to-execution_order mapping for CSV
         for stream in streams_in_community:
@@ -2292,14 +2365,17 @@ Total Streams: {total_streams_global}
         cumulative_sync_size += sync_size
         cumulative_sync_size_bi += sync_size_bi
         cumulative_sync_size_etl += sync_size_etl
+        cumulative_complexity += community_complexity_score
         
         # Calculate remaining
         remaining_streams = total_streams_global - cumulative_streams
         remaining_bi = total_bi_reports_global - cumulative_bi
         remaining_etl = total_etl_streams_global - cumulative_etl
+        remaining_complexity = total_complexity_global - cumulative_complexity
         
         # Progress percentages
         progress_pct = (cumulative_streams / total_streams_global * 100) if total_streams_global > 0 else 0.0
+        complexity_progress_pct = (cumulative_complexity / total_complexity_global * 100) if total_complexity_global > 0 else 0.0
         
         # Write community section
         report_content += f"""\n{'='*100}
@@ -2310,28 +2386,33 @@ STEP {step}/{len(optimized_order)}: COMMUNITY {community_id}
 Streams in this community: {len(streams_in_community)} ({pct_total:.2f}% of total)
   - BI Reports: {len(bi_reports)} ({pct_bi:.2f}% of all BI reports)
   - ETL Streams: {len(etl_streams)} ({pct_etl:.2f}% of all ETL streams)
+Community Complexity Score: {community_complexity_score:.0f}
 
 --- STREAMS LIST ---
 """
         
-        # Add list of streams in the community
+        # Add list of streams in the community with complexity scores
         if len(bi_reports) > 0:
             report_content += f"\n  ** BI REPORTS ({len(bi_reports)}) **\n"
             for stream in sorted(bi_reports):
-                report_content += f"    - {stream}\n"
+                complexity = stream_complexity_map.get(stream, 0)
+                report_content += f"    - {stream} (complexity: {complexity:.0f})\n"
         
         if len(etl_streams) > 0:
             report_content += f"\n  ** ETL STREAMS ({len(etl_streams)}) **\n"
             for stream in sorted(etl_streams):
-                report_content += f"    - {stream}\n"
+                complexity = stream_complexity_map.get(stream, 0)
+                report_content += f"    - {stream} (complexity: {complexity:.0f})\n"
         
         report_content += f"""\n--- MIGRATION PROGRESS ---
 Cumulative streams migrated: {cumulative_streams}/{total_streams_global} ({progress_pct:.2f}%)
   - BI Reports migrated: {cumulative_bi}/{total_bi_reports_global}
   - ETL Streams migrated: {cumulative_etl}/{total_etl_streams_global}
+Cumulative complexity migrated: {cumulative_complexity:.0f}/{total_complexity_global:.0f} ({complexity_progress_pct:.2f}%)
 Remaining streams: {remaining_streams}
   - BI Reports remaining: {remaining_bi}
   - ETL Streams remaining: {remaining_etl}
+Remaining complexity: {remaining_complexity:.0f}
 
 --- SYNC REQUIREMENTS FOR THIS STEP ---
 Tables to SYNC (not yet available): {len(tables_to_sync)} unique tables, {sync_size:.2f} GB
@@ -2431,6 +2512,7 @@ Total communities migrated: {len(optimized_order)}
 Total streams migrated: {cumulative_streams}/{total_streams_global} (100%)
   - BI Reports: {cumulative_bi}/{total_bi_reports_global}
   - ETL Streams: {cumulative_etl}/{total_etl_streams_global}
+Total complexity migrated: {cumulative_complexity:.0f}/{total_complexity_global:.0f} (100%)
 
 Total cumulative sync cost: {cumulative_sync_size:.2f} GB
   - For BI Reports: {cumulative_sync_size_bi:.2f} GB
@@ -2473,7 +2555,7 @@ Migration order: {optimized_order}
 
 # COMMAND ----------
 
-# DBTITLE 1,Run order optimization and generate reports
+# DBTITLE 1,Run order optimization
 order_rows = []
 resolutions_costs = {}  # Track resolution -> (total_cost, num_communities) for metadata CSV
 
@@ -2488,110 +2570,66 @@ for resolution in resolutions:
     # Check if rest_ids needs to be split into batches
     top_n = 10  # Same as used in split_communities_topN
 
-    topN_ids, rest_ids, community_weights = split_communities_topN(leiden_df, top_n=top_n)
+    topN_ids, rest_ids_desc, community_weights = split_communities_topN(leiden_df, top_n=top_n)
+    
+    # REVERSE rest_ids to get ASCENDING order (lowest weight first)
+    # split_communities_topN returns rest_ids in DESCENDING order (highest weight first)
+    # We want to migrate batches with lowest weight first
+    rest_ids = list(reversed(rest_ids_desc))
+    print(f"\n--- REST communities reordered: ASCENDING by weight (lowest first) ---")
 
     dep_scaled_df = unique_table_weights.select("from", "to", "table", "weight")
     
-    if len(rest_ids) > top_n:
-        print(f"\n--- REST communities ({len(rest_ids)}) exceed top_n ({top_n}), splitting into batches ---")
+    # Step 1: Optimize REST communities as a single batch
+    # But identify communities with 0 sync requirement to migrate first
+    print(f"\n--- Step 1: Optimizing REST communities ({len(rest_ids)} communities) ---")
+    
+    # Identify communities with 0 sync requirement (no incoming dependencies from outside)
+    zero_sync_communities = []
+    non_zero_sync_communities = []
+    
+    for comm_id in rest_ids:
+        # Get streams in this community
+        streams_in_community = set(leiden_df[leiden_df['community'] == comm_id]['stream'].tolist())
         
-        # IMPORTANT: rest_ids is already sorted by weight (descending) from split_communities_topN
-        # Verify the ordering is preserved
-        rest_weights = [community_weights.get(comm_id, 0.0) for comm_id in rest_ids]
-        print(f"REST communities weights (first 10): {rest_weights[:10]}")
-        print(f"Weights are in descending order: {rest_weights == sorted(rest_weights, reverse=True)}")
+        # Check if there are any incoming dependencies from outside this community
+        # Convert to pandas for easier filtering
+        dep_pdf = dep_scaled_df.toPandas()
         
-        # Split rest_ids into batches of size top_n
-        # Each batch will contain communities in weight-descending order
-        rest_batches = []
-        for i in range(0, len(rest_ids), top_n):
-            batch = rest_ids[i:i+top_n]
-            rest_batches.append(batch)
+        # Find incoming dependencies: tables consumed by this community but produced outside
+        incoming_deps = dep_pdf[
+            (~dep_pdf['from'].isin(streams_in_community)) & 
+            (dep_pdf['to'].isin(streams_in_community))
+        ]
         
-        print(f"Created {len(rest_batches)} batches: {[len(b) for b in rest_batches]}")
-        
-        # Print weight ranges for each batch and identify zero-weight batches
-        zero_weight_batches = []
-        non_zero_weight_batches = []
-        
-        for batch_idx, batch in enumerate(rest_batches):
-            batch_weights = [community_weights.get(comm_id, 0.0) for comm_id in batch]
-            max_weight = max(batch_weights)
-            min_weight = min(batch_weights)
-            print(f"  Batch {batch_idx + 1}: weight range [{min_weight:.2f} - {max_weight:.2f}]")
-            
-            # Check if this is a zero-weight batch (max weight is 0)
-            if max_weight == 0.0:
-                zero_weight_batches.append((batch_idx, batch))
-                print(f"    -> Zero-weight batch, will be migrated FIRST without optimization")
-            else:
-                non_zero_weight_batches.append((batch_idx, batch))
-                print(f"    -> Non-zero weight batch, will be optimized")
-        
-        print(f"\nBatch classification:")
-        print(f"  Zero-weight batches: {len(zero_weight_batches)} (migrate first, no optimization)")
-        print(f"  Non-zero weight batches: {len(non_zero_weight_batches)} (optimize)")
-        
-        # Optimize only non-zero weight batches in reverse order (last batch first)
-        # This ensures earlier batches can use later batches' tables as pre-available
-        batch_results = []  # Will store results in order: batch3, batch2, batch1
-        cumulative_pre_available = []  # Communities whose tables are already available
-        
-        # Process non-zero weight batches in reverse order
-        for batch_idx, batch in reversed(non_zero_weight_batches):
-            print(f"\n--- Optimizing REST batch {batch_idx + 1}/{len(rest_batches)} (communities: {batch}) ---")
-            
-            # Pre-available communities are all batches processed so far (later batches)
-            pre_available = cumulative_pre_available if cumulative_pre_available else None
-            
-            bf_batch = BruteForceCommunityOrdering(
-                dep_scaled_df,
-                leiden_df,
-                batch,
-                pre_available_communities=pre_available
-            )
-            res_batch = bf_batch.brute_force(log_every=5000, label=f"REST_batch_{batch_idx+1}_gamma_{resolution}")
-            
-            batch_results.append({
-                'order': res_batch['best_order'],
-                'cost': res_batch['best_cost'],
-                'batch_idx': batch_idx
-            })
-            
-            # Add this batch to cumulative pre-available for next iteration
-            cumulative_pre_available.extend(batch)
-            
-            print(f"Batch {batch_idx + 1} optimized: order={res_batch['best_order']}, cost={res_batch['best_cost']:.2f}")
-        
-        # Combine results: zero-weight batches first (in original order), then optimized batches
-        rest_order = []
-        rest_cost = 0.0
-        
-        # Add zero-weight batches first (in their original order, which is descending by batch index)
-        for batch_idx, batch in zero_weight_batches:
-            rest_order.extend(batch)
-            print(f"\nAdding zero-weight batch {batch_idx + 1} to order (no optimization): {batch}")
-        
-        # Add optimized batches (already in reverse order from optimization)
-        for result in batch_results:
-            rest_order.extend(result['order'])
-            rest_cost += result['cost']
-        
-        print(f"\n--- Combined REST order (zero-weight batches → optimized batches): {rest_order} ---")
-        print(f"--- Combined REST cost (optimization metric, zero-weight batches excluded): {rest_cost:.2f} ---")
-        
-    else:
-        # Original logic: optimize REST communities as a single batch
-        print(f"\n--- Step 1: Optimizing REST communities ({len(rest_ids)} communities) ---")
+        if len(incoming_deps) == 0:
+            zero_sync_communities.append(comm_id)
+        else:
+            non_zero_sync_communities.append(comm_id)
+    
+    print(f"Communities with 0 sync requirement: {len(zero_sync_communities)} - {zero_sync_communities}")
+    print(f"Communities with non-zero sync requirement: {len(non_zero_sync_communities)}")
+    
+    # Optimize non-zero sync communities
+    if len(non_zero_sync_communities) > 0:
         bf_rest = BruteForceCommunityOrdering(
             dep_scaled_df, 
             leiden_df, 
-            rest_ids,
+            non_zero_sync_communities,
             pre_available_communities=None  # No pre-available tables for rest
         )
         res_rest = bf_rest.brute_force(log_every=5000, label=f"REST_gamma_{resolution}")
-        rest_order = res_rest["best_order"]
+        optimized_rest_order = res_rest["best_order"]
         rest_cost = res_rest['best_cost']
+    else:
+        optimized_rest_order = []
+        rest_cost = 0.0
+    
+    # Final REST order: zero-sync communities first, then optimized non-zero communities
+    rest_order = zero_sync_communities + optimized_rest_order
+    
+    print(f"\n--- REST order (0-sync first, then optimized): {rest_order} ---")
+    print(f"--- REST cost (optimization metric): {rest_cost:.2f} ---")
 
     # Step 2: Optimize TOP N communities with all REST communities as pre-available
     print(f"\n--- Step 2: Optimizing TOP N communities (with all REST tables pre-available) ---")
@@ -2603,44 +2641,47 @@ for resolution in resolutions:
     )
     res_top = bf_top.brute_force(log_every=7500, label=f"TOPN_gamma_{resolution}")
 
-    # Final order: REST first (zero-weight batches + optimized batches), then TOP N
+    # Final order: REST first (0-sync + optimized), then TOP N
     final_order = rest_order + res_top["best_order"]
     
     print(f"\n=== FINAL MERGED ORDER for γ={resolution} ===")
-    print(f"  REST order: {rest_order}")
+    print(f"  REST order (0-sync first, then optimized): {rest_order}")
     print(f"  TOP N order: {res_top['best_order']}")
     print(f"  FINAL order: {final_order}")
     print(f"  REST cost (optimization metric): {rest_cost:.2f}")
     print(f"  TOP N cost (with REST pre-available, optimization metric): {res_top['best_cost']:.2f}")
-    
-    # Generate detailed migration analysis report
-    # This will calculate the TRUE total sync cost for the entire order
-    print(f"\n--- Generating migration order analysis report ---")
-    report_file, total_sync_cost = generate_migration_order_analysis(
-        leiden_df=leiden_df,
-        stream_table_dependency_df=stream_stream_dependency_df,
-        merged_edges_df=merged_dependency_df,
-        optimized_order=final_order,
-        resolution=resolution,
-        outdir=f"{output_path}migration_order_analysis",
-    )
-    print(f"Report saved to: {report_file}")
-    
-    # Store resolution, total sync cost, and number of communities for metadata CSV
-    resolutions_costs[resolution] = (total_sync_cost, num_communities)
-    
-    print(f"\n=== ACTUAL TOTAL SYNC COST (from analysis): {total_sync_cost:.2f} GB ===")
-    print(f"=== NUMBER OF COMMUNITIES: {num_communities} ===")
-    
-    # Format output with costs
-    order_line = (
-        f"gamma={resolution}: {final_order} | "
-        f"REST_cost={rest_cost:.2f}, "
-        f"TOPN_cost={res_top['best_cost']:.2f}, "
-        f"ACTUAL_TOTAL_SYNC_COST={total_sync_cost:.2f}, "
-        f"NUM_COMMUNITIES={num_communities}"
-    )
-    order_rows.append(order_line)
+
+# COMMAND ----------
+
+# DBTITLE 1,Migration Order Analysis
+# Generate detailed migration analysis report
+print(f"\n--- Generating migration order analysis report ---")
+report_file, total_sync_cost = generate_migration_order_analysis(
+    leiden_df=leiden_df,
+    stream_table_dependency_df=stream_stream_dependency_df,
+    merged_edges_df=merged_dependency_df,
+    optimized_order=final_order,
+    resolution=resolution,
+    complexity_scores_df=complexity_scores_df,
+    outdir=f"{output_path}migration_order_analysis",
+)
+print(f"Report saved to: {report_file}")
+
+# Store resolution, total sync cost, and number of communities 
+resolutions_costs[resolution] = (total_sync_cost, num_communities)
+
+print(f"\n=== ACTUAL TOTAL SYNC COST (from analysis): {total_sync_cost:.2f} GB ===")
+print(f"=== NUMBER OF COMMUNITIES: {num_communities} ===")
+
+# Format output with costs
+order_line = (
+    f"gamma={resolution}: {final_order} | "
+    f"REST_cost={rest_cost:.2f}, "
+    f"TOPN_cost={res_top['best_cost']:.2f}, "
+    f"ACTUAL_TOTAL_SYNC_COST={total_sync_cost:.2f}, "
+    f"NUM_COMMUNITIES={num_communities}"
+)
+order_rows.append(order_line)
 
 # Write all orders to a text file in output_path
 orders_output_path = output_path + "community_execution_orders.txt"
@@ -2661,18 +2702,296 @@ print("\nWritten content:")
 for row in order_rows:
     print(f"  {row}")
 
-# Append execution metadata to CSV
-print(f"\n=== Appending execution metadata to CSV ===")
+# Append execution metadata to table
 metadata_file = append_execution_metadata(
-    output_path="/Volumes/odp_adw_mvp_n/migration/utilities/community_detection/",
     weight_method=WEIGHT_METHOD,  # Use the variable set by the active weight calculation cell
     top_n=top_n,  # Include the top_n value used for ordering
     resolutions_dict=resolutions_costs  # Now contains (total_cost, num_communities) tuples
 )
-print(f"Metadata CSV updated: {metadata_file}")
-print(f"Weight calculation method: {WEIGHT_METHOD}")
-print(f"Top N value: {top_n}")
-print(f"Resolutions and costs: {resolutions_costs}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Generate migration timeline with efficiency gains
+from datetime import datetime, timedelta
+import pandas as pd
+import math
+
+print("\n" + "="*100)
+print("GENERATING MIGRATION TIMELINE")
+print("="*100)
+
+# Start date for migration
+START_DATE = datetime(2026, 2, 23)
+
+# Load the sync details and stream ordering CSVs generated by generate_migration_order_analysis
+sync_details_file = f"{output_path}migration_order_analysis/community_sync_details_gamma_{resolution}.csv"
+stream_ordering_file = f"{output_path}migration_order_analysis/stream_community_ordering_gamma_{resolution}.csv"
+
+try:
+    sync_details_pd = pd.read_csv(sync_details_file)
+    stream_ordering_pd = pd.read_csv(stream_ordering_file)
+except FileNotFoundError as e:
+    print(f"ERROR: Required CSV files not found. Ensure cell 44 has completed successfully.")
+    print(f"Missing file: {e.filename}")
+    raise
+
+# Get stream-to-squad mapping from dependency_df_full
+stream_squad_mapping_df = dependency_df_full.select(
+    col('STREAM_NAME').alias('stream_name'),
+    col('SquadID').alias('squad')
+).distinct().toPandas()
+
+# Create a dictionary for quick lookup
+stream_to_squad = stream_squad_mapping_df.set_index('stream_name')['squad'].to_dict()
+
+print(f"Loaded stream-to-squad mapping for {len(stream_to_squad)} streams")
+
+# Get total complexity for percentage calculations
+total_complexity = complexity_scores_df.agg({'complexity_score': 'sum'}).collect()[0][0]
+total_streams = leiden_df.shape[0]
+
+print(f"Total complexity score: {total_complexity:.2f}")
+print(f"Total streams: {total_streams}")
+
+# Prepare timeline data
+timeline_rows = []
+cumulative_sync_gb = 0.0
+cumulative_complexity = 0.0
+cumulative_streams = 0
+cumulative_weeks = 0
+current_date = START_DATE
+available_tables = set()
+bi_reports_ready = []  # Track BI reports ready from previous stage
+
+# Get stream-to-table production mapping (TGT tables)
+stream_produces_tables_df = dependency_df.filter(
+    (upper(col('table_type')) == 'TGT') |
+    (upper(col('table_type')) == 'TGT_TRNS')
+).select(
+    col('stream_name'),
+    upper(col('DB_Table_Name')).alias('table_name')
+).distinct().toPandas()
+
+stream_produces = stream_produces_tables_df.groupby('stream_name')['table_name'].apply(set).to_dict()
+
+# Get report-to-table dependencies if available
+try:
+    report_to_tables_pd = report_dependency_df.select(
+        col('stream_name').alias('report_name'),
+        upper(col('table_name')).alias('table_name')
+    ).distinct().toPandas()
+    report_required_tables = report_to_tables_pd.groupby('report_name')['table_name'].apply(set).to_dict()
+    has_report_data = True
+except:
+    report_required_tables = {}
+    has_report_data = False
+    print("Note: Report dependency data not available, skipping BI report readiness analysis")
+
+for idx, community_id in enumerate(final_order, start=1):
+    # Get streams in this community
+    community_streams = leiden_df[leiden_df['community'] == community_id]['stream'].tolist()
+    num_streams = len(community_streams)
+    
+    # Separate BI reports from ETL streams
+    bi_reports = [s for s in community_streams if 'json' in s.lower()]
+    etl_streams = [s for s in community_streams if 'json' not in s.lower()]
+    
+    # Group streams by squad
+    squad_streams = {}
+    streams_without_squad = []
+    
+    for stream in community_streams:
+        squad = stream_to_squad.get(stream)
+        if squad:
+            if squad not in squad_streams:
+                squad_streams[squad] = []
+            squad_streams[squad].append(stream)
+        else:
+            streams_without_squad.append(stream)
+    
+    # Create squad-based summary string for CSV (just counts)
+    squad_summary_parts = []
+    for squad in sorted(squad_streams.keys()):
+        streams_in_squad = squad_streams[squad]
+        squad_summary_parts.append(f"{squad} ({len(streams_in_squad)} streams)")
+    
+    if streams_without_squad:
+        squad_summary_parts.append(f"Unknown Squad ({len(streams_without_squad)} streams)")
+    
+    squad_summary = ", ".join(squad_summary_parts)
+    
+    # Create detailed squad-based stream list for CSV (with stream names)
+    squad_details_parts = []
+    for squad in sorted(squad_streams.keys()):
+        streams = sorted(squad_streams[squad])
+        squad_details_parts.append(f"{squad}: {', '.join(streams)}")
+    
+    if streams_without_squad:
+        squad_details_parts.append(f"Unknown Squad: {', '.join(sorted(streams_without_squad))}")
+    
+    squad_based_streams = " | ".join(squad_details_parts)
+    
+    # Get complexity for this community
+    community_complexity_df = complexity_scores_df.filter(
+        col('stream_name').isin(community_streams)
+    )
+    community_complexity = community_complexity_df.agg({'complexity_score': 'sum'}).collect()[0][0] or 0.0
+    complexity_pct = (community_complexity / total_complexity * 100) if total_complexity > 0 else 0.0
+    
+    # Get sync requirements for this community
+    sync_tables = sync_details_pd[sync_details_pd['community_id'] == community_id]
+    sync_gb = sync_tables['size_gb'].sum() if len(sync_tables) > 0 else 0.0
+    sync_table_list = sync_tables['table_name'].unique().tolist() if len(sync_tables) > 0 else []
+    
+    # Get target tables produced by this community
+    target_tables = set()
+    for stream in community_streams:
+        if stream in stream_produces:
+            target_tables.update(stream_produces[stream])
+    num_target_tables = len(target_tables)
+    
+    # Update cumulative metrics FIRST
+    cumulative_sync_gb += sync_gb
+    cumulative_complexity += community_complexity
+    cumulative_streams += num_streams
+    cumulative_complexity_pct = (cumulative_complexity / total_complexity * 100) if total_complexity > 0 else 0.0
+    cumulative_streams_pct = (cumulative_streams / total_streams * 100) if total_streams > 0 else 0.0
+    
+    # Calculate efficiency gain based on CURRENT cumulative complexity (absolute)
+    # 4% for each 10% of cumulative complexity migrated, max 25%
+    efficiency_gain = min(0.04 * math.floor(cumulative_complexity_pct / 10), 0.25)
+    
+    # Apply efficiency gain to complexity
+    effective_complexity_pct = complexity_pct * (1 - efficiency_gain)
+    
+    # Calculate weeks: 1 week per 2% effective complexity, rounded up to full weeks
+    weeks_for_community = math.ceil(effective_complexity_pct / 2.0)
+    cumulative_weeks += weeks_for_community
+    
+    # Calculate dates
+    end_date = START_DATE + timedelta(weeks=cumulative_weeks)
+    
+    # Check which BI reports can be migrated after this community
+    # (reports whose required tables are now all available)
+    if has_report_data:
+        available_tables.update(target_tables)
+        newly_ready_reports = []
+        for report, required_tables in report_required_tables.items():
+            if report not in bi_reports_ready and required_tables.issubset(available_tables):
+                newly_ready_reports.append(report)
+                bi_reports_ready.append(report)
+    else:
+        newly_ready_reports = []
+    
+    # Add BI reports from previous stage to this community's timeline
+    bi_reports_in_timeline = bi_reports if idx == 1 else bi_reports + newly_ready_reports
+    
+    timeline_rows.append({
+        'Stage': idx,
+        'Community_ID': community_id,
+        'Num_Streams': num_streams,
+        'Squad_Based_Streams': squad_based_streams,  # Detailed squad-based list for CSV
+        'Squad_Summary': squad_summary,  # Summary with counts
+        'ETL_Streams': len(etl_streams),
+        'BI_Reports_Migrated': len(bi_reports_in_timeline),
+        'BI_Reports_List': ', '.join(bi_reports_in_timeline) if bi_reports_in_timeline else 'None',
+        'Sync_Tables_Count': len(sync_table_list),
+        'Sync_Tables_GB': f"{sync_gb:.2f}",
+        'Cumulative_Sync_GB': f"{cumulative_sync_gb:.2f}",
+        'Complexity_Pct': f"{complexity_pct:.2f}%",
+        'Cumulative_Complexity_Pct': f"{cumulative_complexity_pct:.2f}%",
+        'Cumulative_Streams_Pct': f"{cumulative_streams_pct:.2f}%",
+        'Weeks_For_Stage': weeks_for_community,
+        'Cumulative_Weeks': cumulative_weeks,
+        'Start_Date': current_date.strftime('%Y-%m-%d'),
+        'End_Date': end_date.strftime('%Y-%m-%d'),
+        'Target_Tables_Created': num_target_tables,
+        # Keep these for text report generation (not in CSV)
+        '_squad_streams_dict': squad_streams,
+        '_streams_without_squad': streams_without_squad
+    })
+    
+    current_date = end_date
+
+# Create DataFrame
+timeline_df = pd.DataFrame(timeline_rows)
+
+# Remove internal columns before saving to CSV
+csv_columns = [col for col in timeline_df.columns if not col.startswith('_')]
+timeline_csv_df = timeline_df[csv_columns]
+
+# Write to CSV
+timeline_csv_path = f"{output_path}migration_order_analysis/migration_timeline_gamma_{resolution}.csv"
+timeline_csv_df.to_csv(timeline_csv_path, index=False)
+print(f"\nMigration timeline CSV saved to: {timeline_csv_path}")
+
+# Generate concise text report
+timeline_txt_path = f"{output_path}migration_order_analysis/migration_timeline_gamma_{resolution}.txt"
+
+with open(timeline_txt_path, 'w') as f:
+    f.write("="*120 + "\n")
+    f.write(f"MIGRATION TIMELINE - Resolution γ={resolution}\n")
+    f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write(f"Start Date: {START_DATE.strftime('%Y-%m-%d')}\n")
+    f.write(f"Total Duration: {cumulative_weeks} weeks\n")
+    f.write("="*120 + "\n\n")
+    
+    for _, row in timeline_df.iterrows():
+        f.write(f"STAGE {row['Stage']}: Community {row['Community_ID']} | {row['Start_Date']} to {row['End_Date']} ({row['Weeks_For_Stage']} weeks)\n")
+        f.write(f"  Streams: {row['Num_Streams']} ({row['ETL_Streams']} ETL, {row['BI_Reports_Migrated']} BI) | Complexity: {row['Complexity_Pct']}\n")
+        f.write(f"  Sync: {row['Sync_Tables_Count']} tables, {row['Sync_Tables_GB']} GB | Cumulative: {row['Cumulative_Sync_GB']} GB\n")
+        f.write(f"  Target Tables: {row['Target_Tables_Created']} | Cumulative Progress: {row['Cumulative_Complexity_Pct']} complexity, {row['Cumulative_Streams_Pct']} streams\n")
+        
+        # Add squad-based stream details with stream names
+        f.write(f"\n  Squads:\n")
+        squad_streams = row['_squad_streams_dict']
+        for squad in sorted(squad_streams.keys()):
+            streams = sorted(squad_streams[squad])
+            f.write(f"    {squad} ({len(streams)} streams):\n")
+            for stream in streams:
+                f.write(f"      - {stream}\n")
+        
+        # Add streams without squad if any
+        streams_without_squad = row['_streams_without_squad']
+        if streams_without_squad:
+            f.write(f"    Unknown Squad ({len(streams_without_squad)} streams):\n")
+            for stream in sorted(streams_without_squad):
+                f.write(f"      - {stream}\n")
+        
+        if row['BI_Reports_List'] != 'None':
+            f.write(f"\n  BI Reports: {row['BI_Reports_List']}\n")
+        f.write("\n")
+    
+    f.write("="*120 + "\n")
+    f.write(f"SUMMARY\n")
+    f.write(f"  Total Communities: {len(final_order)}\n")
+    f.write(f"  Total Streams: {total_streams}\n")
+    f.write(f"  Total Sync Required: {cumulative_sync_gb:.2f} GB\n")
+    f.write(f"  Total Duration: {cumulative_weeks} weeks ({cumulative_weeks/4:.1f} months)\n")
+    f.write(f"  Completion Date: {end_date.strftime('%Y-%m-%d')}\n")
+    if has_report_data:
+        f.write(f"  BI Reports Ready: {len(bi_reports_ready)}\n")
+    f.write("="*120 + "\n")
+
+print(f"Migration timeline report saved to: {timeline_txt_path}")
+
+# Display summary
+print(f"\n{'='*120}")
+print(f"MIGRATION TIMELINE SUMMARY")
+print(f"{'='*120}")
+print(f"Total Communities: {len(final_order)}")
+print(f"Total Streams: {total_streams}")
+print(f"Total Sync Required: {cumulative_sync_gb:.2f} GB")
+print(f"Start Date: {START_DATE.strftime('%Y-%m-%d')}")
+print(f"End Date: {end_date.strftime('%Y-%m-%d')}")
+print(f"Total Duration: {cumulative_weeks} weeks ({cumulative_weeks/4:.1f} months)")
+if has_report_data:
+    print(f"BI Reports Ready: {len(bi_reports_ready)}")
+print(f"{'='*120}\n")
+
+# Display first few rows (without internal columns)
+print("\nFirst 5 stages:")
+display(timeline_csv_df.head())
 
 # COMMAND ----------
 
@@ -2698,7 +3017,7 @@ print(f"Selected resolution for report analysis: {SELECTED_RESOLUTION}")
 print(f"Available resolutions: {resolutions}")
 
 if SELECTED_RESOLUTION not in resolutions:
-    print(f"\n⚠️ WARNING: Selected resolution {SELECTED_RESOLUTION} was not processed in cell 40!")
+    print(f"\nWARNING: Selected resolution {SELECTED_RESOLUTION} was not processed in cell 40!")
     print(f"Please choose from: {resolutions}")
 else:
     print(f"✓ Resolution {SELECTED_RESOLUTION} is valid")
