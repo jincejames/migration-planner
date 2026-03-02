@@ -2715,6 +2715,7 @@ metadata_file = append_execution_metadata(
 from datetime import datetime, timedelta
 import pandas as pd
 import math
+import builtins
 
 print("\n" + "="*100)
 print("GENERATING MIGRATION TIMELINE")
@@ -2753,6 +2754,9 @@ total_streams = leiden_df.shape[0]
 print(f"Total complexity score: {total_complexity:.2f}")
 print(f"Total streams: {total_streams}")
 
+missing_static_tables_df = spark.read.option("header", True).csv("/Volumes/odp_adw_mvp_n/migration/utilities/community_detection/static_tables_for_report.csv").select("table_name")
+missing_static_tables = set(row["table_name"] for row in missing_static_tables_df.collect())
+
 # Prepare timeline data
 timeline_rows = []
 cumulative_sync_gb = 0.0
@@ -2760,7 +2764,7 @@ cumulative_complexity = 0.0
 cumulative_streams = 0
 cumulative_weeks = 0
 current_date = START_DATE
-available_tables = set()
+available_tables = missing_static_tables
 bi_reports_ready = []  # Track BI reports ready from previous stage
 
 # Get stream-to-table production mapping (TGT tables)
@@ -2889,6 +2893,7 @@ for idx, community_id in enumerate(final_order, start=1):
     timeline_rows.append({
         'Stage': idx,
         'Community_ID': community_id,
+        'Original_Community_IDs': [community_id],  # Track original communities
         'Num_Streams': num_streams,
         'Squad_Based_Streams': squad_based_streams,  # Detailed squad-based list for CSV
         'Squad_Summary': squad_summary,  # Summary with counts
@@ -2916,8 +2921,132 @@ for idx, community_id in enumerate(final_order, start=1):
 # Create DataFrame
 timeline_df = pd.DataFrame(timeline_rows)
 
+print(f"\nOriginal timeline has {len(timeline_df)} stages")
+
+# Club consecutive communities with 2 or fewer weeks
+print("\nClubbing consecutive communities with ≤2 weeks...")
+clubbed_rows = []
+i = 0
+clubbed_stage_num = 1
+
+while i < len(timeline_df):
+    current_row = timeline_df.iloc[i].to_dict()
+    
+    # Check if current stage has ≤2 weeks
+    if current_row['Weeks_For_Stage'] <= 2:
+        # Start a clubbed group
+        clubbed_communities = [current_row['Community_ID']]
+        clubbed_original_ids = current_row['Original_Community_IDs'].copy()
+        combined_streams = current_row['Num_Streams']
+        combined_etl = current_row['ETL_Streams']
+        combined_bi = current_row['BI_Reports_Migrated']
+        combined_sync_count = current_row['Sync_Tables_Count']
+        combined_sync_gb = float(current_row['Sync_Tables_GB'])
+        combined_target_tables = current_row['Target_Tables_Created']
+        combined_weeks = current_row['Weeks_For_Stage']
+        
+        # Collect squad streams
+        all_squad_streams = current_row['_squad_streams_dict'].copy()
+        all_streams_without_squad = current_row['_streams_without_squad'].copy()
+        all_bi_reports = [r.strip() for r in current_row['BI_Reports_List'].split(',') if r.strip() != 'None']
+        
+        # Look ahead for more consecutive stages with ≤2 weeks
+        j = i + 1
+        while j < len(timeline_df) and timeline_df.iloc[j]['Weeks_For_Stage'] <= 2:
+            next_row = timeline_df.iloc[j].to_dict()
+            clubbed_communities.append(next_row['Community_ID'])
+            clubbed_original_ids.extend(next_row['Original_Community_IDs'])
+            combined_streams += next_row['Num_Streams']
+            combined_etl += next_row['ETL_Streams']
+            combined_bi += next_row['BI_Reports_Migrated']
+            combined_sync_count += next_row['Sync_Tables_Count']
+            combined_sync_gb += float(next_row['Sync_Tables_GB'])
+            combined_target_tables += next_row['Target_Tables_Created']
+            combined_weeks += next_row['Weeks_For_Stage']
+            
+            # Merge squad streams
+            for squad, streams in next_row['_squad_streams_dict'].items():
+                if squad not in all_squad_streams:
+                    all_squad_streams[squad] = []
+                all_squad_streams[squad].extend(streams)
+            all_streams_without_squad.extend(next_row['_streams_without_squad'])
+            
+            # Merge BI reports
+            next_bi = [r.strip() for r in next_row['BI_Reports_List'].split(',') if r.strip() != 'None']
+            all_bi_reports.extend(next_bi)
+            
+            j += 1
+        
+        # Create clubbed row
+        if len(clubbed_communities) > 1:
+            # Multiple communities clubbed together
+            community_id_str = f"Clubbed ({', '.join(map(str, clubbed_communities))})"
+            print(f"  Clubbing communities {clubbed_communities} into stage {clubbed_stage_num}")
+        else:
+            # Single community, keep as is
+            community_id_str = str(clubbed_communities[0])
+        
+        # Rebuild squad summary and details
+        squad_summary_parts = []
+        squad_details_parts = []
+        for squad in sorted(all_squad_streams.keys()):
+            streams = sorted(set(all_squad_streams[squad]))  # Remove duplicates
+            squad_summary_parts.append(f"{squad} ({len(streams)} streams)")
+            squad_details_parts.append(f"{squad}: {', '.join(streams)}")
+        
+        if all_streams_without_squad:
+            unique_unknown = sorted(set(all_streams_without_squad))
+            squad_summary_parts.append(f"Unknown Squad ({len(unique_unknown)} streams)")
+            squad_details_parts.append(f"Unknown Squad: {', '.join(unique_unknown)}")
+        
+        squad_summary = ", ".join(squad_summary_parts)
+        squad_based_streams = " | ".join(squad_details_parts)
+        
+        # Use the last row's cumulative metrics
+        last_row = timeline_df.iloc[j-1]
+        
+        clubbed_rows.append({
+            'Stage': clubbed_stage_num,
+            'Community_ID': community_id_str,
+            'Original_Community_IDs': clubbed_original_ids,
+            'Num_Streams': combined_streams,
+            'Squad_Based_Streams': squad_based_streams,
+            'Squad_Summary': squad_summary,
+            'ETL_Streams': combined_etl,
+            'BI_Reports_Migrated': combined_bi,
+            'BI_Reports_List': ', '.join(sorted(set(all_bi_reports))) if all_bi_reports else 'None',
+            'Sync_Tables_Count': combined_sync_count,
+            'Sync_Tables_GB': f"{combined_sync_gb:.2f}",
+            'Cumulative_Sync_GB': last_row['Cumulative_Sync_GB'],
+            'Complexity_Pct': f"{builtins.sum([float(timeline_df.iloc[k]['Complexity_Pct'].rstrip('%')) for k in range(i, j)]):.2f}%",
+            'Cumulative_Complexity_Pct': last_row['Cumulative_Complexity_Pct'],
+            'Cumulative_Streams_Pct': last_row['Cumulative_Streams_Pct'],
+            'Weeks_For_Stage': combined_weeks,
+            'Cumulative_Weeks': last_row['Cumulative_Weeks'],
+            'Start_Date': current_row['Start_Date'],
+            'End_Date': last_row['End_Date'],
+            'Target_Tables_Created': combined_target_tables,
+            '_squad_streams_dict': all_squad_streams,
+            '_streams_without_squad': all_streams_without_squad
+        })
+        
+        i = j  # Move to next unchecked stage
+    else:
+        # Stage has >2 weeks, keep as is
+        current_row['Stage'] = clubbed_stage_num
+        current_row['Community_ID'] = str(current_row['Community_ID'])
+        clubbed_rows.append(current_row)
+        i += 1
+    
+    clubbed_stage_num += 1
+
+# Create clubbed DataFrame
+timeline_df = pd.DataFrame(clubbed_rows)
+
+print(f"After clubbing: {len(timeline_df)} stages\n")
+
 # Remove internal columns before saving to CSV
-csv_columns = [col for col in timeline_df.columns if not col.startswith('_')]
+csv_columns = [column for column in timeline_df.columns if not column.startswith('_') and column != 'Original_Community_IDs']
 timeline_csv_df = timeline_df[csv_columns]
 
 # Write to CSV
@@ -2933,11 +3062,17 @@ with open(timeline_txt_path, 'w') as f:
     f.write(f"MIGRATION TIMELINE - Resolution γ={resolution}\n")
     f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     f.write(f"Start Date: {START_DATE.strftime('%Y-%m-%d')}\n")
-    f.write(f"Total Duration: {cumulative_weeks} weeks\n")
+    f.write(f"Total Duration: {timeline_df.iloc[-1]['Cumulative_Weeks']} weeks\n")
     f.write("="*120 + "\n\n")
     
     for _, row in timeline_df.iterrows():
-        f.write(f"STAGE {row['Stage']}: Community {row['Community_ID']} | {row['Start_Date']} to {row['End_Date']} ({row['Weeks_For_Stage']} weeks)\n")
+        # Show which communities were clubbed
+        if 'Clubbed' in str(row['Community_ID']):
+            original_ids = ', '.join(map(str, row['Original_Community_IDs']))
+            f.write(f"STAGE {row['Stage']}: Communities {original_ids} (Clubbed) | {row['Start_Date']} to {row['End_Date']} ({row['Weeks_For_Stage']} weeks)\n")
+        else:
+            f.write(f"STAGE {row['Stage']}: Community {row['Community_ID']} | {row['Start_Date']} to {row['End_Date']} ({row['Weeks_For_Stage']} weeks)\n")
+        
         f.write(f"  Streams: {row['Num_Streams']} ({row['ETL_Streams']} ETL, {row['BI_Reports_Migrated']} BI) | Complexity: {row['Complexity_Pct']}\n")
         f.write(f"  Sync: {row['Sync_Tables_Count']} tables, {row['Sync_Tables_GB']} GB | Cumulative: {row['Cumulative_Sync_GB']} GB\n")
         f.write(f"  Target Tables: {row['Target_Tables_Created']} | Cumulative Progress: {row['Cumulative_Complexity_Pct']} complexity, {row['Cumulative_Streams_Pct']} streams\n")
@@ -2964,11 +3099,11 @@ with open(timeline_txt_path, 'w') as f:
     
     f.write("="*120 + "\n")
     f.write(f"SUMMARY\n")
-    f.write(f"  Total Communities: {len(final_order)}\n")
+    f.write(f"  Total Stages (after clubbing): {len(timeline_df)}\n")
     f.write(f"  Total Streams: {total_streams}\n")
-    f.write(f"  Total Sync Required: {cumulative_sync_gb:.2f} GB\n")
-    f.write(f"  Total Duration: {cumulative_weeks} weeks ({cumulative_weeks/4:.1f} months)\n")
-    f.write(f"  Completion Date: {end_date.strftime('%Y-%m-%d')}\n")
+    f.write(f"  Total Sync Required: {timeline_df.iloc[-1]['Cumulative_Sync_GB']} GB\n")
+    f.write(f"  Total Duration: {timeline_df.iloc[-1]['Cumulative_Weeks']} weeks ({timeline_df.iloc[-1]['Cumulative_Weeks']/4:.1f} months)\n")
+    f.write(f"  Completion Date: {timeline_df.iloc[-1]['End_Date']}\n")
     if has_report_data:
         f.write(f"  BI Reports Ready: {len(bi_reports_ready)}\n")
     f.write("="*120 + "\n")
@@ -2979,12 +3114,12 @@ print(f"Migration timeline report saved to: {timeline_txt_path}")
 print(f"\n{'='*120}")
 print(f"MIGRATION TIMELINE SUMMARY")
 print(f"{'='*120}")
-print(f"Total Communities: {len(final_order)}")
+print(f"Total Stages (after clubbing): {len(timeline_df)}")
 print(f"Total Streams: {total_streams}")
-print(f"Total Sync Required: {cumulative_sync_gb:.2f} GB")
+print(f"Total Sync Required: {timeline_df.iloc[-1]['Cumulative_Sync_GB']} GB")
 print(f"Start Date: {START_DATE.strftime('%Y-%m-%d')}")
-print(f"End Date: {end_date.strftime('%Y-%m-%d')}")
-print(f"Total Duration: {cumulative_weeks} weeks ({cumulative_weeks/4:.1f} months)")
+print(f"End Date: {timeline_df.iloc[-1]['End_Date']}")
+print(f"Total Duration: {timeline_df.iloc[-1]['Cumulative_Weeks']} weeks ({timeline_df.iloc[-1]['Cumulative_Weeks']/4:.1f} months)")
 if has_report_data:
     print(f"BI Reports Ready: {len(bi_reports_ready)}")
 print(f"{'='*120}\n")
@@ -3122,8 +3257,12 @@ execution_stages = stream_ordering_pd['execution_order'].unique().tolist()
 print(f"Total execution stages: {len(execution_stages)}")
 print(f"Execution order (optimized): {execution_stages}")
 
+missing_static_tables_df = spark.read.option("header", True).csv("/Volumes/odp_adw_mvp_n/migration/utilities/community_detection/static_tables_for_report.csv").select("table_name")
+missing_static_tables = set(row["table_name"] for row in missing_static_tables_df.collect())
+
+
 # Initialize tracking
-available_tables = set()  # Tables available from ALL migrated streams (cumulative)
+available_tables = missing_static_tables  # Tables available from ALL migrated streams (cumulative) and initialized with already available static tables
 synced_tables = set()  # Tables that are synced (incoming dependencies, cumulative)
 reports_ready_by_stage = {}  # stage -> list of reports ready
 reports_migrated = set()  # Track which reports have been marked as ready
@@ -3234,7 +3373,7 @@ with open(report_readiness_text_file, 'w') as f:
     
     f.write(f"Analysis Date: {pd.Timestamp.now()}\n")
     f.write(f"Resolution (gamma): {SELECTED_RESOLUTION}\n")
-    f.write(f"Weight Method: {WEIGHT_METHOD}\n")
+    # f.write(f"Weight Method: {WEIGHT_METHOD}\n")
     f.write(f"Total Reports Analyzed: {len(report_required_tables)}\n")
     f.write(f"Total Reports Ready: {len(reports_migrated)}\n")
     f.write(f"Total Execution Stages: {len(execution_stages)}\n\n")
@@ -3298,6 +3437,7 @@ print(f"  2. {report_readiness_text_file}")
 
 # COMMAND ----------
 
+# DBTITLE 1,Report migration readiness output
 missing_tables = set()
 section_found = False
 with open(f"{output_path}migration_order_analysis/report_migration_readiness_analysis_gamma_1.8.txt", "r") as f:
