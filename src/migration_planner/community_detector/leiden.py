@@ -38,49 +38,22 @@ from pyspark.sql.functions import ceil, sum, when, array, sort_array
 
 # COMMAND ----------
 
-# DBTITLE 1,Widgets
-dbutils.widgets.text(
-    "volume_name",
-    "/Volumes/odp_adw_mvp_n/migration/utilities/community_detection/",
-    "Input Volume Path"
-)
-dbutils.widgets.text(
-    "input_dependency_name",
-    "ETL-table-dependencies_20251223_1218.csv",
-    "Input CSV file name"
-)
-dbutils.widgets.text(
-    "outofscope_stream_file_name",
-    "out-of-scopte-streams.csv",
-    "Out of scope streams file name"
-)
-dbutils.widgets.text(
-    "report_dependency_file_name",
-    "stream_to_report_mapping_new.csv",
-    "report Dependency file name"
-)
+# DBTITLE 1,Load configuration
+from migration_planner.utils.config import load_config
+cfg = load_config()
 
-dbutils.widgets.text(
-    "table_size",
-    "table-space-in-gb_20251201_1352.csv",
-    "Table size file name"
-)
+volume_path            = cfg.volume_name
+dependency_input_path  = cfg.dependency_input_path
+outofscope_stream_path = cfg.outofscope_stream_path
+report_dependency      = cfg.report_dependency_path
+table_size             = cfg.table_size_path
+output_path            = cfg.output_path
+latest_path            = cfg.latest_path
 
 # COMMAND ----------
 
-# DBTITLE 1,Common variables & output directory operation
-volume_path = dbutils.widgets.get("volume_name")
-dependency_input_path = volume_path + dbutils.widgets.get("input_dependency_name")
-outofscope_stream_path = volume_path + dbutils.widgets.get("outofscope_stream_file_name")
-report_dependency = volume_path + dbutils.widgets.get("report_dependency_file_name")
-table_size = volume_path + dbutils.widgets.get("table_size")
-
-# Output path with date and hour
-output_dir_name = "community_detection_output_" + datetime.now().strftime("%d%m%Y_%H")
-output_path = volume_path + "community_detection_output_latest/" + output_dir_name + "/"
-
+# DBTITLE 1,Output directory operation
 # Move existing folders from 'latest' one level up (to volume_path)
-latest_path = volume_path + "community_detection_output_latest/"
 folders = [f.name for f in dbutils.fs.ls(latest_path) if f.isDir()]
 for folder in folders:
     dbutils.fs.mv(latest_path + folder, volume_path + folder, recurse=True)
