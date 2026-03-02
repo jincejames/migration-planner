@@ -8,7 +8,7 @@
 # MAGIC   4. Fast community unfolding (Louvian)
 # MAGIC   5. Walktrap
 # MAGIC   6. k-clique community
-
+# MAGIC
 
 # COMMAND ----------
 
