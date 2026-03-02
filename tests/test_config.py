@@ -86,6 +86,14 @@ class TestPlannerConfigConstruction:
         assert cfg.report_dependency_file_name is None
         assert cfg.table_size_file_name is None
 
+    def test_complexity_file_name_defaults_to_none(self):
+        cfg = PlannerConfig(volume_name="/v/", input_dependency_name="dep.csv")
+        assert cfg.complexity_file_name is None
+
+    def test_static_tables_file_name_defaults_to_none(self):
+        cfg = PlannerConfig(volume_name="/v/", input_dependency_name="dep.csv")
+        assert cfg.static_tables_file_name is None
+
     def test_missing_volume_name_raises_type_error(self):
         with pytest.raises(TypeError):
             PlannerConfig(input_dependency_name="dep.csv")  # type: ignore[call-arg]
@@ -250,6 +258,20 @@ class TestPlannerConfigOptionalPaths:
         cfg.report_dependency_file_name = "rep.csv"
         assert cfg.report_dependency_path == VOLUME + "rep.csv"
 
+    def test_complexity_path_is_none_when_field_absent(self):
+        assert minimal().complexity_path is None
+
+    def test_complexity_path_when_field_set(self):
+        cfg = minimal(complexity_file_name="complexity.csv")
+        assert cfg.complexity_path == VOLUME + "complexity.csv"
+
+    def test_static_tables_path_is_none_when_field_absent(self):
+        assert minimal().static_tables_path is None
+
+    def test_static_tables_path_when_field_set(self):
+        cfg = minimal(static_tables_file_name="static.csv")
+        assert cfg.static_tables_path == VOLUME + "static.csv"
+
 
 # ---------------------------------------------------------------------------
 # PlannerConfig — output_path (datetime-dependent)
@@ -381,6 +403,14 @@ class TestLoadConfigCLIArgs:
         assert cfg.report_dependency_file_name == "r.csv"
         assert cfg.table_size_file_name == "s.csv"
 
+    def test_complexity_file_name_cli_flag(self):
+        cfg = load_config(self.BASE + ["--complexity-file-name", "cx.csv"])
+        assert cfg.complexity_file_name == "cx.csv"
+
+    def test_static_tables_file_name_cli_flag(self):
+        cfg = load_config(self.BASE + ["--static-tables-file-name", "st.csv"])
+        assert cfg.static_tables_file_name == "st.csv"
+
     def test_unspecified_optional_flags_remain_none(self):
         cfg = load_config(self.BASE)
         assert cfg.outofscope_stream_file_name is None
@@ -455,6 +485,16 @@ class TestLoadConfigYAML:
         with pytest.raises(ValueError):
             load_config(["--config", str(comments_only)])
 
+    def test_new_optional_fields_from_yaml(self, yaml_file):
+        path = yaml_file({
+            **self.MANDATORY,
+            "complexity_file_name": "cx.csv",
+            "static_tables_file_name": "st.csv",
+        })
+        cfg = load_config(["--config", path])
+        assert cfg.complexity_file_name == "cx.csv"
+        assert cfg.static_tables_file_name == "st.csv"
+
     def test_project_root_config_yaml_loads_all_fields(self):
         root_config = Path(__file__).parent.parent / "config.yaml"
         cfg = load_config(["--config", str(root_config)])
@@ -463,6 +503,8 @@ class TestLoadConfigYAML:
         assert cfg.outofscope_stream_file_name == "out-of-scopte-streams.csv"
         assert cfg.report_dependency_file_name == "stream_to_report_mapping_new.csv"
         assert cfg.table_size_file_name == "table-space-in-gb_20251201_1352.csv"
+        assert cfg.complexity_file_name == "Complexity_by_Stream.csv"
+        assert cfg.static_tables_file_name == "static_tables_for_report.csv"
 
     def test_yaml_volume_name_propagates_to_dependency_input_path(self, yaml_file):
         path = yaml_file({**self.MANDATORY, "outofscope_stream_file_name": "oos.csv"})
@@ -625,3 +667,70 @@ class TestLeidenVariableAssignments:
         assert cfg.outofscope_stream_path == "/yaml/base/yaml-oos.csv"
         assert cfg.report_dependency_path is None
         assert cfg.output_path == f"/yaml/base/community_detection_output_latest/{FIXED_DIR_NAME}/"
+
+
+# ---------------------------------------------------------------------------
+# PlannerConfig — weight_method field
+# ---------------------------------------------------------------------------
+
+
+class TestWeightMethodConfig:
+    def test_weight_method_defaults_to_factor(self):
+        cfg = PlannerConfig(volume_name="/v/", input_dependency_name="dep.csv")
+        assert cfg.weight_method == "factor"
+
+    def test_weight_method_can_be_set_to_scaled(self):
+        cfg = PlannerConfig(
+            volume_name="/v/", input_dependency_name="dep.csv",
+            weight_method="scaled",
+        )
+        assert cfg.weight_method == "scaled"
+
+    def test_weight_method_cli_flag_sets_scaled(self):
+        cfg = load_config([
+            "--volume-name", "/v/",
+            "--input-dependency-name", "dep.csv",
+            "--weight-method", "scaled",
+        ])
+        assert cfg.weight_method == "scaled"
+
+    def test_weight_method_cli_flag_sets_factor(self):
+        cfg = load_config([
+            "--volume-name", "/v/",
+            "--input-dependency-name", "dep.csv",
+            "--weight-method", "factor",
+        ])
+        assert cfg.weight_method == "factor"
+
+    def test_weight_method_not_in_cli_keeps_default(self):
+        cfg = load_config([
+            "--volume-name", "/v/",
+            "--input-dependency-name", "dep.csv",
+        ])
+        assert cfg.weight_method == "factor"
+
+    def test_weight_method_from_yaml(self, yaml_file):
+        path = yaml_file({
+            "volume_name": "/v/",
+            "input_dependency_name": "dep.csv",
+            "weight_method": "scaled",
+        })
+        cfg = load_config(["--config", path])
+        assert cfg.weight_method == "scaled"
+
+    def test_cli_weight_method_overrides_yaml(self, yaml_file):
+        path = yaml_file({
+            "volume_name": "/v/",
+            "input_dependency_name": "dep.csv",
+            "weight_method": "scaled",
+        })
+        cfg = load_config(["--config", path, "--weight-method", "factor"])
+        assert cfg.weight_method == "factor"
+
+    def test_invalid_weight_method_cli_raises_system_exit(self):
+        with pytest.raises(SystemExit):
+            load_config([
+                "--volume-name", "/v/",
+                "--input-dependency-name", "dep.csv",
+                "--weight-method", "bad_method",
+            ])

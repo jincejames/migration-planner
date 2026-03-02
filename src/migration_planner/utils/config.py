@@ -19,6 +19,11 @@ class PlannerConfig:
     outofscope_stream_file_name: str | None = None
     report_dependency_file_name: str | None = None
     table_size_file_name: str | None = None
+    complexity_file_name: str | None = None
+    static_tables_file_name: str | None = None
+
+    # Weight method: "factor" (default) or "scaled"
+    weight_method: str = "factor"
 
     # --- mandatory derived paths ---
 
@@ -55,6 +60,18 @@ class PlannerConfig:
             return None
         return self.volume_name + self.table_size_file_name
 
+    @property
+    def complexity_path(self) -> str | None:
+        if self.complexity_file_name is None:
+            return None
+        return self.volume_name + self.complexity_file_name
+
+    @property
+    def static_tables_path(self) -> str | None:
+        if self.static_tables_file_name is None:
+            return None
+        return self.volume_name + self.static_tables_file_name
+
 
 def load_config(args: list[str] | None = None) -> PlannerConfig:
     parser = argparse.ArgumentParser(description="Migration Planner — Community Detection")
@@ -64,6 +81,13 @@ def load_config(args: list[str] | None = None) -> PlannerConfig:
     parser.add_argument("--outofscope-stream-file-name")
     parser.add_argument("--report-dependency-file-name")
     parser.add_argument("--table-size-file-name")
+    parser.add_argument("--complexity-file-name")
+    parser.add_argument("--static-tables-file-name")
+    parser.add_argument(
+        "--weight-method",
+        choices=["factor", "scaled"],
+        help='Weight calculation method: "factor" (default) or "scaled".',
+    )
     parsed = parser.parse_args(args)
 
     # Collect values — all start as absent (None)
@@ -73,6 +97,9 @@ def load_config(args: list[str] | None = None) -> PlannerConfig:
         "outofscope_stream_file_name": None,
         "report_dependency_file_name": None,
         "table_size_file_name": None,
+        "complexity_file_name": None,
+        "static_tables_file_name": None,
+        "weight_method": None,
     }
 
     # Layer 1: YAML file
@@ -90,6 +117,9 @@ def load_config(args: list[str] | None = None) -> PlannerConfig:
         "outofscope_stream_file_name": parsed.outofscope_stream_file_name,
         "report_dependency_file_name": parsed.report_dependency_file_name,
         "table_size_file_name": parsed.table_size_file_name,
+        "complexity_file_name": parsed.complexity_file_name,
+        "static_tables_file_name": parsed.static_tables_file_name,
+        "weight_method": parsed.weight_method,
     }
     for attr, value in cli_map.items():
         if value is not None:
@@ -100,4 +130,8 @@ def load_config(args: list[str] | None = None) -> PlannerConfig:
     if missing:
         raise ValueError(f"Required config fields not provided: {', '.join(missing)}")
 
-    return PlannerConfig(**values)
+    # Drop None values for fields that have dataclass defaults — avoids overriding
+    # the default with None when the field was not supplied in YAML or CLI.
+    _fields_with_defaults = {"weight_method"}
+    kwargs = {k: v for k, v in values.items() if v is not None or k not in _fields_with_defaults}
+    return PlannerConfig(**kwargs)

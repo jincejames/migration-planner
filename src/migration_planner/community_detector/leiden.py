@@ -40,6 +40,31 @@ from pyspark.sql.functions import ceil, sum, when, array, sort_array
 
 # DBTITLE 1,Load configuration
 from migration_planner.utils.config import load_config
+from migration_planner.dependency_extractors.loaders import (
+    load_stream_table_dependencies,
+    load_outofscope_streams,
+    load_complexity_scores,
+    load_report_dependencies,
+    load_table_sizes,
+    load_static_tables,
+)
+from migration_planner.community_detector.preprocessing import (
+    preprocess_stream_dependencies,
+)
+from migration_planner.community_detector.weights import (
+    WEIGHT_METHOD_FACTOR,
+    WEIGHT_METHOD_SCALED,
+)
+from migration_planner.community_detector.graph_builder import (
+    find_isolated_streams,
+    build_igraph,
+    build_networkx_graph,
+)
+from migration_planner.community_detector.algorithm import (
+    run_leiden_rb,
+    stability_ari,
+    scan_resolutions,
+)
 cfg = load_config()
 
 volume_path            = cfg.volume_name
@@ -47,8 +72,11 @@ dependency_input_path  = cfg.dependency_input_path
 outofscope_stream_path = cfg.outofscope_stream_path
 report_dependency      = cfg.report_dependency_path
 table_size             = cfg.table_size_path
+complexity_path        = cfg.complexity_path
+static_tables_path     = cfg.static_tables_path
 output_path            = cfg.output_path
 latest_path            = cfg.latest_path
+weight_method          = cfg.weight_method  # "factor" (default) or "scaled"
 
 # COMMAND ----------
 
@@ -69,205 +97,62 @@ dbutils.fs.mkdirs(output_path)
 # COMMAND ----------
 
 # DBTITLE 1,Reading input stream - table dependency file
-dependency_df_full = spark.read.format("csv").option("header", "true").load(dependency_input_path)
+dependency_df_full = load_stream_table_dependencies(spark, dependency_input_path)
 
 # COMMAND ----------
 
 # DBTITLE 1,Reading out of scope stream names
-outofscope_stream_names_df = spark.read.format("csv").option("header","true").load(outofscope_stream_path).select(col("stream_name"))
-outofscope_stream_names_rows_list = outofscope_stream_names_df.collect()
-outofscope_stream_names_list = [x['stream_name'] for x in outofscope_stream_names_rows_list]
+outofscope_stream_names_list = (
+    load_outofscope_streams(spark, outofscope_stream_path)
+    if outofscope_stream_path is not None else []
+)
 
 # COMMAND ----------
 
 # DBTITLE 1,Read complexity by stream
-# Read complexity by stream with semicolon delimiter
-complexity_by_stream_df = spark.read.format("csv").option("header", "true").option("delimiter", ";").load(f"{volume_path}Complexity_by_Stream.csv")
-
-# Define complexity score weights
-COMPLEXITY_WEIGHTS = {
-    'low': 1,
-    'medium': 2,
-    'complex': 4,
-    'very_complex': 7
-}
-
-# Calculate complexity score for each stream
-# Score = (low * 1) + (medium * 2) + (complex * 4) + (very_complex * 7)
-# Using double to handle decimal values, then casting to int
-complexity_scores_df = complexity_by_stream_df.withColumn(
-    "complexity_score",
-    (col("low").cast("double").cast("int") * lit(COMPLEXITY_WEIGHTS['low'])) +
-    (col("medium").cast("double").cast("int") * lit(COMPLEXITY_WEIGHTS['medium'])) +
-    (col("complex").cast("double").cast("int") * lit(COMPLEXITY_WEIGHTS['complex'])) +
-    (col("very_complex").cast("double").cast("int") * lit(COMPLEXITY_WEIGHTS['very_complex']))
-).select(
-    col("stream_name"),
-    col("low").cast("double").cast("int").alias("low"),
-    col("medium").cast("double").cast("int").alias("medium"),
-    col("complex").cast("double").cast("int").alias("complex"),
-    col("very_complex").cast("double").cast("int").alias("very_complex"),
-    col("complexity_score")
-)
-
-# Calculate total complexity across all streams for percentage calculations
+complexity_scores_df = load_complexity_scores(spark, complexity_path)
 total_complexity = complexity_scores_df.agg({"complexity_score": "sum"}).collect()[0][0]
 print(f"Total complexity score across all streams: {total_complexity}")
-
 print("\nTop 10 streams by complexity score:")
 display(complexity_scores_df.orderBy(col("complexity_score").desc()).limit(10))
 
 # COMMAND ----------
 
 # DBTITLE 1,Reading report to table dependency
-# Read report to stream dependency and standardize values and column names
-# Each table is marked as a Src, since reports only create tables and do not write to tables (or only exceptions)
-# Filtering two reports wrt corona and gdpr, since they skew the community creation due to high number of dependencies
 report_dependency_df = (
-    spark.read.format("csv")
-    .option("header", "true")
-    .load(report_dependency)
-    .select(
-        col("report_name").alias("stream_name"),
-        upper(col("table_name")).alias("table_name"),
-        lit("Src").alias('table_type'),
-    )
-    .filter(~lower(col("stream_name")).contains("corona") & ~lower(col("stream_name")).contains("gdpr"))
+    load_report_dependencies(spark, report_dependency)
+    if report_dependency is not None else None
 )
 
 # COMMAND ----------
 
 # DBTITLE 1,Reading table size in GB records
-table_size_df = spark.read.format("csv").option("header","true").load(table_size).select(upper(col("DB_Table_Name")).alias("table_name"), col("SPACE_IN_GB").alias("size"))
-
-# COMMAND ----------
-
-# DBTITLE 1,Remove admin streams
-# Removing streams associated with acrchiving, GDPR, housekeeping and out of scope streams
-dependency_df_filtered = dependency_df_full.filter(
-    ~upper(col("stream_name")).contains("ARCHIVE") & 
-    ~upper(col("stream_name")).contains("GDPR") &
-    ~upper(col("stream_name")).contains("HOUSEKEEPING") &
-    ~upper(col("stream_name")).isin(outofscope_stream_names_list)
-)
-
-# COMMAND ----------
-
-# DBTITLE 1,Considering all TGT tables as SRC
-# Considering all TGT tables as SRC as well due to a gap in ODAT output
-tgt_as_source = dependency_df_filtered.filter(upper(col('table_type')).contains("TGT")).replace({"Tgt" : "Src", "Tgt_Trns" : "Src_Trns"}, subset=["table_type"])
-dependency_df = dependency_df_filtered.union(tgt_as_source).distinct()
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Forming Table to Stream Dependecies
-
-# COMMAND ----------
-
-# DBTITLE 1,Filter out intra stream (self) dependency
-dependency_with_transactional_df = dependency_df.select(
-    'stream_name', col('DB_Table_Name').alias('table_name'), 'table_type'
-).distinct()
-
-# Self join to find dependencies and filter intra stream dependency (table to table within same stream)
-# This will basically result all cases where the exact table is a src or tgt of 2 different streams
-non_filtered_self_join_result = (
-    dependency_with_transactional_df.alias("df1")
-    .join(dependency_with_transactional_df.alias("df2"), col("df1.table_name") == col("df2.table_name"))
-    .filter(col("df1.stream_name") != col("df2.stream_name"))
-)
-
-
-# COMMAND ----------
-
-# DBTITLE 1,Joining reports to the stream data
-report_join_result = (
-    report_dependency_df.alias("df2")
-    .join(dependency_with_transactional_df.alias("df1"), upper(col("df1.table_name")) == upper(col("df2.table_name")))
-)
-
-# COMMAND ----------
-
-# DBTITLE 1,Merging reports and streams
-self_join_result_without_size = report_join_result.union(non_filtered_self_join_result)
-
-# COMMAND ----------
-
-# DBTITLE 1,Adding table size information
-#<TODO> revert back to include report dependencies
-self_join_result = non_filtered_self_join_result.join(
-    table_size_df.alias("table_size"),
-    col("df1.table_name") == col("table_size.table_name")
-).select(
-    "df1.*",
-    "df2.*",
-    col("table_size.size")
+table_size_df = (
+    load_table_sizes(spark, table_size)
+    if table_size is not None else None
 )
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Forming Stream - Stream Dependencies
+# MAGIC ## Preprocessing: Filter → Weight → Merge
 
 # COMMAND ----------
 
-# DBTITLE 1,Forming Stream - Stream dependency
-src_tgt_dependencies = self_join_result.filter(
-    (
-        (upper(col("df1.table_type").cast("string")) == "TGT") |
-        (upper(col("df1.table_type").cast("string")) == "TGT_TRNS") |
-        (upper(col("df1.table_type").cast("string")) == "FILE")
-    ) &
-    (
-        (upper(col("df2.table_type").cast("string")) == "SRC") |
-        (upper(col("df2.table_type").cast("string")) == "SRC_TRNS") |
-        (upper(col("df2.table_type").cast("string")) == "FILE")
-    )
+# DBTITLE 1,Run full preprocessing pipeline
+# Filters admin/out-of-scope streams, normalises TGT-as-SRC, forms cross-stream
+# dependencies, applies factor-based weight calculation (WEIGHT_METHOD), and
+# merges bidirectional edges into a single undirected weighted edge list.
+dependency_df, merged_dependency_df = preprocess_stream_dependencies(
+    dependency_df_full,
+    outofscope_stream_names_list,
+    report_dependency_df,
+    table_size_df,
+    weight_method=weight_method,
 )
-
-stream_stream_dependency_df = src_tgt_dependencies.select(
-    col("df1.stream_name").alias("from"),
-    col("df2.stream_name").alias("to"),
-    col("df1.table_name").alias("table"),
-    col("table_size.size").alias("size")
-)
-
-stream_stream_dependency_df.toPandas().to_csv(output_path + "stream_stream_dependencies.csv", index=False)
-
-# COMMAND ----------
-
-# DBTITLE 1,Option 1 - Weight Calculation
-# ===== WEIGHT CALCULATION METHOD =====
-WEIGHT_METHOD = "Factor based"
-# =====================================
-
-table_weight_df = stream_stream_dependency_df.withColumn(
-    "table_weight",
-    when(
-        lower(col("to")).contains("json"),
-        2
-    ).otherwise(
-        ceil((col("size").cast("double") / 100)).cast("int")
-    )
-).withColumn(
-    "table_weight",
-    when(col("table_weight") < 1, 1).otherwise(col("table_weight"))
-)
-
-# Remove duplicate (from, to, table) combinations and alias as "weight" for consistency
-unique_table_weights = (
-    table_weight_df
-    .dropDuplicates(["from", "to", "table"])
-    .withColumnRenamed("table_weight", "weight")
-)
-
-# Group by (from, to), sum the weight as the edge weight
-weighted_stream_stream_dependency_df = unique_table_weights.groupBy("from", "to").agg(
-    sum("weight").alias("weight")
-)
-
-display(weighted_stream_stream_dependency_df)
+print(f"Weight method: {weight_method}")
+print(f"Total edges after merging: {merged_dependency_df.count()}")
+display(merged_dependency_df)
 
 # COMMAND ----------
 
@@ -363,58 +248,6 @@ display(weighted_stream_stream_dependency_df)
 
 # COMMAND ----------
 
-# DBTITLE 1,Merge bidirectional dependencies with summed weights
-
-# Step 1: Identify bidirectional pairs and sum their weights, keeping only one direction
-bidirectional_merged = (
-    weighted_stream_stream_dependency_df.alias("forward")
-    .join(
-        weighted_stream_stream_dependency_df.alias("backward"),
-        (col("forward.from") == col("backward.to")) & 
-        (col("forward.to") == col("backward.from"))
-    )
-    .select(
-        # If forward.weight > backward.weight, use forward.from/to, else use backward.from/to
-        when(col("forward.weight") > col("backward.weight"), col("forward.from"))
-            .otherwise(col("backward.from")).alias("streamA"),
-        when(col("forward.weight") > col("backward.weight"), col("forward.to"))
-            .otherwise(col("backward.to")).alias("streamB"),
-        (col("forward.weight") + col("backward.weight")).alias("weight"),
-        sort_array(array(col("forward.from"), col("forward.to"))).alias("pair_key")
-    )
-    .dropDuplicates(["pair_key"])  # Only keep one row per bidirectional pair
-    .select("streamA", "streamB", "weight")
-)
-
-print(f"Bidirectional pairs (merged): {bidirectional_merged.count()}")
-
-# Step 2: Identify unidirectional relationships (no reverse edge exists)
-unidirectional = (
-    weighted_stream_stream_dependency_df.alias("forward")
-    .join(
-        weighted_stream_stream_dependency_df.alias("backward"),
-        (col("forward.from") == col("backward.to")) & 
-        (col("forward.to") == col("backward.from")),
-        "left_anti"  # Keep only rows from forward that don't have a match in backward
-    )
-    .select(
-        col("forward.from").alias("streamA"),
-        col("forward.to").alias("streamB"),
-        col("forward.weight").alias("weight")
-    )
-)
-
-print(f"Unidirectional relationships: {unidirectional.count()}")
-
-# Step 3: Combine bidirectional (merged) and unidirectional
-merged_dependency_df = bidirectional_merged.union(unidirectional)
-
-print(f"\nTotal edges after merging: {merged_dependency_df.count()}")
-print(f"Original edges: {weighted_stream_stream_dependency_df.count()}")
-print(f"Reduction: {weighted_stream_stream_dependency_df.count() - merged_dependency_df.count()} edges")
-
-# COMMAND ----------
-
 # DBTITLE 1,Create Edges of the graph in Pandas
 edges_df = merged_dependency_df.toPandas()
 edges_df.to_csv(f"{output_path}edges.csv", index=False)
@@ -422,24 +255,11 @@ edges_df.to_csv(f"{output_path}edges.csv", index=False)
 # COMMAND ----------
 
 # DBTITLE 1,Identify isolated streams (only intra-stream dependencies)
-# Get all unique stream names from the original dependency data (before filtering)
-all_streams_in_data = [row['stream_name'] for row in dependency_df.select('stream_name').distinct().collect()]
-
-# Get all streams that appear in the edges (have inter-stream dependencies)
-streams_in_edges = set([row['streamA'] for row in merged_dependency_df.select('streamA').distinct().collect()]) | \
-                   set([row['streamB'] for row in merged_dependency_df.select('streamB').distinct().collect()])
-
-# Find isolated streams (streams with only intra-stream dependencies)
-isolated_streams = [s for s in all_streams_in_data if s not in streams_in_edges]
-
-print(f"Total streams in original data: {len(all_streams_in_data)}")
-print(f"Streams with inter-stream dependencies: {len(streams_in_edges)}")
+isolated_streams = find_isolated_streams(dependency_df, merged_dependency_df)
 print(f"Isolated streams (only intra-stream dependencies): {len(isolated_streams)}")
 
 if len(isolated_streams) > 0:
     print(f"\nFirst 10 isolated streams: {isolated_streams[:10]}")
-    
-    # Save isolated streams to CSV for reference
     isolated_streams_df = pd.DataFrame({'stream_name': isolated_streams})
     isolated_streams_df.to_csv(f"{output_path}isolated_streams.csv", index=False)
     print(f"\nIsolated streams saved to: {output_path}isolated_streams.csv")
@@ -449,10 +269,7 @@ else:
 # COMMAND ----------
 
 # DBTITLE 1,Aggregate weights - safety step
-# Aggregate weights if necessary (depends on whether the grouping already handles this)
 edges = edges_df.groupby(['streamA', 'streamB'])['weight'].sum().reset_index()
-
-
 
 # COMMAND ----------
 
@@ -463,7 +280,7 @@ edges = edges_df.groupby(['streamA', 'streamB'])['weight'].sum().reset_index()
 
 # MAGIC %md
 # MAGIC ## Algorithm used: Leiden + RBConfiguration (resolution γ)
-# MAGIC ## 
+# MAGIC ##
 # MAGIC We're running the Leiden algorithm, which is a community detection method that searches for a partition of the graph into communities by optimizing an objective function.
 # MAGIC
 # MAGIC In this case the objective is RBConfiguration (RBConfigurationVertexPartition), which is a modularity-like objective that includes a resolution parameter γ (called resolution_parameter):
@@ -476,197 +293,19 @@ edges = edges_df.groupby(['streamA', 'streamB'])['weight'].sum().reset_index()
 # COMMAND ----------
 
 # DBTITLE 1,Community Detection
-
-# Build an undirected weighted igraph graph from the edge list
-# edges is a pandas DataFrame with columns:
-#   - streamA: source node label (string/int)
-#   - streamB: target node label (string/int)
-#   - weight: edge weight (numeric, strength of relationship)
-#
-# Graph.TupleList will:
-#   - create vertices implicitly from unique labels in streamA/streamB
-#   - create edges between them
-#   - attach edge attribute "weight"
-g = ig.Graph.TupleList(
-    edges[["streamA", "streamB", "weight"]].itertuples(index=False, name=None),
-    directed=False,
-    edge_attrs=["weight"]
-)
-
-# Add isolated streams as nodes (streams with only intra-stream dependencies)
-if len(isolated_streams) > 0:
-    print(f"\nAdding {len(isolated_streams)} isolated streams as nodes to the graph...")
-    g.add_vertices(isolated_streams)
-    print(f"Graph now has {g.vcount()} nodes (including {len(isolated_streams)} isolated nodes)")
-
-# Also build a NetworkX graph for plotting (separate from igraph/Leiden)
-G = nx.from_pandas_edgelist(
-    edges, "streamA", "streamB",
-    edge_attr="weight",
-    create_using=nx.Graph()
-)
-
-# Add isolated streams to NetworkX graph as well
-if len(isolated_streams) > 0:
-    G.add_nodes_from(isolated_streams)
-    print(f"NetworkX graph now has {G.number_of_nodes()} nodes (including {len(isolated_streams)} isolated nodes)")
-
-# Quick sanity summary check
+g = build_igraph(edges, isolated_streams)
+G = build_networkx_graph(edges, isolated_streams)
+igraph_names = np.array(g.vs["name"])
 print(f"\nigraph summary: {g.summary()}")
 print(f"NetworkX graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
+# COMMAND ----------
 
-#Run Leiden using the RBConfiguration objective at a fixed resolution (gamma)
-def run_leiden_rb(g, resolution, seed, weights="weight", n_iterations=100):
-    """
-    Run Leiden community detection on graph g using the RBConfiguration objective.
-
-    Parameters
-    ----------
-    g : igraph.Graph
-        The graph to cluster.
-    resolution : float
-        The resolution (gamma) parameter controlling community granularity.
-        Higher -> more/smaller communities; lower -> fewer/larger communities.
-    seed : int
-        Random seed controlling stochastic aspects of Leiden (important for stability testing).
-    weights : str or None
-        Name of edge attribute to use as weights (default "weight").
-    n_iterations : int
-        Number of Leiden iterations. More iterations can improve quality but costs time.
-
-    Returns
-    -------
-    dict with:
-        - membership: community assignment per vertex
-        - quality: value of RBConfiguration objective for this partition
-        - diagnostics about community size distribution
-    """
-
-    # find_partition runs Leiden optimization for the chosen partition type/objective.
-    # RBConfigurationVertexPartition = modularity-like objective with a resolution parameter.
-    # seed=... is crucial: it ensures runs start from different random initializations across seeds.
-    part = la.find_partition(
-        g,
-        la.RBConfigurationVertexPartition,
-        weights=weights,
-        resolution_parameter=resolution,
-        n_iterations=n_iterations,
-        seed=seed,
-    )
-
-    # part.membership is a list of length |V|, giving cluster id for each vertex
-    membership = np.array(part.membership, dtype=int)
-
-    # Compute community sizes by counting how many nodes each community label got
-    counts = np.bincount(membership)
-
-    # Sort community sizes descending (largest community first)
-    counts_sorted = np.sort(counts)[::-1]
-
-    return {
-        "resolution": resolution,
-        "seed": seed,
-
-        # number of communities found in this run
-        "n_communities": len(counts),
-
-        # fraction of all nodes contained in the largest community
-        # (useful to detect "giant blob" solutions)
-        "largest_comm_share": counts_sorted[0] / g.vcount(),
-
-        # count of "tiny" communities (here <5 nodes), a fragmentation indicator
-        "small_comms_lt5": int((counts < 5).sum()),
-
-        # objective value for the partition (RBConfiguration quality)
-        "quality": float(part.quality()),
-
-        # raw node-to-community assignment
-        "membership": membership,
-    }
-
-
-# Stability metric: average pairwise Adjusted Rand Index (ARI)
-def stability_ari(memberships):
-    """
-    Compute average pairwise Adjusted Rand Index (ARI) across partitions.
-
-    ARI compares two partitions of the same nodes:
-      - 1.0: identical clustering
-      - ~0: no better than random agreement
-
-    Here we average ARI over all pairs of runs for a given resolution.
-    """
-    if len(memberships) < 2:
-        return 1.0
-
-    aris = []
-    for i in range(len(memberships)):
-        for j in range(i + 1, len(memberships)):
-            aris.append(adjusted_rand_score(memberships[i], memberships[j]))
-
-    return float(np.mean(aris)) if aris else 1.0
-
-
-# Helper to map igraph membership -> (stream -> community)
-# igraph vertex "name" will be the original labels from TupleList
-igraph_names = np.array(g.vs["name"])
-
-
-#Scan over resolutions (gamma) and many random seeds per resolution
-#Resolution grid: controls granularity (higher -> more communities)
-resolutions = [0.4, 0.8, 1.0, 1.2, 1.4, 1.5, 1.6,1.8, 1.9, 2.2, 2.4, 2.6]
-
-#Multiple random restarts at each resolution to test robustness
+# DBTITLE 1,Resolution scan
+resolutions = [0.4, 0.8, 1.0, 1.2, 1.4, 1.5, 1.6, 1.8, 1.9, 2.2, 2.4, 2.6]
 seeds = [1, 3, 7, 43, 99, 123, 11, 28, 37, 45, 672, 42, 10, 100, 178]
-
-# Store one representative run per resolution (so plotting does not re-run Leiden)
-# If ARI==1.0 at a resolution, any seed is equivalent; otherwise this still gives a consistent choice.
 plot_seed = 42
-rep_by_res = {}  # resolution -> dict returned by run_leiden_rb (includes membership, quality, etc.)
-
-rows = []
-for res in resolutions:
-    # Run Leiden many times at the same resolution (different seeds)
-    runs = [run_leiden_rb(g, res, s) for s in seeds]
-
-    # Extract memberships for ARI stability computation
-    memberships = [r["membership"] for r in runs]
-
-    # Aggregate diagnostics across seeds for this resolution
-    n_comms = [r["n_communities"] for r in runs]
-    largest = [r["largest_comm_share"] for r in runs]
-    small_lt5 = [r["small_comms_lt5"] for r in runs]
-    quality = [r["quality"] for r in runs]
-
-    rows.append({
-        "resolution": res,
-
-        # community count statistics across seeds at this resolution
-        "n_communities_avg": np.mean(n_comms),
-        "n_communities_min": np.min(n_comms),
-        "n_communities_max": np.max(n_comms),
-
-        # size/fragmentation diagnostics
-        "largest_comm_share_avg": np.mean(largest),
-        "small_comms_lt5_avg": np.mean(small_lt5),
-
-        # average objective value across seeds
-        "quality_avg": np.mean(quality),
-
-        # average pairwise partition similarity across seeds
-        "stability_ari": stability_ari(memberships),
-    })
-
-    # Keep a representative partition for plotting later (no re-run)
-    rep = next((r for r in runs if r["seed"] == plot_seed), runs[0])
-    rep_by_res[res] = rep
-
-
-summary = pd.DataFrame(rows)
-
-# Summary table
-summary = summary.sort_values("resolution").reset_index(drop=True)
+summary, rep_by_res = scan_resolutions(g, resolutions, seeds, plot_seed)
 
 # Final summary table
 summary
@@ -2727,8 +2366,10 @@ total_streams = leiden_df.shape[0]
 print(f"Total complexity score: {total_complexity:.2f}")
 print(f"Total streams: {total_streams}")
 
-missing_static_tables_df = spark.read.option("header", True).csv("/Volumes/odp_adw_mvp_n/migration/utilities/community_detection/static_tables_for_report.csv").select("table_name")
-missing_static_tables = set(row["table_name"] for row in missing_static_tables_df.collect())
+missing_static_tables = (
+    load_static_tables(spark, static_tables_path)
+    if static_tables_path is not None else set()
+)
 
 # Prepare timeline data
 timeline_rows = []
@@ -3230,8 +2871,10 @@ execution_stages = stream_ordering_pd['execution_order'].unique().tolist()
 print(f"Total execution stages: {len(execution_stages)}")
 print(f"Execution order (optimized): {execution_stages}")
 
-missing_static_tables_df = spark.read.option("header", True).csv("/Volumes/odp_adw_mvp_n/migration/utilities/community_detection/static_tables_for_report.csv").select("table_name")
-missing_static_tables = set(row["table_name"] for row in missing_static_tables_df.collect())
+missing_static_tables = (
+    load_static_tables(spark, static_tables_path)
+    if static_tables_path is not None else set()
+)
 
 
 # Initialize tracking

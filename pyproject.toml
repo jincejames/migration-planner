@@ -66,6 +66,8 @@ dependencies = [
   "python-louvain",
   "python-igraph",
   "adjustText",
+  "pandas",
+  "scikit-learn",
 ]
 
 python="3.10"
