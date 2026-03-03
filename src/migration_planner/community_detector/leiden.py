@@ -48,10 +48,10 @@ from migration_planner.dependency_extractors.loaders import (
     load_table_sizes,
     load_static_tables,
 )
-from migration_planner.community_detector.preprocessing import (
+from migration_planner.planner_core.preprocessing import (
     preprocess_stream_dependencies,
 )
-from migration_planner.community_detector.weights import (
+from migration_planner.planner_core.weights import (
     WEIGHT_METHOD_FACTOR,
     WEIGHT_METHOD_SCALED,
 )

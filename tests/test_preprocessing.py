@@ -1,5 +1,5 @@
 """
-Tests for migration_planner.community_detector.preprocessing.
+Tests for migration_planner.planner_core.preprocessing.
 
 All Spark DataFrames are MagicMock objects; no real Spark cluster is required.
 """
@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from migration_planner.community_detector.preprocessing import (
+from migration_planner.planner_core.preprocessing import (
     filter_admin_streams,
     form_stream_stream_dependencies,
     merge_bidirectional_edges,

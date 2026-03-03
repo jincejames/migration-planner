@@ -10,7 +10,7 @@ from pyspark.sql.functions import (
     when,
 )
 
-from migration_planner.community_detector.weights import (
+from migration_planner.planner_core.weights import (
     aggregate_edge_weights,
     calculate_table_weights,
     deduplicate_table_weights,

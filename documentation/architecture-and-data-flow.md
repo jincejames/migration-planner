@@ -47,14 +47,15 @@ Migration Planner runs as a **Databricks notebook** (`leiden.py`) on an Apache S
 │  │   workers) │    │                  │                 │
 │  └─────────────┘    │  ├─ config.py   │                 │
 │                     │  ├─ loaders.py  │                 │
-│  ┌─────────────┐    │  ├─ preproc.py  │                 │
-│  │  igraph /   │◀───│  ├─ weights.py  │                 │
-│  │  leidenalg  │    │  ├─ graph_b.py  │                 │
-│  └─────────────┘    │  ├─ algorithm.py│                 │
-│                     │  ├─ comm_plots  │                 │
-│  ┌─────────────┐    │  └─ leiden.py   │                 │
-│  │  Unity Cat. │◀───┘                  │                 │
-│  │  Volume     │  reads CSVs / writes outputs            │
+│                     │  ├─ preproc.py  │                 │
+│  ┌─────────────┐    │  ├─ weights.py  │                 │
+│  │  igraph /   │◀───│  ├─ graph_b.py  │                 │
+│  │  leidenalg  │    │  ├─ algorithm.py│                 │
+│  └─────────────┘    │  ├─ comm_plots  │                 │
+│                     │  └─ leiden.py   │                 │
+│  ┌─────────────┐    └──────────────────┘                 │
+│  │  Unity Cat. │◀──── reads CSVs / writes outputs        │
+│  │  Volume     │                                          │
 │  └─────────────┘                                          │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -74,6 +75,19 @@ src/migration_planner/
 │   └── loaders.py              6 CSV reader functions
 │                               COMPLEXITY_WEIGHTS constant
 │
+├── planner_core/
+│   ├── preprocessing.py        filter_admin_streams()
+│   │                           treat_tgt_as_src()
+│   │                           form_stream_stream_dependencies()
+│   │                           merge_bidirectional_edges()
+│   │                           preprocess_stream_dependencies()  ← pipeline entry
+│   │
+│   └── weights.py              calculate_table_weights()  ← dispatcher
+│                               _calculate_factor_weights()
+│                               _calculate_scaled_weights()
+│                               deduplicate_table_weights()
+│                               aggregate_edge_weights()
+│
 ├── visualization/
 │   └── community_plots.py      select_resolutions()
 │                               precompute_layout()
@@ -83,18 +97,6 @@ src/migration_planner/
 │                               plot_communities_with_analysis_safe()
 │
 └── community_detector/
-    ├── preprocessing.py        filter_admin_streams()
-    │                           treat_tgt_as_src()
-    │                           form_stream_stream_dependencies()
-    │                           merge_bidirectional_edges()
-    │                           preprocess_stream_dependencies()  ← pipeline entry
-    │
-    ├── weights.py              calculate_table_weights()  ← dispatcher
-    │                           _calculate_factor_weights()
-    │                           _calculate_scaled_weights()
-    │                           deduplicate_table_weights()
-    │                           aggregate_edge_weights()
-    │
     ├── graph_builder.py        find_isolated_streams()
     │                           build_igraph()
     │                           build_networkx_graph()
@@ -175,7 +177,7 @@ complexity_score = (low × 1) + (medium × 2) + (complex × 4) + (very_complex �
 
 ### Stage 2 — Stream Filtering
 
-**Function:** `preprocessing.filter_admin_streams(dependency_df_full, outofscope_list)`
+**Function:** `planner_core/preprocessing.py / filter_admin_streams(dependency_df_full, outofscope_list)`
 
 Removes streams whose names match any of the following (case-insensitive):
 - Contains `ARCHIVE`
@@ -195,7 +197,7 @@ Same columns as input (`stream_name`, `DB_Table_Name`, `table_type`), but with a
 
 ### Stage 3 — TGT-as-SRC Normalization
 
-**Function:** `preprocessing.treat_tgt_as_src(filtered_df)`
+**Function:** `planner_core/preprocessing.py / treat_tgt_as_src(filtered_df)`
 
 A stream that writes a table (type `Tgt` or `Tgt_Trns`) implicitly also reads it. This stage duplicates every TGT row as a SRC row so that the self-join in Stage 4 can find the correct directional dependency.
 
@@ -212,7 +214,7 @@ If stream A writes table T and stream B reads table T, there is a dependency A�
 
 ### Stage 4 — Cross-Stream Dependency Formation
 
-**Function:** `preprocessing.form_stream_stream_dependencies(dependency_df, report_df, size_df)`
+**Function:** `planner_core/preprocessing.py / form_stream_stream_dependencies(dependency_df, report_df, size_df)`
 
 Performs a self-join on `table_name` to find pairs of streams that share a table:
 
@@ -240,7 +242,7 @@ If `table_size_df` is absent, the `size` column is `null`.
 
 ### Stage 5 — Edge Weight Calculation
 
-**Module:** `community_detector/weights.py`
+**Module:** `planner_core/weights.py`
 **Dispatcher:** `calculate_table_weights(df, method, ...)`
 
 Adds a `table_weight` column to the dependency DataFrame. Two methods are available:
@@ -271,7 +273,7 @@ Min and max are computed in a distributed Spark aggregation, then broadcast back
 
 ### Stage 6 — Edge Deduplication and Aggregation
 
-**Functions:** `weights.deduplicate_table_weights()`, `weights.aggregate_edge_weights()`
+**Functions:** `planner_core/weights.py / deduplicate_table_weights()`, `aggregate_edge_weights()`
 
 ```
 table_weight_df
@@ -292,7 +294,7 @@ One row per directed stream-stream edge, with weight equal to the total migratio
 
 ### Stage 7 — Bidirectional Edge Merging
 
-**Function:** `preprocessing.merge_bidirectional_edges(weighted_df)`
+**Function:** `planner_core/preprocessing.py / merge_bidirectional_edges(weighted_df)`
 
 The graph must be undirected. If both A→B and B→A exist, they are merged into a single edge by summing their weights. Unidirectional edges are kept as-is.
 
@@ -482,7 +484,7 @@ The Spark DataFrame API is used for all preprocessing and weight calculation ste
 
 ### Weight method chosen at config time
 
-The weight method (`"factor"` or `"scaled"`) is stored in `PlannerConfig.weight_method` and passed through the `preprocess_stream_dependencies()` pipeline to `calculate_table_weights()`. This means the choice affects the entire edge weight computation, not just individual steps.
+The weight method (`"factor"` or `"scaled"`) is stored in `PlannerConfig.weight_method` and passed through `planner_core/preprocessing.py / preprocess_stream_dependencies()` to `planner_core/weights.py / calculate_table_weights()`. This means the choice affects the entire edge weight computation, not just individual steps.
 
 ### Output directory rotation
 
@@ -505,16 +507,17 @@ leiden.py (orchestrator)
   ├── dependency_extractors/loaders.py
   │     └── (no internal imports)
   │
+  ├── planner_core/
+  │     ├── preprocessing.py
+  │     │     └── imports: planner_core/weights.py
+  │     │
+  │     └── weights.py
+  │           └── (no internal imports from this package)
+  │
   ├── visualization/community_plots.py
   │     └── (no internal imports from this package)
   │
   └── community_detector/
-        ├── preprocessing.py
-        │     └── imports: weights.py
-        │
-        ├── weights.py
-        │     └── (no internal imports from this package)
-        │
         ├── graph_builder.py
         │     └── (no internal imports from this package)
         │
@@ -522,4 +525,4 @@ leiden.py (orchestrator)
               └── (no internal imports from this package)
 ```
 
-All modules depend only downward; there are no circular imports. `preprocessing.py` is the only community-detector module that imports from a sibling (`weights.py`). `leiden.py` imports from `visualization/community_plots.py` for all plotting operations.
+All modules depend only downward; there are no circular imports. Within `planner_core/`, `preprocessing.py` imports from `weights.py`. `leiden.py` imports from `planner_core/` for domain-specific preprocessing and weight calculation, and from `visualization/community_plots.py` for all plotting operations.

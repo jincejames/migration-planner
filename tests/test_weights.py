@@ -1,5 +1,5 @@
 """
-Tests for migration_planner.community_detector.weights.
+Tests for migration_planner.planner_core.weights.
 
 All Spark DataFrames are MagicMock objects; no real Spark cluster is required.
 """
@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from migration_planner.community_detector.weights import (
+from migration_planner.planner_core.weights import (
     WEIGHT_METHOD_FACTOR,
     WEIGHT_METHOD_SCALED,
     _VALID_WEIGHT_METHODS,
