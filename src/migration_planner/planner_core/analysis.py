@@ -10,6 +10,7 @@ import builtins
 import itertools
 import os
 import time
+from collections.abc import Iterable
 from datetime import datetime
 from math import factorial
 from typing import TYPE_CHECKING
@@ -19,6 +20,220 @@ import pandas as pd
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (reused across multiple public functions)
+# ---------------------------------------------------------------------------
+
+
+def split_bi_etl(streams: Iterable[str]) -> tuple[list[str], list[str]]:
+    """Split stream names into (bi_reports, etl_streams) by ``'json'`` in name.
+
+    Streams whose name contains ``'json'`` (case-insensitive) are classified
+    as BI reports; all others are ETL streams.
+
+    Returns
+    -------
+    tuple[list[str], list[str]]
+        ``(bi_reports, etl_streams)``
+    """
+    bi = [s for s in streams if "json" in s.lower()]
+    etl = [s for s in streams if "json" not in s.lower()]
+    return bi, etl
+
+
+def _coerce_size(df: pd.DataFrame, col: str = "size") -> pd.DataFrame:
+    """Return a *copy* of *df* with *col* coerced to ``float``; NaN → 0.0."""
+    df = df.copy()
+    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    return df
+
+
+def _safe_pct(numerator: float, denominator: float) -> float:
+    """Return ``numerator / denominator * 100``, or 0.0 when *denominator* is zero."""
+    return numerator / denominator * 100.0 if denominator else 0.0
+
+
+def _global_stream_totals(
+    leiden_df: pd.DataFrame,
+    complexity_pdf: pd.DataFrame | None = None,
+) -> tuple[int, int, int, float]:
+    """Return ``(total_streams, total_bi, total_etl, total_complexity)``.
+
+    Parameters
+    ----------
+    leiden_df:
+        Must have a ``stream`` column.
+    complexity_pdf:
+        Optional DataFrame with a ``complexity_score`` column; ``total_complexity``
+        is 0.0 when *None*.
+    """
+    all_streams = set(leiden_df["stream"].tolist())
+    bi, etl = split_bi_etl(all_streams)
+    total_complexity = (
+        float(complexity_pdf["complexity_score"].sum())
+        if complexity_pdf is not None
+        else 0.0
+    )
+    return len(all_streams), len(bi), len(etl), total_complexity
+
+
+def _classify_tables_by_consumer_type(
+    table_dep_df: pd.DataFrame,
+    consumer_col: str = "to",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Classify tables as BI or ETL based on the consuming stream name.
+
+    A table consumed by *both* BI and ETL streams is classified as ETL
+    (ETL-wins rule).
+
+    Parameters
+    ----------
+    table_dep_df:
+        DataFrame with at least columns ``table``, *consumer_col*, ``size``.
+    consumer_col:
+        Column containing the consuming stream name (default ``"to"``).
+
+    Returns
+    -------
+    tuple[pd.DataFrame, pd.DataFrame]
+        ``(bi_tables, etl_tables)`` — each has columns
+        ``table``, ``is_bi``, ``is_etl``, ``size``, ``category``.
+    """
+    if table_dep_df.empty:
+        empty = pd.DataFrame(columns=["table", "is_bi", "is_etl", "size", "category"])
+        return empty, empty
+
+    df = table_dep_df.copy()
+    df["is_bi"] = df[consumer_col].str.lower().str.contains("json")
+    df["is_etl"] = ~df["is_bi"]
+
+    classified = (
+        df.groupby("table")
+        .agg({"is_bi": "any", "is_etl": "any", "size": "first"})
+        .reset_index()
+    )
+    classified["category"] = classified.apply(
+        lambda row: "ETL" if row["is_etl"] else "BI", axis=1
+    )
+
+    bi = classified[classified["category"] == "BI"]
+    etl = classified[classified["category"] == "ETL"]
+    return bi, etl
+
+
+def _filter_boundary_tables(
+    stream_table_pdf: pd.DataFrame,
+    streams_in_community: set,
+    direction: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return ``(all_rows, unique_by_table)`` for community-boundary tables.
+
+    Parameters
+    ----------
+    direction : ``{"incoming", "outgoing"}``
+        ``"incoming"`` — ``from`` ∉ community **and** ``to`` ∈ community.
+        ``"outgoing"`` — ``from`` ∈ community **and** ``to`` ∉ community.
+    """
+    cols = ["table", "from", "to", "size"]
+    if direction == "incoming":
+        mask = (
+            ~stream_table_pdf["from"].isin(streams_in_community)
+            & stream_table_pdf["to"].isin(streams_in_community)
+        )
+    else:
+        mask = (
+            stream_table_pdf["from"].isin(streams_in_community)
+            & ~stream_table_pdf["to"].isin(streams_in_community)
+        )
+    all_rows = stream_table_pdf[mask][cols].sort_values("table")
+    unique_rows = all_rows.drop_duplicates(subset=["table"])
+    return all_rows, unique_rows
+
+
+def _format_table_entry(
+    table: str,
+    table_instances: pd.DataFrame,
+    writer_label: str = "Written by (outside)",
+    reader_label: str = "Read by (inside)",
+    suffix: str = "",
+) -> str:
+    """Return a formatted 3-line table entry for report text.
+
+    Parameters
+    ----------
+    table:
+        Table name to display.
+    table_instances:
+        Rows for this table; must have ``size``, ``from``, and ``to`` columns.
+    writer_label:
+        Label for the producer side.
+    reader_label:
+        Label for the consumer side.
+    suffix:
+        Optional marker appended after the size on the first line (e.g.
+        ``" [MULTI-PRODUCER & MULTI-CONSUMER]"``).
+    """
+    size = table_instances["size"].iloc[0]
+    producers = sorted(table_instances["from"].unique())
+    consumers = sorted(table_instances["to"].unique())
+    return (
+        f"\n  Table: {table} ({size:.2f} GB){suffix}\n"
+        f"    - {writer_label}: {', '.join(producers)}\n"
+        f"    - {reader_label}: {', '.join(consumers)}\n"
+    )
+
+
+def build_stream_produces_mapping(dependency_df: "DataFrame") -> dict[str, set]:
+    """Return ``{stream_name -> set of uppercase TGT/TGT_TRNS table names}``.
+
+    Extracts which tables each stream *produces* (writes) by filtering
+    ``table_type`` to ``TGT`` and ``TGT_TRNS`` rows.
+
+    Parameters
+    ----------
+    dependency_df:
+        Preprocessed Spark DataFrame with columns ``stream_name``,
+        ``DB_Table_Name``, ``table_type``.
+    """
+    from pyspark.sql.functions import col, upper  # noqa: PLC0415
+
+    pdf = (
+        dependency_df.filter(
+            (upper(col("table_type")) == "TGT")
+            | (upper(col("table_type")) == "TGT_TRNS")
+        )
+        .select(
+            col("stream_name"),
+            upper(col("DB_Table_Name")).alias("table_name"),
+        )
+        .distinct()
+        .toPandas()
+    )
+    return pdf.groupby("stream_name")["table_name"].apply(set).to_dict()
+
+
+def build_report_required_tables(report_dependency_df: "DataFrame") -> dict[str, set]:
+    """Return ``{report_name -> set of uppercase required table names}``.
+
+    Parameters
+    ----------
+    report_dependency_df:
+        Spark DataFrame with columns ``stream_name`` (report name) and
+        ``table_name``.
+    """
+    from pyspark.sql.functions import col, upper  # noqa: PLC0415
+
+    pdf = (
+        report_dependency_df.select(
+            col("stream_name").alias("report_name"),
+            upper(col("table_name")).alias("table_name"),
+        )
+        .distinct()
+        .toPandas()
+    )
+    return pdf.groupby("report_name")["table_name"].apply(set).to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -513,16 +728,10 @@ def generate_community_analysis(
     """
     os.makedirs(outdir, exist_ok=True)
 
-    stream_table_pdf = stream_table_pdf.copy()
-    stream_table_pdf['size'] = pd.to_numeric(stream_table_pdf['size'], errors='coerce').fillna(0.0)
-
-    all_streams = set(leiden_df["stream"].tolist())
-    total_streams_global = len(all_streams)
-    bi_reports_global = [s for s in all_streams if "json" in s.lower()]
-    etl_streams_global = [s for s in all_streams if "json" not in s.lower()]
-    total_bi_reports_global = len(bi_reports_global)
-    total_etl_streams_global = len(etl_streams_global)
-    total_complexity_global = complexity_pdf['complexity_score'].sum()
+    stream_table_pdf = _coerce_size(stream_table_pdf)
+    total_streams_global, total_bi_reports_global, total_etl_streams_global, total_complexity_global = (
+        _global_stream_totals(leiden_df, complexity_pdf)
+    )
 
     communities = sorted(leiden_df["community"].unique())
     saved_files = []
@@ -533,13 +742,12 @@ def generate_community_analysis(
 
         streams_in_community = set(leiden_df[leiden_df["community"] == c]["stream"].tolist())
 
-        streams_list = sorted(list(streams_in_community))
-        bi_reports = [s for s in streams_list if "json" in s.lower()]
-        etl_streams = [s for s in streams_list if "json" not in s.lower()]
+        streams_list = sorted(streams_in_community)
+        bi_reports, etl_streams = split_bi_etl(streams_list)
 
-        pct_total = (len(streams_list) / total_streams_global * 100) if total_streams_global > 0 else 0.0
-        pct_bi = (len(bi_reports) / total_bi_reports_global * 100) if total_bi_reports_global > 0 else 0.0
-        pct_etl = (len(etl_streams) / total_etl_streams_global * 100) if total_etl_streams_global > 0 else 0.0
+        pct_total = _safe_pct(len(streams_list), total_streams_global)
+        pct_bi = _safe_pct(len(bi_reports), total_bi_reports_global)
+        pct_etl = _safe_pct(len(etl_streams), total_etl_streams_global)
 
         community_complexity_df = complexity_pdf[
             complexity_pdf['stream_name'].isin(streams_in_community)
@@ -548,11 +756,7 @@ def generate_community_analysis(
             zip(community_complexity_df['stream_name'], community_complexity_df['complexity_score'])
         )
         total_community_complexity = community_complexity_df['complexity_score'].sum()
-        pct_complexity = (
-            (total_community_complexity / total_complexity_global * 100)
-            if total_complexity_global > 0
-            else 0.0
-        )
+        pct_complexity = _safe_pct(total_community_complexity, total_complexity_global)
         bi_complexity_df = community_complexity_df[
             community_complexity_df['stream_name'].isin(bi_reports)
         ]
@@ -562,46 +766,20 @@ def generate_community_analysis(
         total_bi_complexity = bi_complexity_df['complexity_score'].sum()
         total_etl_complexity = etl_complexity_df['complexity_score'].sum()
 
-        tables_src_inside_tgt_outside_all = stream_table_pdf[
-            (~stream_table_pdf['from'].isin(streams_in_community))
-            & (stream_table_pdf['to'].isin(streams_in_community))
-        ][['table', 'from', 'to', 'size']].sort_values('table')
-        tables_src_inside_tgt_outside_unique = tables_src_inside_tgt_outside_all.drop_duplicates(
-            subset=['table']
+        tables_src_inside_tgt_outside_all, tables_src_inside_tgt_outside_unique = (
+            _filter_boundary_tables(stream_table_pdf, streams_in_community, "incoming")
         )
-
-        tables_incoming_details = tables_src_inside_tgt_outside_all.copy()
-        tables_incoming_details['is_bi'] = (
-            tables_incoming_details['to'].str.lower().str.contains('json')
+        tables_incoming_bi, tables_incoming_etl = _classify_tables_by_consumer_type(
+            tables_src_inside_tgt_outside_all
         )
-        tables_incoming_details['is_etl'] = ~tables_incoming_details['is_bi']
-
-        table_classification = tables_incoming_details.groupby('table').agg(
-            {'is_bi': 'any', 'is_etl': 'any', 'size': 'first'}
-        ).reset_index()
-        table_classification['category'] = table_classification.apply(
-            lambda row: 'ETL' if row['is_etl'] else 'BI', axis=1
-        )
-        tables_incoming_bi = table_classification[table_classification['category'] == 'BI']
-        tables_incoming_etl = table_classification[table_classification['category'] == 'ETL']
-        total_size_incoming_bi = tables_incoming_bi['size'].sum() if len(tables_incoming_bi) > 0 else 0.0
-        total_size_incoming_etl = (
-            tables_incoming_etl['size'].sum() if len(tables_incoming_etl) > 0 else 0.0
-        )
+        total_size_incoming_bi = tables_incoming_bi['size'].sum()
+        total_size_incoming_etl = tables_incoming_etl['size'].sum()
         total_size_incoming = total_size_incoming_bi + total_size_incoming_etl
 
-        tables_tgt_inside_src_outside_all = stream_table_pdf[
-            (stream_table_pdf['from'].isin(streams_in_community))
-            & (~stream_table_pdf['to'].isin(streams_in_community))
-        ][['table', 'from', 'to', 'size']].sort_values('table')
-        tables_tgt_inside_src_outside_unique = tables_tgt_inside_src_outside_all.drop_duplicates(
-            subset=['table']
+        tables_tgt_inside_src_outside_all, tables_tgt_inside_src_outside_unique = (
+            _filter_boundary_tables(stream_table_pdf, streams_in_community, "outgoing")
         )
-        total_size_outgoing = (
-            tables_tgt_inside_src_outside_unique['size'].sum()
-            if len(tables_tgt_inside_src_outside_unique) > 0
-            else 0.0
-        )
+        total_size_outgoing = tables_tgt_inside_src_outside_unique['size'].sum()
 
         outgoing_edges = merged_edges_pdf[
             (merged_edges_pdf['streamA'].isin(streams_in_community))
@@ -665,30 +843,20 @@ Total Instances: {len(tables_src_inside_tgt_outside_all)}\n\n"""
                     f"{total_size_incoming_bi:.2f} GB):\n{'-'*80}\n"
                 )
                 for table in tables_incoming_bi['table']:
-                    table_instances = tables_incoming_details[
-                        tables_incoming_details['table'] == table
+                    table_instances = tables_src_inside_tgt_outside_all[
+                        tables_src_inside_tgt_outside_all['table'] == table
                     ]
-                    size = table_instances['size'].iloc[0]
-                    producers = sorted(table_instances['from'].unique())
-                    consumers = sorted(table_instances['to'].unique())
-                    analysis_content += f"\n  Table: {table} ({size:.2f} GB)\n"
-                    analysis_content += f"    - Written by (outside): {', '.join(producers)}\n"
-                    analysis_content += f"    - Read by (inside): {', '.join(consumers)}\n"
+                    analysis_content += _format_table_entry(table, table_instances)
             if len(tables_incoming_etl) > 0:
                 analysis_content += (
                     f"\n3b. FOR ETL STREAMS ({len(tables_incoming_etl)} tables, "
                     f"{total_size_incoming_etl:.2f} GB):\n{'-'*80}\n"
                 )
                 for table in tables_incoming_etl['table']:
-                    table_instances = tables_incoming_details[
-                        tables_incoming_details['table'] == table
+                    table_instances = tables_src_inside_tgt_outside_all[
+                        tables_src_inside_tgt_outside_all['table'] == table
                     ]
-                    size = table_instances['size'].iloc[0]
-                    producers = sorted(table_instances['from'].unique())
-                    consumers = sorted(table_instances['to'].unique())
-                    analysis_content += f"\n  Table: {table} ({size:.2f} GB)\n"
-                    analysis_content += f"    - Written by (outside): {', '.join(producers)}\n"
-                    analysis_content += f"    - Read by (inside): {', '.join(consumers)}\n"
+                    analysis_content += _format_table_entry(table, table_instances)
         else:
             analysis_content += "  (No such tables found)\n"
 
@@ -706,12 +874,11 @@ Total Instances: {len(tables_tgt_inside_src_outside_all)}\n\n"""
                 table_instances = tables_tgt_inside_src_outside_all[
                     tables_tgt_inside_src_outside_all['table'] == table
                 ]
-                size = table_instances['size'].iloc[0]
-                producers = sorted(table_instances['from'].unique())
-                consumers = sorted(table_instances['to'].unique())
-                analysis_content += f"\n  Table: {table} ({size:.2f} GB)\n"
-                analysis_content += f"    - Written by (inside): {', '.join(producers)}\n"
-                analysis_content += f"    - Read by (outside): {', '.join(consumers)}\n"
+                analysis_content += _format_table_entry(
+                    table, table_instances,
+                    writer_label="Written by (inside)",
+                    reader_label="Read by (outside)",
+                )
         else:
             analysis_content += "  (No such tables found)\n"
 
@@ -811,8 +978,8 @@ def generate_migration_order_analysis(
     merged_edges_pdf = merged_edges_df.toPandas()
     complexity_pdf = complexity_scores_df.select("stream_name", "complexity_score").toPandas()
 
-    # Convert size to numeric
-    stream_table_pdf["size"] = pd.to_numeric(stream_table_pdf["size"], errors="coerce").fillna(0.0)
+    # Coerce size column (returns a copy — no in-place mutation)
+    stream_table_pdf = _coerce_size(stream_table_pdf)
 
     # Merge leiden_df with complexity scores
     leiden_with_complexity = leiden_df.merge(
@@ -823,15 +990,10 @@ def generate_migration_order_analysis(
     )
     leiden_with_complexity["complexity_score"] = leiden_with_complexity["complexity_score"].fillna(0)
 
-    # Calculate global totals
-    all_streams = set(leiden_df["stream"].tolist())
-    total_streams_global = len(all_streams)
-    bi_reports_global = [s for s in all_streams if "json" in s.lower()]
-    etl_streams_global = [s for s in all_streams if "json" not in s.lower()]
-    total_bi_reports_global = len(bi_reports_global)
-    total_etl_streams_global = len(etl_streams_global)
-
-    # Calculate total complexity across all communities
+    # Global totals (complexity taken from leiden_with_complexity to include merged scores)
+    total_streams_global, total_bi_reports_global, total_etl_streams_global, _ = (
+        _global_stream_totals(leiden_df)
+    )
     total_complexity_global = leiden_with_complexity["complexity_score"].sum()
 
     # Build community -> streams mapping with complexity
@@ -904,22 +1066,17 @@ Total Complexity Score: {total_complexity_global:.0f}
             )
 
         # Separate BI and ETL
-        bi_reports = [s for s in streams_in_community if "json" in s.lower()]
-        etl_streams = [s for s in streams_in_community if "json" not in s.lower()]
+        bi_reports, etl_streams = split_bi_etl(streams_in_community)
 
         # Calculate percentages
-        pct_total = (len(streams_in_community) / total_streams_global * 100) if total_streams_global > 0 else 0.0
-        pct_bi = (len(bi_reports) / total_bi_reports_global * 100) if total_bi_reports_global > 0 else 0.0
-        pct_etl = (len(etl_streams) / total_etl_streams_global * 100) if total_etl_streams_global > 0 else 0.0
+        pct_total = _safe_pct(len(streams_in_community), total_streams_global)
+        pct_bi = _safe_pct(len(bi_reports), total_bi_reports_global)
+        pct_etl = _safe_pct(len(etl_streams), total_etl_streams_global)
 
-        # Find tables this community needs (incoming dependencies)
-        incoming_tables_all = stream_table_pdf[
-            (~stream_table_pdf["from"].isin(streams_in_community))
-            & (stream_table_pdf["to"].isin(streams_in_community))
-        ][["table", "from", "to", "size"]].sort_values("table")
-
-        # Unique incoming tables
-        incoming_tables_unique = incoming_tables_all.drop_duplicates(subset=["table"])
+        # Incoming and outgoing boundary tables
+        incoming_tables_all, incoming_tables_unique = _filter_boundary_tables(
+            stream_table_pdf, streams_in_community, "incoming"
+        )
 
         # Tables that need to be synced (not yet available)
         tables_to_sync = incoming_tables_unique[
@@ -960,25 +1117,12 @@ Total Complexity Score: {total_complexity_global:.0f}
                 }
             )
 
-        # Classify each table dependency as BI or ETL based on the 'to' stream
-        tables_to_sync_details["is_bi"] = tables_to_sync_details["to"].str.lower().str.contains("json")
-        tables_to_sync_details["is_etl"] = ~tables_to_sync_details["is_bi"]
-
-        # For each unique table, determine if it's needed by BI, ETL, or both
-        table_classification = tables_to_sync_details.groupby("table").agg(
-            {"is_bi": "any", "is_etl": "any", "size": "first"}
-        ).reset_index()
-
-        # If a table is needed by both, classify as ETL
-        table_classification["category"] = table_classification.apply(
-            lambda row: "ETL" if row["is_etl"] else "BI", axis=1
+        # Classify each table as BI or ETL based on the consuming stream (ETL-wins rule)
+        tables_to_sync_bi, tables_to_sync_etl = _classify_tables_by_consumer_type(
+            tables_to_sync_details
         )
-
-        tables_to_sync_bi = table_classification[table_classification["category"] == "BI"]
-        tables_to_sync_etl = table_classification[table_classification["category"] == "ETL"]
-
-        sync_size_bi = tables_to_sync_bi["size"].sum() if len(tables_to_sync_bi) > 0 else 0.0
-        sync_size_etl = tables_to_sync_etl["size"].sum() if len(tables_to_sync_etl) > 0 else 0.0
+        sync_size_bi = tables_to_sync_bi["size"].sum()
+        sync_size_etl = tables_to_sync_etl["size"].sum()
         sync_size = sync_size_bi + sync_size_etl
 
         # Tables with multiple producers AND multiple consumers
@@ -1002,16 +1146,13 @@ Total Complexity Score: {total_complexity_global:.0f}
         tables_already_available = incoming_tables_unique[
             incoming_tables_unique["table"].isin(available_tables)
         ]
-        available_size = tables_already_available["size"].sum() if len(tables_already_available) > 0 else 0.0
+        available_size = tables_already_available["size"].sum()
 
         # Tables this community produces (outgoing)
-        outgoing_tables_all = stream_table_pdf[
-            stream_table_pdf["from"].isin(streams_in_community)
-            & (~stream_table_pdf["to"].isin(streams_in_community))
-        ][["table", "from", "to", "size"]].sort_values("table")
-
-        outgoing_tables_unique = outgoing_tables_all.drop_duplicates(subset=["table"])
-        outgoing_size = outgoing_tables_unique["size"].sum() if len(outgoing_tables_unique) > 0 else 0.0
+        outgoing_tables_all, outgoing_tables_unique = _filter_boundary_tables(
+            stream_table_pdf, streams_in_community, "outgoing"
+        )
+        outgoing_size = outgoing_tables_unique["size"].sum()
 
         # Update available tables BEFORE calculating cumulative outstanding sync
         produced_tables = stream_table_pdf[
@@ -1031,33 +1172,19 @@ Total Complexity Score: {total_complexity_global:.0f}
             & (stream_table_pdf["to"].isin(migrated_streams))
         ][["table", "to", "size"]].drop_duplicates(subset=["table", "to"])
 
-        cumulative_outstanding_sync_df["is_bi"] = (
-            cumulative_outstanding_sync_df["to"].str.lower().str.contains("json")
+        cumulative_outstanding_bi, cumulative_outstanding_etl = _classify_tables_by_consumer_type(
+            cumulative_outstanding_sync_df
         )
-        cumulative_outstanding_sync_df["is_etl"] = ~cumulative_outstanding_sync_df["is_bi"]
-
-        cumulative_classification = cumulative_outstanding_sync_df.groupby("table").agg(
-            {"is_bi": "any", "is_etl": "any", "size": "first"}
-        ).reset_index()
-
-        cumulative_classification["category"] = cumulative_classification.apply(
-            lambda row: "ETL" if row["is_etl"] else "BI", axis=1
-        )
-
-        cumulative_outstanding_bi = cumulative_classification[cumulative_classification["category"] == "BI"]
-        cumulative_outstanding_etl = cumulative_classification[cumulative_classification["category"] == "ETL"]
-
         cumulative_outstanding_sync_count_bi = len(cumulative_outstanding_bi)
         cumulative_outstanding_sync_count_etl = len(cumulative_outstanding_etl)
-        cumulative_outstanding_sync_count = cumulative_outstanding_sync_count_bi + cumulative_outstanding_sync_count_etl
-
-        cumulative_outstanding_sync_size_bi = (
-            cumulative_outstanding_bi["size"].sum() if len(cumulative_outstanding_bi) > 0 else 0.0
+        cumulative_outstanding_sync_count = (
+            cumulative_outstanding_sync_count_bi + cumulative_outstanding_sync_count_etl
         )
-        cumulative_outstanding_sync_size_etl = (
-            cumulative_outstanding_etl["size"].sum() if len(cumulative_outstanding_etl) > 0 else 0.0
+        cumulative_outstanding_sync_size_bi = cumulative_outstanding_bi["size"].sum()
+        cumulative_outstanding_sync_size_etl = cumulative_outstanding_etl["size"].sum()
+        cumulative_outstanding_sync_size = (
+            cumulative_outstanding_sync_size_bi + cumulative_outstanding_sync_size_etl
         )
-        cumulative_outstanding_sync_size = cumulative_outstanding_sync_size_bi + cumulative_outstanding_sync_size_etl
 
         # Update cumulative metrics
         cumulative_streams += len(streams_in_community)
@@ -1142,13 +1269,8 @@ Total tables still to be synced (this + earlier communities): {cumulative_outsta
                 )
                 for table in tables_to_sync_bi["table"]:
                     table_instances = tables_to_sync_details[tables_to_sync_details["table"] == table]
-                    size = table_instances["size"].iloc[0]
-                    producers = sorted(table_instances["from"].unique())
-                    consumers = sorted(table_instances["to"].unique())
-                    multi_marker = " [MULTI-PRODUCER & MULTI-CONSUMER]" if table in multi_producer_consumer_tables else ""
-                    report_content += f"\n  Table: {table} ({size:.2f} GB){multi_marker}\n"
-                    report_content += f"    - Written by (outside): {', '.join(producers)}\n"
-                    report_content += f"    - Read by (inside): {', '.join(consumers)}\n"
+                    suffix = " [MULTI-PRODUCER & MULTI-CONSUMER]" if table in multi_producer_consumer_tables else ""
+                    report_content += _format_table_entry(table, table_instances, suffix=suffix)
 
             if len(tables_to_sync_etl) > 0:
                 report_content += (
@@ -1156,13 +1278,8 @@ Total tables still to be synced (this + earlier communities): {cumulative_outsta
                 )
                 for table in tables_to_sync_etl["table"]:
                     table_instances = tables_to_sync_details[tables_to_sync_details["table"] == table]
-                    size = table_instances["size"].iloc[0]
-                    producers = sorted(table_instances["from"].unique())
-                    consumers = sorted(table_instances["to"].unique())
-                    multi_marker = " [MULTI-PRODUCER & MULTI-CONSUMER]" if table in multi_producer_consumer_tables else ""
-                    report_content += f"\n  Table: {table} ({size:.2f} GB){multi_marker}\n"
-                    report_content += f"    - Written by (outside): {', '.join(producers)}\n"
-                    report_content += f"    - Read by (inside): {', '.join(consumers)}\n"
+                    suffix = " [MULTI-PRODUCER & MULTI-CONSUMER]" if table in multi_producer_consumer_tables else ""
+                    report_content += _format_table_entry(table, table_instances, suffix=suffix)
         else:
             report_content += "  (No new tables to sync - all dependencies already available!)\n"
 
@@ -1174,12 +1291,7 @@ Total tables still to be synced (this + earlier communities): {cumulative_outsta
             ]
             for table in sorted(tables_already_available["table"].unique()):
                 table_instances = tables_available_all[tables_available_all["table"] == table]
-                size = table_instances["size"].iloc[0]
-                producers = sorted(table_instances["from"].unique())
-                consumers = sorted(table_instances["to"].unique())
-                report_content += f"\n  Table: {table} ({size:.2f} GB)\n"
-                report_content += f"    - Written by (outside): {', '.join(producers)}\n"
-                report_content += f"    - Read by (inside): {', '.join(consumers)}\n"
+                report_content += _format_table_entry(table, table_instances)
         else:
             report_content += "  (No dependencies from previous migrations)\n"
 
@@ -1190,12 +1302,11 @@ This community produces: {len(outgoing_tables_unique)} unique tables, {outgoing_
         if len(outgoing_tables_unique) > 0:
             for table in sorted(outgoing_tables_unique["table"].unique()):
                 table_instances = outgoing_tables_all[outgoing_tables_all["table"] == table]
-                size = table_instances["size"].iloc[0]
-                producers = sorted(table_instances["from"].unique())
-                consumers = sorted(table_instances["to"].unique())
-                report_content += f"\n  Table: {table} ({size:.2f} GB)\n"
-                report_content += f"    - Written by (inside): {', '.join(producers)}\n"
-                report_content += f"    - Read by (outside): {', '.join(consumers)}\n"
+                report_content += _format_table_entry(
+                    table, table_instances,
+                    writer_label="Written by (inside)",
+                    reader_label="Read by (outside)",
+                )
 
     # Final summary
     report_content += f"""\n\n{'=' * 100}

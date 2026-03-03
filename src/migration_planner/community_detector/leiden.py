@@ -51,9 +51,12 @@ from migration_planner.dependency_extractors.loaders import (
 from migration_planner.planner_core.analysis import (
     BruteForceCommunityOrdering,
     append_execution_metadata,
+    build_report_required_tables,
+    build_stream_produces_mapping,
     generate_migration_order_analysis,
     get_leiden_df,
     membership_to_leiden_df,
+    split_bi_etl,
     split_communities_topN,
 )
 from migration_planner.planner_core.preprocessing import (
@@ -574,29 +577,26 @@ for resolution in resolutions:
     print(f"\n--- REST communities reordered: ASCENDING by weight (lowest first) ---")
 
     dep_scaled_df = unique_table_weights.select("from", "to", "table", "weight")
-    
+    dep_pdf = dep_scaled_df.toPandas()  # convert once; reused across all REST community iterations
+
     # Step 1: Optimize REST communities as a single batch
     # But identify communities with 0 sync requirement to migrate first
     print(f"\n--- Step 1: Optimizing REST communities ({len(rest_ids)} communities) ---")
-    
+
     # Identify communities with 0 sync requirement (no incoming dependencies from outside)
     zero_sync_communities = []
     non_zero_sync_communities = []
-    
+
     for comm_id in rest_ids:
         # Get streams in this community
         streams_in_community = set(leiden_df[leiden_df['community'] == comm_id]['stream'].tolist())
-        
-        # Check if there are any incoming dependencies from outside this community
-        # Convert to pandas for easier filtering
-        dep_pdf = dep_scaled_df.toPandas()
-        
+
         # Find incoming dependencies: tables consumed by this community but produced outside
         incoming_deps = dep_pdf[
-            (~dep_pdf['from'].isin(streams_in_community)) & 
+            (~dep_pdf['from'].isin(streams_in_community)) &
             (dep_pdf['to'].isin(streams_in_community))
         ]
-        
+
         if len(incoming_deps) == 0:
             zero_sync_communities.append(comm_id)
         else:
@@ -766,23 +766,11 @@ available_tables = missing_static_tables
 bi_reports_ready = []  # Track BI reports ready from previous stage
 
 # Get stream-to-table production mapping (TGT tables)
-stream_produces_tables_df = dependency_df.filter(
-    (upper(col('table_type')) == 'TGT') |
-    (upper(col('table_type')) == 'TGT_TRNS')
-).select(
-    col('stream_name'),
-    upper(col('DB_Table_Name')).alias('table_name')
-).distinct().toPandas()
-
-stream_produces = stream_produces_tables_df.groupby('stream_name')['table_name'].apply(set).to_dict()
+stream_produces = build_stream_produces_mapping(dependency_df)
 
 # Get report-to-table dependencies if available
 try:
-    report_to_tables_pd = report_dependency_df.select(
-        col('stream_name').alias('report_name'),
-        upper(col('table_name')).alias('table_name')
-    ).distinct().toPandas()
-    report_required_tables = report_to_tables_pd.groupby('report_name')['table_name'].apply(set).to_dict()
+    report_required_tables = build_report_required_tables(report_dependency_df)
     has_report_data = True
 except:
     report_required_tables = {}
@@ -795,8 +783,7 @@ for idx, community_id in enumerate(final_order, start=1):
     num_streams = len(community_streams)
     
     # Separate BI reports from ETL streams
-    bi_reports = [s for s in community_streams if 'json' in s.lower()]
-    etl_streams = [s for s in community_streams if 'json' not in s.lower()]
+    bi_reports, etl_streams = split_bi_etl(community_streams)
     
     # Group streams by squad
     squad_streams = {}
@@ -1177,19 +1164,10 @@ except FileNotFoundError:
 # COMMAND ----------
 
 # DBTITLE 1,Prepare report-to-table dependencies
-# Convert report_dependency_df to Pandas for easier manipulation
-report_to_tables_pd = report_dependency_df.select(
-    col('stream_name').alias('report_name'),
-    upper(col('table_name')).alias('table_name')
-).distinct().toPandas()
-
-print(f"Total report-to-table dependencies: {len(report_to_tables_pd)}")
-print(f"Unique reports: {report_to_tables_pd['report_name'].nunique()}")
-print(f"Unique tables required by reports: {report_to_tables_pd['table_name'].nunique()}")
-
 # Group by report to get all tables required per report
-report_required_tables = report_to_tables_pd.groupby('report_name')['table_name'].apply(set).to_dict()
+report_required_tables = build_report_required_tables(report_dependency_df)
 
+print(f"Total reports with table dependencies: {len(report_required_tables)}")
 print(f"\nExample - First 3 reports and their required tables:")
 for i, (report, tables) in enumerate(list(report_required_tables.items())[:3]):
     print(f"  {report}: {len(tables)} tables - {list(tables)[:5]}{'...' if len(tables) > 5 else ''}")
@@ -1198,20 +1176,7 @@ for i, (report, tables) in enumerate(list(report_required_tables.items())[:3]):
 
 # DBTITLE 1,Extract table production by streams
 # Get which tables are produced (TGT) by which streams
-# From the original dependency_df, extract TGT tables per stream
-stream_produces_tables_df = dependency_df.filter(
-    (upper(col('table_type')) == 'TGT') |
-    (upper(col('table_type')) == 'TGT_TRNS')
-).select(
-    col('stream_name'),
-    upper(col('DB_Table_Name')).alias('table_name')
-).distinct()
-
-stream_produces_tables_pd = stream_produces_tables_df.toPandas()
-print(f"Total stream-produces-table mappings: {len(stream_produces_tables_pd)}")
-
-# Group by stream to get all tables produced per stream
-stream_produces = stream_produces_tables_pd.groupby('stream_name')['table_name'].apply(set).to_dict()
+stream_produces = build_stream_produces_mapping(dependency_df)
 
 print(f"Total streams that produce tables: {len(stream_produces)}")
 print(f"\nExample - First 3 streams and tables they produce:")

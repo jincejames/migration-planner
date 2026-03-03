@@ -96,6 +96,17 @@ src/migration_planner/
 │                               append_execution_metadata()
 │                               generate_community_analysis()  ← per-community reports
 │                               generate_migration_order_analysis()
+│                               ── shared helpers (public) ──
+│                               split_bi_etl()               ← BI/ETL stream split
+│                               build_stream_produces_mapping()  ← TGT table map
+│                               build_report_required_tables()   ← report→table map
+│                               ── shared helpers (private) ──
+│                               _coerce_size()               ← size column → float
+│                               _safe_pct()                  ← safe percentage
+│                               _global_stream_totals()      ← global BI/ETL counts
+│                               _classify_tables_by_consumer_type()  ← BI/ETL classify
+│                               _filter_boundary_tables()    ← incoming/outgoing filter
+│                               _format_table_entry()        ← table entry renderer
 │
 ├── visualization/
 │   └── community_plots.py      select_resolutions()
@@ -417,15 +428,19 @@ For each chosen resolution and each community:
 ```
 leiden_df (stream → community_id)
   │
-  ├── Separate BI reports (stream contains "json") vs ETL streams
-  ├── Calculate complexity scores from complexity_pdf (pandas)
+  ├── split_bi_etl()             ← separate BI reports (name contains "json") vs ETL
+  ├── _global_stream_totals()    ← total/bi/etl counts + complexity across all streams
+  ├── _coerce_size()             ← coerce stream_table_pdf size column to float
   │
-  ├── Incoming tables:  stream_table_pdf WHERE (from ∉ community AND to ∈ community)
+  ├── _filter_boundary_tables(..., "incoming")
   │   → tables produced outside, consumed inside → SYNC REQUIREMENTS
-  │   → classify by whether consuming stream is BI or ETL
+  │   → _classify_tables_by_consumer_type()  ← split into BI-consumed / ETL-consumed
   │
-  ├── Outgoing tables:  stream_table_pdf WHERE (from ∈ community AND to ∉ community)
+  ├── _filter_boundary_tables(..., "outgoing")
   │   → tables produced inside, consumed outside
+  │
+  ├── _safe_pct()                ← safe percentage for all ratio calculations
+  ├── _format_table_entry()      ← render per-table lines in analysis text
   │
   └── Write community_<N>_analysis.txt per community
 ```
@@ -497,6 +512,28 @@ All functions in `planner_core/analysis.py` that deal with per-community reports
 ### Plain class for test stubs, not MagicMock
 
 `tests/conftest.py` defines `_SparkColumn` and `_SparkFunctions` as plain Python classes rather than `MagicMock` subclasses. In Python 3.10, `MagicMock._get_child_mock` always returns plain `MagicMock` instances for comparison operators (`>`, `<`, `&`, `~`), causing `TypeError: NotImplemented`. Plain classes with explicit operator implementations avoid this entirely.
+
+### Shared helpers in `planner_core/analysis.py`
+
+Both `generate_community_analysis` and `generate_migration_order_analysis` share the same set of internal helpers to avoid duplicated logic:
+
+| Helper | Visibility | Purpose |
+|---|---|---|
+| `split_bi_etl(streams)` | public | Splits a list of stream names into `(bi_reports, etl_streams)` by `"json"` in name |
+| `build_stream_produces_mapping(dependency_df)` | public | Returns `{stream → set of TGT/TGT_TRNS tables}` from a Spark DataFrame |
+| `build_report_required_tables(report_dependency_df)` | public | Returns `{report → set of required tables}` from a Spark DataFrame |
+| `_coerce_size(df, col)` | private | Returns a copy of a pandas DataFrame with the size column coerced to float |
+| `_safe_pct(n, d)` | private | Returns `n/d*100` safely; returns `0.0` when denominator is zero |
+| `_global_stream_totals(leiden_df, complexity_pdf)` | private | Returns `(total, n_bi, n_etl, total_complexity)` for the whole run |
+| `_classify_tables_by_consumer_type(table_dep_df)` | private | Returns `(bi_df, etl_df)` — ETL wins when a table is consumed by both types |
+| `_filter_boundary_tables(stream_table_pdf, community, direction)` | private | Returns `(all_rows, unique_by_table)` for incoming or outgoing community boundary tables |
+| `_format_table_entry(table, instances, ...)` | private | Renders a single formatted table entry (3 lines) for report text |
+
+`build_stream_produces_mapping` and `build_report_required_tables` are also called from `leiden.py`, replacing duplicate inline Spark query blocks that previously appeared twice each in the notebook.
+
+### Hoisting `toPandas()` outside loops
+
+In `leiden.py`, the REST-community sync classification loop previously called `dep_scaled_df.toPandas()` once per iteration, materializing the same Spark DataFrame N times. The call is now hoisted before the loop so the pandas conversion runs exactly once and the resulting DataFrame is reused across all iterations.
 
 ### Weight method chosen at config time
 
