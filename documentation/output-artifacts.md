@@ -186,7 +186,7 @@ Values close to 1.0 indicate that the community structure at this resolution is 
 ## 4. Per-Community Analysis Reports
 
 **Path:** `<output_path>/leiden_community_plots_gamma_<γ>/community_<N>/community_<N>_analysis.txt`
-**When produced:** After `plot_communities_with_analysis_safe()` is called for each chosen resolution.
+**When produced:** After `visualization.community_plots.plot_communities_with_analysis_safe()` is called for each chosen resolution.
 
 One text file is generated per community per resolution. These are the primary planning documents for migration teams.
 
@@ -472,7 +472,7 @@ ORDER BY execution_datetime DESC;
 
 **Path:** `<output_path>/leiden_community_plots_gamma_<γ>/community_<N>/community_<N>.png`
 **Path:** `<output_path>/leiden_community_plots_gamma_<γ>/leiden_rb_gamma_<γ>.png`
-**When produced:** Only when `enable_plotting=True` is set in `plot_communities_with_analysis_safe()` or the overall graph plot cell is un-skipped.
+**When produced:** Only when `enable_plotting=True` is set in `visualization.community_plots.plot_communities_with_analysis_safe()` or the overall graph plot cell is un-skipped.
 
 Visualizations are disabled by default (they can be slow to generate for large graphs).
 

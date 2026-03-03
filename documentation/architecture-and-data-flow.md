@@ -51,10 +51,10 @@ Migration Planner runs as a **Databricks notebook** (`leiden.py`) on an Apache S
 │  │  igraph /   │◀───│  ├─ weights.py  │                 │
 │  │  leidenalg  │    │  ├─ graph_b.py  │                 │
 │  └─────────────┘    │  ├─ algorithm.py│                 │
-│                     │  └─ leiden.py   │                 │
-│  ┌─────────────┐    └──────────────────┘                 │
-│  │  Unity Cat. │◀──── reads CSVs / writes outputs        │
-│  │  Volume     │                                          │
+│                     │  ├─ comm_plots  │                 │
+│  ┌─────────────┐    │  └─ leiden.py   │                 │
+│  │  Unity Cat. │◀───┘                  │                 │
+│  │  Volume     │  reads CSVs / writes outputs            │
 │  └─────────────┘                                          │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -73,6 +73,14 @@ src/migration_planner/
 ├── dependency_extractors/
 │   └── loaders.py              6 CSV reader functions
 │                               COMPLEXITY_WEIGHTS constant
+│
+├── visualization/
+│   └── community_plots.py      select_resolutions()
+│                               precompute_layout()
+│                               precompute_edge_style()
+│                               plot_leiden_resolutions()
+│                               edge_style()
+│                               plot_communities_with_analysis_safe()
 │
 └── community_detector/
     ├── preprocessing.py        filter_admin_streams()
@@ -96,8 +104,9 @@ src/migration_planner/
     │                           scan_resolutions()
     │
     └── leiden.py               Databricks notebook orchestrator
-                                Community analysis functions
-                                Migration ordering optimization
+                                membership_to_leiden_df()
+                                get_leiden_df()
+                                Community ordering optimization
                                 Execution metadata logging
 ```
 
@@ -387,7 +396,7 @@ The output `summary` DataFrame has one row per resolution; `rep_by_res` maps eac
 
 ### Stage 10 — Community Analysis
 
-**Function:** `leiden.py / plot_communities_with_analysis_safe()`
+**Function:** `visualization/community_plots.py / plot_communities_with_analysis_safe()`
 
 For each chosen resolution and each community:
 
@@ -419,7 +428,7 @@ The analysis text file contains six sections:
 
 ### Stage 11 — Community Ordering Optimization
 
-**Class:** `leiden.py / CommunityOrderOptimizer`
+**Class:** `leiden.py / BruteForceCommunityOrdering`
 
 Finds the migration sequence that minimizes total data synchronization cost. The search space grows factorially with the number of communities, so it is split into two parts:
 
@@ -496,6 +505,9 @@ leiden.py (orchestrator)
   ├── dependency_extractors/loaders.py
   │     └── (no internal imports)
   │
+  ├── visualization/community_plots.py
+  │     └── (no internal imports from this package)
+  │
   └── community_detector/
         ├── preprocessing.py
         │     └── imports: weights.py
@@ -510,4 +522,4 @@ leiden.py (orchestrator)
               └── (no internal imports from this package)
 ```
 
-All modules depend only downward; there are no circular imports. `preprocessing.py` is the only module that imports from a sibling module (`weights.py`).
+All modules depend only downward; there are no circular imports. `preprocessing.py` is the only community-detector module that imports from a sibling (`weights.py`). `leiden.py` imports from `visualization/community_plots.py` for all plotting operations.
