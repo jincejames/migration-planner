@@ -1,3 +1,12 @@
+from migration_planner.planner_core.analysis import (
+    BruteForceCommunityOrdering,
+    append_execution_metadata,
+    generate_community_analysis,
+    generate_migration_order_analysis,
+    get_leiden_df,
+    membership_to_leiden_df,
+    split_communities_topN,
+)
 from migration_planner.planner_core.preprocessing import (
     filter_admin_streams,
     form_stream_stream_dependencies,
@@ -14,6 +23,14 @@ from migration_planner.planner_core.weights import (
 )
 
 __all__ = [
+    # analysis
+    "BruteForceCommunityOrdering",
+    "append_execution_metadata",
+    "generate_community_analysis",
+    "generate_migration_order_analysis",
+    "get_leiden_df",
+    "membership_to_leiden_df",
+    "split_communities_topN",
     # preprocessing
     "filter_admin_streams",
     "form_stream_stream_dependencies",

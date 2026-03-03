@@ -101,7 +101,7 @@ This runs `hatch env create`, placing the `.venv` directory inside the project f
 make test
 ```
 
-All 223 unit tests should pass.
+All 338 unit tests should pass.
 
 ### Quick Start
 
@@ -394,7 +394,7 @@ For full details on interpreting each artifact, see [`documentation/output-artif
 make dev        # Create .venv and install all dev dependencies
 make fmt        # Auto-format: black, ruff --fix, mypy, pylint
 make lint       # Verify formatting (no modifications)
-make test       # Run all 223 unit tests (parallel, 30 s timeout)
+make test       # Run all 338 unit tests (parallel, 30 s timeout)
 make coverage   # Generate HTML coverage report and open in browser
 make clean      # Remove .venv, build artifacts, and caches
 ```
@@ -408,13 +408,17 @@ migration-planner/
 │   │   └── config.py                   # PlannerConfig dataclass + load_config()
 │   ├── dependency_extractors/
 │   │   └── loaders.py                  # Six CSV loader functions
+│   ├── planner_core/
+│   │   ├── preprocessing.py            # Full preprocessing pipeline
+│   │   ├── weights.py                  # Factor & scaled weight methods
+│   │   └── analysis.py                 # Community analysis, ordering, metadata logging
+│   ├── visualization/
+│   │   └── community_plots.py          # Resolution plots + per-community PNG export
 │   └── community_detector/
-│       ├── preprocessing.py            # Full preprocessing pipeline
-│       ├── weights.py                  # Factor & scaled weight methods
 │       ├── graph_builder.py            # igraph + NetworkX graph builders
 │       ├── algorithm.py                # Leiden RB + stability (ARI) + resolution scan
 │       └── leiden.py                   # Databricks orchestration notebook
-├── tests/                              # 223 unit tests (pytest)
+├── tests/                              # 338 unit tests (pytest)
 ├── documentation/
 │   ├── architecture-and-data-flow.md   # Module architecture and pipeline stages
 │   └── output-artifacts.md             # All output files with interpretation guide

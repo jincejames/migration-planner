@@ -174,7 +174,7 @@ def preprocess_stream_dependencies(
     report_dependency_df: DataFrame | None,
     table_size_df: DataFrame | None,
     weight_method: str = "factor",
-) -> tuple[DataFrame, DataFrame]:
+) -> tuple[DataFrame, DataFrame, DataFrame]:
     """
     Run the complete preprocessing pipeline.
 
@@ -198,11 +198,15 @@ def preprocess_stream_dependencies(
 
     Returns
     -------
-    tuple[DataFrame, DataFrame]
-        ``(dependency_df, merged_dependency_df)`` where
+    tuple[DataFrame, DataFrame, DataFrame]
+        ``(dependency_df, unique_table_weights_df, merged_dependency_df)`` where
 
         * ``dependency_df`` – filtered and TGT-as-SRC normalised stream-table
           dependency table; required by :func:`graph_builder.find_isolated_streams`.
+        * ``unique_table_weights_df`` – deduplicated stream-stream-table weight
+          table with columns ``from``, ``to``, ``table``, ``weight``; consumed by
+          :func:`~migration_planner.planner_core.analysis.split_communities_topN`
+          and :class:`~migration_planner.planner_core.analysis.BruteForceCommunityOrdering`.
         * ``merged_dependency_df`` – weighted, undirected edge list with columns
           ``streamA``, ``streamB``, ``weight``; ready for graph construction.
     """
@@ -213,4 +217,4 @@ def preprocess_stream_dependencies(
     unique_weights = deduplicate_table_weights(table_weights)
     weighted = aggregate_edge_weights(unique_weights)
     merged_dependency_df = merge_bidirectional_edges(weighted)
-    return dependency_df, merged_dependency_df
+    return dependency_df, unique_weights, merged_dependency_df

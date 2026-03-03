@@ -14,8 +14,9 @@ plot_leiden_resolutions
 edge_style
     Compute per-edge widths and alphas for a community sub-graph.
 plot_communities_with_analysis_safe
-    For every community at a given resolution: write an analysis text file
-    and (optionally) save a sub-graph PNG.
+    For every community at a given resolution: delegate analysis text-file
+    writing to ``planner_core.analysis.generate_community_analysis`` and
+    (optionally) save a sub-graph PNG.
 """
 from __future__ import annotations
 
@@ -26,6 +27,8 @@ import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
+
+from migration_planner.planner_core.analysis import generate_community_analysis
 
 
 def select_resolutions(
@@ -392,7 +395,10 @@ def plot_communities_with_analysis_safe(
     For every community at a given Leiden resolution: write a structured
     analysis text file and (optionally) save a community sub-graph PNG.
 
-    Analysis is always written regardless of *enable_plotting*.
+    Analysis text files are always written regardless of *enable_plotting*.
+    The analysis logic is delegated to
+    :func:`~migration_planner.planner_core.analysis.generate_community_analysis`;
+    this function is responsible only for the optional graph plots.
 
     Parameters
     ----------
@@ -402,13 +408,15 @@ def plot_communities_with_analysis_safe(
         DataFrame with columns ``['stream', 'community']``.
     stream_table_dependency_df : pyspark.sql.DataFrame
         Full stream-to-table dependency Spark DataFrame.  Converted to pandas
-        internally via ``.toPandas()``.
+        once via ``.toPandas()`` before being passed to
+        ``generate_community_analysis``.
     merged_edges_df : pyspark.sql.DataFrame
         Merged, bidirectional edge-list Spark DataFrame.  Converted to pandas
-        internally via ``.toPandas()``.
+        once via ``.toPandas()`` before being passed to
+        ``generate_community_analysis``.
     complexity_scores_df : pyspark.sql.DataFrame
-        Complexity scores Spark DataFrame.  Converted to pandas internally
-        via ``.toPandas()``.
+        Complexity scores Spark DataFrame.  Converted to pandas once via
+        ``.toPandas()`` before being passed to ``generate_community_analysis``.
     resolution : float
         Leiden resolution used (for labelling output files only).
     outdir : str
@@ -462,318 +470,86 @@ def plot_communities_with_analysis_safe(
             iterations=layout_iterations,
         )
 
+    # Convert Spark DFs to pandas once — no recomputation downstream
     stream_table_pdf = stream_table_dependency_df.toPandas()
     merged_edges_pdf = merged_edges_df.toPandas()
     complexity_pdf = complexity_scores_df.toPandas()
 
-    stream_table_pdf['size'] = pd.to_numeric(stream_table_pdf['size'], errors='coerce').fillna(0.0)
+    # Delegate all analysis (text file writing) to planner_core
+    saved_files = generate_community_analysis(
+        leiden_df=leiden_df,
+        stream_table_pdf=stream_table_pdf,
+        merged_edges_pdf=merged_edges_pdf,
+        complexity_pdf=complexity_pdf,
+        resolution=resolution,
+        outdir=outdir,
+    )
 
-    all_streams = set(leiden_df["stream"].tolist())
-    total_streams_global = len(all_streams)
-    bi_reports_global = [s for s in all_streams if "json" in s.lower()]
-    etl_streams_global = [s for s in all_streams if "json" not in s.lower()]
-    total_bi_reports_global = len(bi_reports_global)
-    total_etl_streams_global = len(etl_streams_global)
-    total_complexity_global = complexity_pdf['complexity_score'].sum()
+    if not enable_plotting:
+        return saved_files
 
+    # ---- PLOTTING (only if enabled) ----
     communities = sorted(leiden_df["community"].unique())
-    saved_files = []
 
     for c in communities:
         comm_dir = os.path.join(outdir, f"community_{c}")
         os.makedirs(comm_dir, exist_ok=True)
 
         comm_nodes = [n for n in labeled_nodes if node_to_comm[n] == c]
-        streams_in_community = set(comm_nodes)
+        h_graph = G.subgraph(comm_nodes).copy()
+        print(f"Community {c}: nodes={h_graph.number_of_nodes()}, edges={h_graph.number_of_edges()}")
 
-        if enable_plotting:
-            h_graph = G.subgraph(comm_nodes).copy()
-            print(f"Community {c}: nodes={h_graph.number_of_nodes()}, edges={h_graph.number_of_edges()}")
+        pos = {n: pos_global[n] for n in h_graph.nodes() if n in pos_global}
 
-        # ---- ANALYSIS (always runs regardless of plotting) ----
+        missing = [n for n in h_graph.nodes() if n not in pos]
+        if missing:
+            pos_local = nx.spring_layout(
+                h_graph, seed=layout_seed, k=layout_k, iterations=20
+            )
+            for n in missing:
+                pos[n] = pos_local[n]
 
-        streams_list = sorted(list(streams_in_community))
-        bi_reports = [s for s in streams_list if "json" in s.lower()]
-        etl_streams = [s for s in streams_list if "json" not in s.lower()]
+        widths, alphas = edge_style(h_graph, weight_attr=weight_attr)
 
-        pct_total = (len(streams_list) / total_streams_global * 100) if total_streams_global > 0 else 0.0
-        pct_bi = (len(bi_reports) / total_bi_reports_global * 100) if total_bi_reports_global > 0 else 0.0
-        pct_etl = (len(etl_streams) / total_etl_streams_global * 100) if total_etl_streams_global > 0 else 0.0
+        plt.figure(figsize=figsize, dpi=dpi)
 
-        community_complexity_df = complexity_pdf[
-            complexity_pdf['stream_name'].isin(streams_in_community)
-        ].copy()
-        stream_complexity_map = dict(
-            zip(community_complexity_df['stream_name'], community_complexity_df['complexity_score'])
-        )
-        total_community_complexity = community_complexity_df['complexity_score'].sum()
-        pct_complexity = (
-            (total_community_complexity / total_complexity_global * 100)
-            if total_complexity_global > 0
-            else 0.0
-        )
-        bi_complexity_df = community_complexity_df[
-            community_complexity_df['stream_name'].isin(bi_reports)
-        ]
-        etl_complexity_df = community_complexity_df[
-            community_complexity_df['stream_name'].isin(etl_streams)
-        ]
-        total_bi_complexity = bi_complexity_df['complexity_score'].sum()
-        total_etl_complexity = etl_complexity_df['complexity_score'].sum()
-
-        tables_src_inside_tgt_outside_all = stream_table_pdf[
-            (~stream_table_pdf['from'].isin(streams_in_community))
-            & (stream_table_pdf['to'].isin(streams_in_community))
-        ][['table', 'from', 'to', 'size']].sort_values('table')
-        tables_src_inside_tgt_outside_unique = tables_src_inside_tgt_outside_all.drop_duplicates(
-            subset=['table']
+        nx.draw_networkx_nodes(
+            h_graph, pos,
+            node_size=node_size,
+            node_color=[c] * h_graph.number_of_nodes(),
+            cmap=cmap,
         )
 
-        tables_incoming_details = tables_src_inside_tgt_outside_all.copy()
-        tables_incoming_details['is_bi'] = (
-            tables_incoming_details['to'].str.lower().str.contains('json')
-        )
-        tables_incoming_details['is_etl'] = ~tables_incoming_details['is_bi']
-
-        table_classification = tables_incoming_details.groupby('table').agg(
-            {'is_bi': 'any', 'is_etl': 'any', 'size': 'first'}
-        ).reset_index()
-        table_classification['category'] = table_classification.apply(
-            lambda row: 'ETL' if row['is_etl'] else 'BI', axis=1
-        )
-        tables_incoming_bi = table_classification[table_classification['category'] == 'BI']
-        tables_incoming_etl = table_classification[table_classification['category'] == 'ETL']
-        total_size_incoming_bi = tables_incoming_bi['size'].sum() if len(tables_incoming_bi) > 0 else 0.0
-        total_size_incoming_etl = (
-            tables_incoming_etl['size'].sum() if len(tables_incoming_etl) > 0 else 0.0
-        )
-        total_size_incoming = total_size_incoming_bi + total_size_incoming_etl
-
-        tables_tgt_inside_src_outside_all = stream_table_pdf[
-            (stream_table_pdf['from'].isin(streams_in_community))
-            & (~stream_table_pdf['to'].isin(streams_in_community))
-        ][['table', 'from', 'to', 'size']].sort_values('table')
-        tables_tgt_inside_src_outside_unique = tables_tgt_inside_src_outside_all.drop_duplicates(
-            subset=['table']
-        )
-        total_size_outgoing = (
-            tables_tgt_inside_src_outside_unique['size'].sum()
-            if len(tables_tgt_inside_src_outside_unique) > 0
-            else 0.0
-        )
-
-        outgoing_edges = merged_edges_pdf[
-            (merged_edges_pdf['streamA'].isin(streams_in_community))
-            & (~merged_edges_pdf['streamB'].isin(streams_in_community))
-        ]
-        incoming_edges = merged_edges_pdf[
-            (~merged_edges_pdf['streamA'].isin(streams_in_community))
-            & (merged_edges_pdf['streamB'].isin(streams_in_community))
-        ]
-
-        analysis_content = f"""Community {c} Analysis (Resolution γ={resolution})
-{'='*80}
-
-1. STREAMS IN COMMUNITY ({len(streams_list)} total streams, {pct_total:.2f}% of all streams):
-{'-'*80}
-
-1a. BI REPORTS/STREAMS ({len(bi_reports)} streams with 'json' in name, {pct_bi:.2f}% of all BI reports):
-{'-'*80}
-"""
-        if len(bi_reports) > 0:
-            for i, stream in enumerate(bi_reports, 1):
-                complexity = stream_complexity_map.get(stream, 0.0)
-                analysis_content += f"{i}. {stream} (complexity: {complexity:.2f})\n"
-        else:
-            analysis_content += "  (No BI reports/streams found)\n"
-
-        analysis_content += (
-            f"\n1b. ETL STREAMS ({len(etl_streams)} streams without 'json' in name, "
-            f"{pct_etl:.2f}% of all ETL streams):\n{'-'*80}\n"
-        )
-        if len(etl_streams) > 0:
-            for i, stream in enumerate(etl_streams, 1):
-                complexity = stream_complexity_map.get(stream, 0.0)
-                analysis_content += f"{i}. {stream} (complexity: {complexity:.2f})\n"
-        else:
-            analysis_content += "  (No ETL streams found)\n"
-
-        analysis_content += f"""
-2. COMPLEXITY ANALYSIS:
-{'-'*80}
-Total Community Complexity: {total_community_complexity:.2f}
-Percentage of Total Complexity: {pct_complexity:.2f}%
-  - BI Reports Complexity: {total_bi_complexity:.2f}
-  - ETL Streams Complexity: {total_etl_complexity:.2f}
-"""
-
-        analysis_content += f"""
-3. TABLES - SRC OF STREAMS INSIDE, TGT OF STREAMS OUTSIDE:
-{'-'*80}
-These are tables that streams in this community READ FROM, but are WRITTEN BY streams outside.
-(Dependencies flowing INTO the community - SYNC REQUIREMENTS)
-Total: {len(tables_src_inside_tgt_outside_unique)} unique tables, {total_size_incoming:.2f} GB
-  - For BI Reports: {len(tables_incoming_bi)} tables, {total_size_incoming_bi:.2f} GB
-  - For ETL Streams: {len(tables_incoming_etl)} tables, {total_size_incoming_etl:.2f} GB
-Total Instances: {len(tables_src_inside_tgt_outside_all)}\n\n"""
-
-        if len(tables_src_inside_tgt_outside_all) > 0:
-            if len(tables_incoming_bi) > 0:
-                analysis_content += (
-                    f"\n3a. FOR BI REPORTS ({len(tables_incoming_bi)} tables, "
-                    f"{total_size_incoming_bi:.2f} GB):\n{'-'*80}\n"
-                )
-                for table in tables_incoming_bi['table']:
-                    table_instances = tables_incoming_details[
-                        tables_incoming_details['table'] == table
-                    ]
-                    size = table_instances['size'].iloc[0]
-                    producers = sorted(table_instances['from'].unique())
-                    consumers = sorted(table_instances['to'].unique())
-                    analysis_content += f"\n  Table: {table} ({size:.2f} GB)\n"
-                    analysis_content += f"    - Written by (outside): {', '.join(producers)}\n"
-                    analysis_content += f"    - Read by (inside): {', '.join(consumers)}\n"
-            if len(tables_incoming_etl) > 0:
-                analysis_content += (
-                    f"\n3b. FOR ETL STREAMS ({len(tables_incoming_etl)} tables, "
-                    f"{total_size_incoming_etl:.2f} GB):\n{'-'*80}\n"
-                )
-                for table in tables_incoming_etl['table']:
-                    table_instances = tables_incoming_details[
-                        tables_incoming_details['table'] == table
-                    ]
-                    size = table_instances['size'].iloc[0]
-                    producers = sorted(table_instances['from'].unique())
-                    consumers = sorted(table_instances['to'].unique())
-                    analysis_content += f"\n  Table: {table} ({size:.2f} GB)\n"
-                    analysis_content += f"    - Written by (outside): {', '.join(producers)}\n"
-                    analysis_content += f"    - Read by (inside): {', '.join(consumers)}\n"
-        else:
-            analysis_content += "  (No such tables found)\n"
-
-        analysis_content += f"""
-4. TABLES - TGT OF STREAMS INSIDE, SRC OF STREAMS OUTSIDE:
-{'-'*80}
-These are tables that streams in this community WRITE TO, but are READ BY streams outside.
-(Dependencies flowing OUT OF the community)
-Total: {len(tables_tgt_inside_src_outside_unique)} unique tables
-Total Size: {total_size_outgoing:.2f} GB
-Total Instances: {len(tables_tgt_inside_src_outside_all)}\n\n"""
-
-        if len(tables_tgt_inside_src_outside_all) > 0:
-            for table in sorted(tables_tgt_inside_src_outside_unique['table'].unique()):
-                table_instances = tables_tgt_inside_src_outside_all[
-                    tables_tgt_inside_src_outside_all['table'] == table
-                ]
-                size = table_instances['size'].iloc[0]
-                producers = sorted(table_instances['from'].unique())
-                consumers = sorted(table_instances['to'].unique())
-                analysis_content += f"\n  Table: {table} ({size:.2f} GB)\n"
-                analysis_content += f"    - Written by (inside): {', '.join(producers)}\n"
-                analysis_content += f"    - Read by (outside): {', '.join(consumers)}\n"
-        else:
-            analysis_content += "  (No such tables found)\n"
-
-        analysis_content += f"""
-5. AGGREGATED STREAM CONNECTIONS:
-{'-'*80}
-
-5a. Outgoing Stream Connections (Inside → Outside):
-"""
-        if len(outgoing_edges) > 0:
-            analysis_content += f"Total: {len(outgoing_edges)} connections\n\n"
-            for _, row in outgoing_edges.iterrows():
-                analysis_content += f"  {row['streamA']} → {row['streamB']} (weight: {row['weight']})\n"
-        else:
-            analysis_content += "  (No outgoing connections)\n"
-
-        analysis_content += "\n5b. Incoming Stream Connections (Outside → Inside):\n"
-        if len(incoming_edges) > 0:
-            analysis_content += f"Total: {len(incoming_edges)} connections\n\n"
-            for _, row in incoming_edges.iterrows():
-                analysis_content += f"  {row['streamA']} → {row['streamB']} (weight: {row['weight']})\n"
-        else:
-            analysis_content += "  (No incoming connections)\n"
-
-        analysis_content += f"""
-6. SUMMARY:
-{'-'*80}
-  - Total streams in community: {len(streams_list)} ({pct_total:.2f}% of {total_streams_global} total streams)
-    * BI Reports/Streams (with 'json'): {len(bi_reports)} ({pct_bi:.2f}% of {total_bi_reports_global} total BI reports)
-    * ETL Streams (without 'json'): {len(etl_streams)} ({pct_etl:.2f}% of {total_etl_streams_global} total ETL streams)
-  - Total Community Complexity: {total_community_complexity:.2f} ({pct_complexity:.2f}% of total complexity)
-    * BI Reports Complexity: {total_bi_complexity:.2f}
-    * ETL Streams Complexity: {total_etl_complexity:.2f}
-  - Tables flowing INTO community (SYNC REQUIREMENTS): {len(tables_src_inside_tgt_outside_unique)} unique tables, {total_size_incoming:.2f} GB
-    * For BI Reports: {len(tables_incoming_bi)} tables, {total_size_incoming_bi:.2f} GB
-    * For ETL Streams: {len(tables_incoming_etl)} tables, {total_size_incoming_etl:.2f} GB
-    * Total instances: {len(tables_src_inside_tgt_outside_all)}
-  - Tables flowing OUT OF community: {len(tables_tgt_inside_src_outside_unique)} unique tables, {total_size_outgoing:.2f} GB ({len(tables_tgt_inside_src_outside_all)} total instances)
-  - Aggregated outgoing stream connections: {len(outgoing_edges)}
-  - Aggregated incoming stream connections: {len(incoming_edges)}
-"""
-
-        analysis_file = os.path.join(comm_dir, f"community_{c}_analysis.txt")
-        with open(analysis_file, 'w') as f:
-            f.write(analysis_content)
-        print(f"  Saved analysis: {analysis_file}")
-        saved_files.append(analysis_file)
-
-        # ---- PLOTTING (only if enabled) ----
-        if enable_plotting:
-            pos = {n: pos_global[n] for n in h_graph.nodes() if n in pos_global}
-
-            missing = [n for n in h_graph.nodes() if n not in pos]
-            if missing:
-                pos_local = nx.spring_layout(
-                    h_graph, seed=layout_seed, k=layout_k, iterations=20
-                )
-                for n in missing:
-                    pos[n] = pos_local[n]
-
-            widths, alphas = edge_style(h_graph, weight_attr=weight_attr)
-
-            plt.figure(figsize=figsize, dpi=dpi)
-
-            nx.draw_networkx_nodes(
-                h_graph, pos,
-                node_size=node_size,
-                node_color=[c] * h_graph.number_of_nodes(),
-                cmap=cmap,
+        for (u, v), lw, a in zip(h_graph.edges(), widths, alphas):
+            nx.draw_networkx_edges(
+                h_graph, pos, edgelist=[(u, v)], width=float(lw), alpha=float(a)
             )
 
-            for (u, v), lw, a in zip(h_graph.edges(), widths, alphas):
-                nx.draw_networkx_edges(
-                    h_graph, pos, edgelist=[(u, v)], width=float(lw), alpha=float(a)
-                )
-
-            label_nodes = [n for n in h_graph.nodes() if n in pos]
-            if len(label_nodes) <= max_labels:
-                labels = {n: n for n in label_nodes}
-                nx.draw_networkx_labels(h_graph, pos, labels=labels, font_size=font_size)
-            else:
-                subset = label_nodes[:max_labels]
-                labels = {n: n for n in subset}
-                nx.draw_networkx_labels(h_graph, pos, labels=labels, font_size=font_size)
-
-            plt.title(
-                f"Community {c} — nodes={h_graph.number_of_nodes()} "
-                f"edges={h_graph.number_of_edges()}",
-                fontsize=16,
-            )
-            plt.axis("off")
-            plt.tight_layout()
-
-            if save:
-                plot_file = os.path.join(comm_dir, f"{filename_prefix}_{c}.png")
-                plt.savefig(plot_file, bbox_inches="tight")
-                saved_files.append(plot_file)
-
-            if show:
-                plt.show()
-            else:
-                plt.close()
+        label_nodes = [n for n in h_graph.nodes() if n in pos]
+        if len(label_nodes) <= max_labels:
+            labels = {n: n for n in label_nodes}
+            nx.draw_networkx_labels(h_graph, pos, labels=labels, font_size=font_size)
         else:
-            print(f"  Skipping plot generation (enable_plotting=False)")
+            subset = label_nodes[:max_labels]
+            labels = {n: n for n in subset}
+            nx.draw_networkx_labels(h_graph, pos, labels=labels, font_size=font_size)
+
+        plt.title(
+            f"Community {c} — nodes={h_graph.number_of_nodes()} "
+            f"edges={h_graph.number_of_edges()}",
+            fontsize=16,
+        )
+        plt.axis("off")
+        plt.tight_layout()
+
+        if save:
+            plot_file = os.path.join(comm_dir, f"{filename_prefix}_{c}.png")
+            plt.savefig(plot_file, bbox_inches="tight")
+            saved_files.append(plot_file)
+
+        if show:
+            plt.show()
+        else:
+            plt.close()
 
     return saved_files

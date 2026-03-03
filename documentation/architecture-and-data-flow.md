@@ -81,12 +81,21 @@ src/migration_planner/
 │   │                           form_stream_stream_dependencies()
 │   │                           merge_bidirectional_edges()
 │   │                           preprocess_stream_dependencies()  ← pipeline entry
+│   │                               returns (dependency_df, unique_weights_df, merged_df)
 │   │
-│   └── weights.py              calculate_table_weights()  ← dispatcher
-│                               _calculate_factor_weights()
-│                               _calculate_scaled_weights()
-│                               deduplicate_table_weights()
-│                               aggregate_edge_weights()
+│   ├── weights.py              calculate_table_weights()  ← dispatcher
+│   │                           _calculate_factor_weights()
+│   │                           _calculate_scaled_weights()
+│   │                           deduplicate_table_weights()
+│   │                           aggregate_edge_weights()
+│   │
+│   └── analysis.py             membership_to_leiden_df()
+│                               get_leiden_df()
+│                               split_communities_topN()
+│                               BruteForceCommunityOrdering  ← brute-force ordering
+│                               append_execution_metadata()
+│                               generate_community_analysis()  ← per-community reports
+│                               generate_migration_order_analysis()
 │
 ├── visualization/
 │   └── community_plots.py      select_resolutions()
@@ -95,6 +104,7 @@ src/migration_planner/
 │                               plot_leiden_resolutions()
 │                               edge_style()
 │                               plot_communities_with_analysis_safe()
+│                                   → delegates analysis to planner_core/analysis.py
 │
 └── community_detector/
     ├── graph_builder.py        find_isolated_streams()
@@ -106,10 +116,6 @@ src/migration_planner/
     │                           scan_resolutions()
     │
     └── leiden.py               Databricks notebook orchestrator
-                                membership_to_leiden_df()
-                                get_leiden_df()
-                                Community ordering optimization
-                                Execution metadata logging
 ```
 
 ---
@@ -398,7 +404,13 @@ The output `summary` DataFrame has one row per resolution; `rep_by_res` maps eac
 
 ### Stage 10 — Community Analysis
 
-**Function:** `visualization/community_plots.py / plot_communities_with_analysis_safe()`
+**Function:** `planner_core/analysis.py / generate_community_analysis()`
+**Called from:** `visualization/community_plots.py / plot_communities_with_analysis_safe()`
+
+`plot_communities_with_analysis_safe` converts the three Spark DataFrames to
+pandas once (via `.toPandas()`) and then delegates all analysis text-file
+writing to `generate_community_analysis`, which accepts pre-computed pandas
+DataFrames and performs no Spark operations.
 
 For each chosen resolution and each community:
 
@@ -406,7 +418,7 @@ For each chosen resolution and each community:
 leiden_df (stream → community_id)
   │
   ├── Separate BI reports (stream contains "json") vs ETL streams
-  ├── Calculate complexity scores from complexity_scores_df
+  ├── Calculate complexity scores from complexity_pdf (pandas)
   │
   ├── Incoming tables:  stream_table_pdf WHERE (from ∉ community AND to ∈ community)
   │   → tables produced outside, consumed inside → SYNC REQUIREMENTS
@@ -430,7 +442,7 @@ The analysis text file contains six sections:
 
 ### Stage 11 — Community Ordering Optimization
 
-**Class:** `leiden.py / BruteForceCommunityOrdering`
+**Class:** `planner_core/analysis.py / BruteForceCommunityOrdering`
 
 Finds the migration sequence that minimizes total data synchronization cost. The search space grows factorially with the number of communities, so it is split into two parts:
 
@@ -465,18 +477,22 @@ The cost naturally penalizes both large numbers of tables and large table sizes.
 
 ## Key Design Decisions
 
-### Two DataFrames returned from preprocessing
+### Three DataFrames returned from preprocessing
 
-`preprocess_stream_dependencies()` returns a tuple `(dependency_df, merged_dependency_df)`:
+`preprocess_stream_dependencies()` returns a 3-tuple
+`(dependency_df, unique_weights_df, merged_dependency_df)`:
 
 - `dependency_df` — filtered and normalized stream-table dependency table. Needed by `find_isolated_streams()` to enumerate all streams, including those with no cross-stream dependencies.
+- `unique_weights_df` — deduplicated stream-stream-table weight table (columns: `from`, `to`, `table`, `weight`). Consumed by `split_communities_topN()` and `BruteForceCommunityOrdering` without recomputation.
 - `merged_dependency_df` — weighted, undirected edge list. Used directly for graph construction.
 
-Returning both avoids a redundant re-computation of the filtered dependency table after graph building.
+Returning all three avoids redundant recomputation further down the pipeline.
 
-### PySpark only in preprocessing and weights
+### PySpark only in preprocessing, weights, and split_communities_topN
 
-The Spark DataFrame API is used for all preprocessing and weight calculation steps (Stages 2–7) to allow distributed execution on large dependency tables. The graph itself is collected into memory as a pandas DataFrame and passed to igraph, which runs on the driver node.
+The Spark DataFrame API is used for all preprocessing and weight calculation steps (Stages 2–7) and for `split_communities_topN` (which joins the leiden assignment back to the weight table) to allow distributed execution on large dependency tables. The graph itself is collected into memory as a pandas DataFrame and passed to igraph, which runs on the driver node.
+
+All functions in `planner_core/analysis.py` that deal with per-community reports (`generate_community_analysis`, `generate_migration_order_analysis`, `BruteForceCommunityOrdering`) receive pre-converted pandas DataFrames and perform no Spark operations.
 
 ### Plain class for test stubs, not MagicMock
 
@@ -508,6 +524,9 @@ leiden.py (orchestrator)
   │     └── (no internal imports)
   │
   ├── planner_core/
+  │     ├── analysis.py
+  │     │     └── (no internal imports from this package)
+  │     │
   │     ├── preprocessing.py
   │     │     └── imports: planner_core/weights.py
   │     │
@@ -515,7 +534,7 @@ leiden.py (orchestrator)
   │           └── (no internal imports from this package)
   │
   ├── visualization/community_plots.py
-  │     └── (no internal imports from this package)
+  │     └── imports: planner_core/analysis.py (generate_community_analysis)
   │
   └── community_detector/
         ├── graph_builder.py
@@ -525,4 +544,4 @@ leiden.py (orchestrator)
               └── (no internal imports from this package)
 ```
 
-All modules depend only downward; there are no circular imports. Within `planner_core/`, `preprocessing.py` imports from `weights.py`. `leiden.py` imports from `planner_core/` for domain-specific preprocessing and weight calculation, and from `visualization/community_plots.py` for all plotting operations.
+All modules depend only downward; there are no circular imports. Within `planner_core/`, `preprocessing.py` imports from `weights.py`. `visualization/community_plots.py` imports `generate_community_analysis` from `planner_core/analysis.py` to delegate text-file writing. `leiden.py` imports from `planner_core/` for all analysis and ordering functions, and from `visualization/community_plots.py` for plotting.
