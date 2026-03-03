@@ -1,0 +1,9 @@
+# Migration Planner - Community Detection Config
+volume_name: /Volumes/odp_adw_mvp_n/migration/utilities/community_detection/
+input_dependency_name: ETL-table-dependencies_20251223_1218.csv
+outofscope_stream_file_name: out-of-scopte-streams.csv
+report_dependency_file_name: stream_to_report_mapping_new.csv
+table_size_file_name: table-space-in-gb_20251201_1352.csv
+complexity_file_name: Complexity_by_Stream.csv
+static_tables_file_name: static_tables_for_report.csv
+# weight_method: factor   # Options: "factor" (default) or "scaled"
