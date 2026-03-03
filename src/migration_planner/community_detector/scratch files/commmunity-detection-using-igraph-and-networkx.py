@@ -18,7 +18,6 @@ Image("../input/image-community/Community.jpeg")  # https://healthcommcapacity.o
 # COMMAND ----------
 
 
-
 # COMMAND ----------
 
 dbutils.library.restartPython()
