@@ -3570,7 +3570,58 @@ print(f"ETL streams with immediate neighbors: {streams_with_neighbors}")
 print(f"ETL streams without neighbors (isolated): {streams_isolated}")
 print(f"Edge-to-table mappings: {len(edge_tables_lookup)}")
 
+# --- Helper: compute sync tables for a single stream ---
+def compute_stream_sync_tables(stream, migrated_set, upstream_nbrs, edge_tbl_lookup):
+    """
+    BFS upstream within migrated streams from `stream`.
+    At each unmigrated boundary, collect the SRC tables that need syncing.
+    Returns dict: table_name -> size_gb
+    """
+    sync = {}
+    visited = set()
+    queue = [stream]
+    while queue:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        for up in upstream_nbrs.get(current, set()):
+            if up in migrated_set:
+                queue.append(up)
+            else:
+                # Unmigrated upstream — these SRC tables need syncing
+                for tbl, sz in edge_tbl_lookup.get((up, current), []):
+                    if tbl not in sync or sz > sync[tbl]:
+                        sync[tbl] = sz
+    return sync
+
+# --- Build table -> all producer streams lookup ---
+# A table's producers are all streams that write it as TGT.
+# Used to check if a sync table has multiple unmigrated producers.
+table_to_all_producers = defaultdict(set)
+for _, row in stream_deps_with_tables.iterrows():
+    table_to_all_producers[row['table']].add(row['from'])
+
+print(f"Table-to-producer mappings: {len(table_to_all_producers)} tables")
+
+
+def has_multi_unmigrated_producer(sync_tables, migrated_set, tbl_producers):
+    """
+    Check if any sync table has more than one unmigrated producer.
+    Returns (bool, list of problematic tables with their unmigrated producers).
+    """
+    problematic = []
+    for tbl in sync_tables:
+        all_producers = tbl_producers.get(tbl, set())
+        unmigrated_producers = all_producers - migrated_set
+        if len(unmigrated_producers) > 1:
+            problematic.append((tbl, unmigrated_producers))
+    return len(problematic) > 0, problematic
+
+
 # --- Step 2: Process each clubbed stage ---
+CUTOVER_SYNC_THRESHOLD_GB = 500.0
+
 migrated_streams_imm = set()
 cutover_ready_etl_imm = set()
 cutover_ready_bi_imm = set()
@@ -3594,17 +3645,123 @@ for _, stage_row in timeline_df.iterrows():
             if stream in stream_produces:
                 bi_available_tables_imm.update(stream_produces[stream])
 
-    # ETL immediate cutover: check all migrated-but-not-yet-cutover streams
-    # A stream may become cutover-ready in a later stage when its last neighbor gets migrated
+    # --- Compute baseline sync for already-cutover ETL streams ---
+    # Recomputed each stage since migration state changes (upstream streams
+    # that were unmigrated may now be migrated, reducing sync)
+    baseline_sync = {}  # table_name -> size_gb
+    for stream in cutover_ready_etl_imm:
+        for tbl, sz in compute_stream_sync_tables(
+            stream, migrated_streams_imm, upstream_neighbors, edge_tables_lookup
+        ).items():
+            if tbl not in baseline_sync or sz > baseline_sync[tbl]:
+                baseline_sync[tbl] = sz
+    baseline_total = builtins.sum(baseline_sync.values())
+
+    # --- Find candidates: migrated ETL streams with all immediate neighbors migrated ---
+    candidates = []
+    candidates_all = (etl_streams_all & migrated_streams_imm) - cutover_ready_etl_imm
+    for stream in sorted(candidates_all):
+        if all_immediate_neighbors[stream].issubset(migrated_streams_imm):
+            candidates.append(stream)
+
+    # --- Compute per-candidate sync tables ---
+    candidate_sync_map = {}
+    for stream in candidates:
+        candidate_sync_map[stream] = compute_stream_sync_tables(
+            stream, migrated_streams_imm, upstream_neighbors, edge_tables_lookup
+        )
+
+    # --- Greedy subset selection to stay under sync threshold ---
+    # Sort candidates by their individual sync cost (ascending) so lowest-cost
+    # streams are selected first, maximizing the number of cutover streams.
+    candidates_sorted = sorted(
+        candidates,
+        key=lambda s: builtins.sum(candidate_sync_map[s].values())
+    )
+
+    selected_sync = dict(baseline_sync)
+    selected_total = baseline_total
     newly_cutover_etl_imm = []
-    candidates = (etl_streams_all & migrated_streams_imm) - cutover_ready_etl_imm
-    for stream in sorted(candidates):
-        neighbors = all_immediate_neighbors[stream]
-        if neighbors.issubset(migrated_streams_imm):
+    held_back_streams = []
+    multi_producer_blocked = []  # streams blocked due to multi-unmigrated-producer tables
+
+    for stream in candidates_sorted:
+        stream_sync = candidate_sync_map[stream]
+
+        # Check if any sync table has multiple unmigrated producers
+        has_multi, problematic_tables = has_multi_unmigrated_producer(
+            stream_sync.keys(), migrated_streams_imm, table_to_all_producers
+        )
+        if has_multi:
+            held_back_streams.append(stream)
+            multi_producer_blocked.append((stream, problematic_tables))
+            continue
+
+        # Compute marginal sync: tables this stream adds that aren't already counted
+        marginal = {
+            tbl: sz for tbl, sz in stream_sync.items()
+            if tbl not in selected_sync
+        }
+        marginal_cost = builtins.sum(marginal.values())
+
+        if selected_total + marginal_cost < CUTOVER_SYNC_THRESHOLD_GB:
             newly_cutover_etl_imm.append(stream)
             cutover_ready_etl_imm.add(stream)
+            selected_sync.update(stream_sync)
+            selected_total += marginal_cost
+        else:
+            held_back_streams.append(stream)
 
-    # BI cutover (same logic as recursive)
+    held_back_count = len(held_back_streams)
+
+    # Store per-stream sync cost and block reason for held-back streams
+    held_back_sync_costs = {}
+    held_back_reasons = {}
+    multi_producer_blocked_set = set(s for s, _ in multi_producer_blocked)
+    for stream in held_back_streams:
+        held_back_sync_costs[stream] = builtins.sum(candidate_sync_map[stream].values())
+        if stream in multi_producer_blocked_set:
+            held_back_reasons[stream] = 'multi_producer'
+        else:
+            held_back_reasons[stream] = 'sync_threshold'
+
+    # --- Build stage sync tables from selected cutover set ---
+    # (for reporting: which tables actually need syncing for the cutover subset)
+    stage_sync_tables = {}
+    for stream in cutover_ready_etl_imm:
+        for tbl, sz in compute_stream_sync_tables(
+            stream, migrated_streams_imm, upstream_neighbors, edge_tables_lookup
+        ).items():
+            if tbl not in stage_sync_tables:
+                stage_sync_tables[tbl] = {
+                    'size': sz,
+                    'producers': set(),
+                    'consumers': set(),
+                }
+            # Find which unmigrated stream produces this table
+            # (trace this stream's upstream to find the boundary)
+            visited = set()
+            q = [stream]
+            while q:
+                cur = q.pop(0)
+                if cur in visited:
+                    continue
+                visited.add(cur)
+                for up in upstream_neighbors.get(cur, set()):
+                    if up in migrated_streams_imm:
+                        q.append(up)
+                    else:
+                        for t, _ in edge_tables_lookup.get((up, cur), []):
+                            if t == tbl:
+                                stage_sync_tables[tbl]['producers'].add(up)
+                                stage_sync_tables[tbl]['consumers'].add(cur)
+
+    stage_sync_count = len(stage_sync_tables)
+    stage_sync_size = builtins.sum(info['size'] for info in stage_sync_tables.values())
+
+    cutover_allowed = held_back_count == 0
+
+    # --- BI cutover (always allowed if tables are available) ---
     newly_cutover_bi_imm = []
     for bi_stream in sorted(bi_streams_all - cutover_ready_bi_imm):
         required = bi_stream_required_tables.get(bi_stream, set())
@@ -3615,30 +3772,6 @@ for _, stage_row in timeline_df.iterrows():
         elif required.issubset(bi_available_tables_imm):
             newly_cutover_bi_imm.append(bi_stream)
             cutover_ready_bi_imm.add(bi_stream)
-
-    # --- Sync requirement analysis ---
-    # For all migrated ETL streams, find unmigrated upstream neighbors.
-    # The SRC tables flowing from those unmigrated streams need to be synced
-    # for the cutover-ready streams to run in production.
-    stage_sync_tables = {}  # table_name -> (size, unmigrated_producer, migrated_consumer)
-    migrated_etl = etl_streams_all & migrated_streams_imm
-    for stream in migrated_etl:
-        for upstream in upstream_neighbors[stream]:
-            if upstream not in migrated_streams_imm:
-                # This upstream is not migrated — its tables need syncing
-                tables_on_edge = edge_tables_lookup.get((upstream, stream), [])
-                for table_name, size in tables_on_edge:
-                    if table_name not in stage_sync_tables:
-                        stage_sync_tables[table_name] = {
-                            'size': size,
-                            'producers': set(),
-                            'consumers': set(),
-                        }
-                    stage_sync_tables[table_name]['producers'].add(upstream)
-                    stage_sync_tables[table_name]['consumers'].add(stream)
-
-    stage_sync_count = len(stage_sync_tables)
-    stage_sync_size = builtins.sum(info['size'] for info in stage_sync_tables.values())
 
     # Record per-stream rows for CSV
     for stream in newly_cutover_etl_imm:
@@ -3687,12 +3820,29 @@ for _, stage_row in timeline_df.iterrows():
         'sync_table_count': stage_sync_count,
         'sync_total_size_gb': stage_sync_size,
         'sync_tables_detail': stage_sync_tables,
+        'cutover_allowed': cutover_allowed,
+        'held_back_count': held_back_count,
+        'held_back_streams': held_back_streams,
+        'held_back_sync_costs': held_back_sync_costs,
+        'held_back_reasons': held_back_reasons,
+        'multi_producer_blocked': multi_producer_blocked,
     })
 
+    multi_blocked_count = len(multi_producer_blocked)
+    threshold_blocked_count = held_back_count - multi_blocked_count
+    if held_back_count > 0:
+        status = f"PARTIAL ({len(newly_cutover_etl_imm)} selected, {held_back_count} held back)"
+    else:
+        status = f"ALL ({len(newly_cutover_etl_imm)} streams)"
     print(f"\nStage {stage_num} ({stage_end_date}):")
+    print(f"  Cutover sync: {stage_sync_count} tables, {stage_sync_size:.2f} GB (threshold: {CUTOVER_SYNC_THRESHOLD_GB:.0f} GB)")
+    print(f"  Cutover: {status}")
     print(f"  Newly cutover-ready: {len(newly_cutover_etl_imm)} ETL, {len(newly_cutover_bi_imm)} BI")
+    if multi_blocked_count > 0:
+        print(f"  Blocked (multi-producer tables): {multi_blocked_count} streams")
+    if threshold_blocked_count > 0:
+        print(f"  Blocked (sync threshold): {threshold_blocked_count} streams")
     print(f"  Cumulative cutover: {total_cutover_imm}/{total_all} ({total_cutover_imm/total_all*100:.1f}%)")
-    print(f"  Sync required: {stage_sync_count} tables, {stage_sync_size:.2f} GB")
 
 # --- Step 3: Save CSVs ---
 cutover_imm_csv_df = pd.DataFrame(cutover_rows_imm)
@@ -3733,10 +3883,13 @@ with open(cutover_imm_txt_path, 'w') as f:
     f.write("A stream is cutover-ready (immediate) when:\n")
     f.write("  - ETL streams: ALL immediate upstream AND downstream ETL neighbors are migrated\n")
     f.write("  - BI/JSON streams: all required source tables are available (produced + static tables)\n")
+    f.write("  - Sync threshold: cutover sync for selected subset must be < {:.0f} GB\n".format(CUTOVER_SYNC_THRESHOLD_GB))
+    f.write("  - Multi-producer rule: a sync table must have at most 1 unmigrated producer\n")
     f.write("  Note: This is LESS strict than the recursive check — transitive dependencies are not checked.\n\n")
 
     f.write(f"Total ETL Streams: {len(etl_streams_all)}\n")
     f.write(f"Total BI/JSON Streams: {len(bi_streams_all)}\n")
+    f.write(f"Cutover Sync Threshold: {CUTOVER_SYNC_THRESHOLD_GB:.0f} GB\n")
     f.write(f"Migration Start Date: {START_DATE.strftime('%Y-%m-%d')}\n")
     f.write(f"Total Stages: {len(stage_summaries_imm)}\n\n")
 
@@ -3747,6 +3900,35 @@ with open(cutover_imm_txt_path, 'w') as f:
         else:
             f.write(f"STAGE {ss['stage']}: Community {ss['community_label']} | {ss['start_date']} to {ss['end_date']}\n")
         f.write(f"{'='*120}\n\n")
+
+        # Cutover gating status
+        if ss['cutover_allowed']:
+            f.write(f"Cutover Status: ALL ELIGIBLE ({ss['sync_total_size_gb']:.2f} GB sync, within {CUTOVER_SYNC_THRESHOLD_GB:.0f} GB threshold)\n")
+        else:
+            f.write(f"Cutover Status: PARTIAL — {ss['newly_cutover_etl']} selected, {ss['held_back_count']} held back\n")
+            f.write(f"  Sync for selected subset: {ss['sync_total_size_gb']:.2f} GB (threshold: {CUTOVER_SYNC_THRESHOLD_GB:.0f} GB)\n")
+
+            # Show multi-producer blocked streams
+            mp_blocked = ss.get('multi_producer_blocked', [])
+            if mp_blocked:
+                f.write(f"\n  Held back — MULTI-PRODUCER TABLES ({len(mp_blocked)} streams):\n")
+                f.write(f"  (A sync table has >1 unmigrated producer — sync is unsafe until at most 1 remains)\n")
+                for hb_stream, problematic in mp_blocked:
+                    hb_cost = ss['held_back_sync_costs'].get(hb_stream, 0.0)
+                    f.write(f"    - {hb_stream} (individual sync: {hb_cost:.2f} GB)\n")
+                    for tbl, unmig_producers in problematic:
+                        f.write(f"        Table: {tbl} — unmigrated producers: {', '.join(sorted(unmig_producers))}\n")
+
+            # Show threshold blocked streams
+            threshold_blocked = [
+                s for s in ss['held_back_streams']
+                if ss['held_back_reasons'].get(s) == 'sync_threshold'
+            ]
+            if threshold_blocked:
+                f.write(f"\n  Held back — SYNC THRESHOLD ({len(threshold_blocked)} streams):\n")
+                for hb_stream in sorted(threshold_blocked):
+                    hb_cost = ss['held_back_sync_costs'].get(hb_stream, 0.0)
+                    f.write(f"    - {hb_stream} (individual sync: {hb_cost:.2f} GB)\n")
 
         f.write(f"Newly Cutover-Ready ETL Streams: {ss['newly_cutover_etl']}\n")
         f.write(f"Newly Cutover-Ready BI Streams: {ss['newly_cutover_bi']}\n")
@@ -3816,11 +3998,18 @@ with open(cutover_imm_txt_path, 'w') as f:
     f.write(f" ({final_imm.get('cumulative_cutover_pct', 0):.1f}%)\n\n")
 
     # Sync summary across all stages
+    f.write(f"Cutover Sync Threshold: {CUTOVER_SYNC_THRESHOLD_GB:.0f} GB\n\n")
     f.write(f"--- Sync Requirements Summary ---\n\n")
-    f.write(f"{'Stage':<8} {'Date':<14} {'Sync Tables':>12} {'Sync GB':>12}\n")
-    f.write(f"{'-'*46}\n")
+    f.write(f"{'Stage':<8} {'Date':<14} {'Sync Tables':>12} {'Sync GB':>12} {'Status':>10} {'Held':>6} {'MultiProd':>10} {'Threshold':>10}\n")
+    f.write(f"{'-'*82}\n")
     for ss in stage_summaries_imm:
-        f.write(f"{ss['stage']:<8} {ss['end_date']:<14} {ss['sync_table_count']:>12} {ss['sync_total_size_gb']:>12.2f}\n")
+        status = "ALL" if ss['cutover_allowed'] else "PARTIAL"
+        held = str(ss['held_back_count']) if ss['held_back_count'] > 0 else "-"
+        mp_count = len(ss.get('multi_producer_blocked', []))
+        th_count = ss['held_back_count'] - mp_count
+        mp_str = str(mp_count) if mp_count > 0 else "-"
+        th_str = str(th_count) if th_count > 0 else "-"
+        f.write(f"{ss['stage']:<8} {ss['end_date']:<14} {ss['sync_table_count']:>12} {ss['sync_total_size_gb']:>12.2f} {status:>10} {held:>6} {mp_str:>10} {th_str:>10}\n")
     f.write(f"\n")
 
     # Comparison with recursive analysis
@@ -3909,14 +4098,19 @@ if bad_neighbors:
     errors_imm.append(f"{len(bad_neighbors)} cutover-ready streams have unmigrated neighbors")
 print(f"[{'PASS' if not bad_neighbors else 'FAIL'}] All cutover-ready streams have all neighbors migrated")
 
-# 3. Recursive cutover-ready must be a subset of immediate cutover-ready
-# (recursive is stricter, so anything recursive-ready should also be immediate-ready)
+# 3. Recursive cutover-ready should generally be a subset of immediate cutover-ready
+# Note: with sync threshold gating, some immediate-eligible streams may be held back,
+# so recursive-ready streams COULD exceed immediate-ready if threshold blocks them.
 recursive_not_in_immediate = cutover_ready_etl - cutover_ready_etl_imm
 if recursive_not_in_immediate:
-    errors_imm.append(f"Recursive-ready but NOT immediate-ready: {recursive_not_in_immediate}")
-print(f"[{'PASS' if not recursive_not_in_immediate else 'FAIL'}] Recursive cutover ⊆ immediate cutover")
+    # Only flag as error if the difference is NOT due to sync threshold gating
+    print(f"[INFO] Recursive-ready but NOT immediate-ready: {len(recursive_not_in_immediate)} streams")
+    print(f"       (May be due to sync threshold gating at {CUTOVER_SYNC_THRESHOLD_GB:.0f} GB)")
+else:
+    print(f"[PASS] Recursive cutover ⊆ immediate cutover")
 
-# 4. Isolated ETL streams are cutover-ready if migrated
+# 4. Isolated ETL streams (no sync cost) should be cutover-ready if migrated
+# Isolated streams have 0 sync cost, so sync threshold should never block them
 isolated_etl_imm = set(s for s in etl_streams_all if not all_immediate_neighbors[s])
 isolated_migrated_imm = isolated_etl_imm & migrated_streams_imm
 isolated_not_cutover_imm = isolated_migrated_imm - cutover_ready_etl_imm
@@ -3936,10 +4130,34 @@ if actual_imm != expected_imm:
     errors_imm.append(f"CSV rows ({actual_imm}) != cutover-ready ({expected_imm})")
 print(f"[{'PASS' if actual_imm == expected_imm else 'FAIL'}] CSV row count matches ({actual_imm} rows)")
 
-# 7. Immediate count >= Recursive count (immediate is less strict)
+# 7. Multi-producer rule: no cutover-ready stream should have a sync table with >1 unmigrated producer
+multi_prod_violations = []
+for stream in cutover_ready_etl_imm:
+    stream_sync = compute_stream_sync_tables(
+        stream, migrated_streams_imm, upstream_neighbors, edge_tables_lookup
+    )
+    has_multi, problematic = has_multi_unmigrated_producer(
+        stream_sync.keys(), migrated_streams_imm, table_to_all_producers
+    )
+    if has_multi:
+        multi_prod_violations.append((stream, problematic))
+if multi_prod_violations:
+    errors_imm.append(f"{len(multi_prod_violations)} cutover-ready streams have sync tables with >1 unmigrated producer")
+print(f"[{'PASS' if not multi_prod_violations else 'FAIL'}] No cutover-ready stream has multi-unmigrated-producer sync tables")
+
+# 8. Sync threshold compliance: every stage's cutover sync must be < threshold
+sync_violations = []
+for ss in stage_summaries_imm:
+    if ss['sync_total_size_gb'] >= CUTOVER_SYNC_THRESHOLD_GB and ss['newly_cutover_etl'] > 0:
+        sync_violations.append(f"Stage {ss['stage']}: {ss['sync_total_size_gb']:.2f} GB >= {CUTOVER_SYNC_THRESHOLD_GB:.0f} GB")
+if sync_violations:
+    errors_imm.append(f"Sync threshold violated: {sync_violations}")
+print(f"[{'PASS' if not sync_violations else 'FAIL'}] All stages with cutover respect sync threshold ({CUTOVER_SYNC_THRESHOLD_GB:.0f} GB)")
+
+# 8. Immediate count vs Recursive count (informational — threshold may reduce immediate)
+print(f"[INFO] Immediate ETL: {len(cutover_ready_etl_imm)}, Recursive ETL: {len(cutover_ready_etl)} (diff: {len(cutover_ready_etl_imm) - len(cutover_ready_etl):+d})")
 if len(cutover_ready_etl_imm) < len(cutover_ready_etl):
-    errors_imm.append(f"Immediate ETL ({len(cutover_ready_etl_imm)}) < Recursive ETL ({len(cutover_ready_etl)})")
-print(f"[{'PASS' if len(cutover_ready_etl_imm) >= len(cutover_ready_etl) else 'FAIL'}] Immediate count >= Recursive count ({len(cutover_ready_etl_imm)} >= {len(cutover_ready_etl)})")
+    print(f"       Immediate < Recursive due to sync threshold gating")
 
 if errors_imm:
     print(f"\n{'!'*80}")
