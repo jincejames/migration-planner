@@ -3521,6 +3521,12 @@ print("="*100)
 
 stream_deps_directed = stream_stream_dependency_df.select("from", "to").distinct().toPandas()
 
+# Also collect full dependency info with table names and sizes for sync analysis
+stream_deps_with_tables = stream_stream_dependency_df.select(
+    "from", "to", "table", "size"
+).distinct().toPandas()
+stream_deps_with_tables['size'] = pd.to_numeric(stream_deps_with_tables['size'], errors='coerce').fillna(0.0)
+
 # Filter to ETL-only edges
 etl_directed = stream_deps_directed[
     ~stream_deps_directed['from'].str.lower().str.contains('json') &
@@ -3536,6 +3542,21 @@ for _, row in etl_directed.iterrows():
         upstream_neighbors[tgt].add(src)
         downstream_neighbors[src].add(tgt)
 
+# Build lookup: for a given (upstream_producer, downstream_consumer) pair,
+# which SRC tables flow between them and what are their sizes?
+# Key: (from_stream, to_stream) -> list of (table_name, size_gb)
+edge_tables_lookup = defaultdict(list)
+for _, row in stream_deps_with_tables.iterrows():
+    edge_tables_lookup[(row['from'], row['to'])].append((row['table'], row['size']))
+
+# Deduplicate tables per edge (keep max size per table)
+for key in edge_tables_lookup:
+    tables_dict = {}
+    for table, size in edge_tables_lookup[key]:
+        if table not in tables_dict or size > tables_dict[table]:
+            tables_dict[table] = size
+    edge_tables_lookup[key] = [(t, s) for t, s in tables_dict.items()]
+
 # All immediate neighbors (union of upstream + downstream)
 all_immediate_neighbors = defaultdict(set)
 for stream in etl_streams_all:
@@ -3547,6 +3568,7 @@ streams_isolated = len(etl_streams_all) - streams_with_neighbors
 print(f"Directed ETL edges: {len(etl_directed)}")
 print(f"ETL streams with immediate neighbors: {streams_with_neighbors}")
 print(f"ETL streams without neighbors (isolated): {streams_isolated}")
+print(f"Edge-to-table mappings: {len(edge_tables_lookup)}")
 
 # --- Step 2: Process each clubbed stage ---
 migrated_streams_imm = set()
@@ -3594,6 +3616,30 @@ for _, stage_row in timeline_df.iterrows():
             newly_cutover_bi_imm.append(bi_stream)
             cutover_ready_bi_imm.add(bi_stream)
 
+    # --- Sync requirement analysis ---
+    # For all migrated ETL streams, find unmigrated upstream neighbors.
+    # The SRC tables flowing from those unmigrated streams need to be synced
+    # for the cutover-ready streams to run in production.
+    stage_sync_tables = {}  # table_name -> (size, unmigrated_producer, migrated_consumer)
+    migrated_etl = etl_streams_all & migrated_streams_imm
+    for stream in migrated_etl:
+        for upstream in upstream_neighbors[stream]:
+            if upstream not in migrated_streams_imm:
+                # This upstream is not migrated — its tables need syncing
+                tables_on_edge = edge_tables_lookup.get((upstream, stream), [])
+                for table_name, size in tables_on_edge:
+                    if table_name not in stage_sync_tables:
+                        stage_sync_tables[table_name] = {
+                            'size': size,
+                            'producers': set(),
+                            'consumers': set(),
+                        }
+                    stage_sync_tables[table_name]['producers'].add(upstream)
+                    stage_sync_tables[table_name]['consumers'].add(stream)
+
+    stage_sync_count = len(stage_sync_tables)
+    stage_sync_size = builtins.sum(info['size'] for info in stage_sync_tables.values())
+
     # Record per-stream rows for CSV
     for stream in newly_cutover_etl_imm:
         up_count = len(upstream_neighbors[stream])
@@ -3638,17 +3684,41 @@ for _, stage_row in timeline_df.iterrows():
         'cumulative_cutover_total': total_cutover_imm,
         'cumulative_cutover_pct': (total_cutover_imm / total_all * 100) if total_all > 0 else 0.0,
         'cumulative_migrated': len(migrated_streams_imm),
+        'sync_table_count': stage_sync_count,
+        'sync_total_size_gb': stage_sync_size,
+        'sync_tables_detail': stage_sync_tables,
     })
 
     print(f"\nStage {stage_num} ({stage_end_date}):")
     print(f"  Newly cutover-ready: {len(newly_cutover_etl_imm)} ETL, {len(newly_cutover_bi_imm)} BI")
     print(f"  Cumulative cutover: {total_cutover_imm}/{total_all} ({total_cutover_imm/total_all*100:.1f}%)")
+    print(f"  Sync required: {stage_sync_count} tables, {stage_sync_size:.2f} GB")
 
-# --- Step 3: Save CSV ---
+# --- Step 3: Save CSVs ---
 cutover_imm_csv_df = pd.DataFrame(cutover_rows_imm)
 cutover_imm_csv_path = f"{output_path}migration_order_analysis/cutover_readiness_immediate_gamma_{resolution}.csv"
 cutover_imm_csv_df.to_csv(cutover_imm_csv_path, index=False)
 print(f"\nImmediate cutover readiness CSV saved: {cutover_imm_csv_path}")
+
+# Save sync details CSV — one row per table per stage
+sync_detail_rows = []
+for ss in stage_summaries_imm:
+    for table_name in sorted(ss['sync_tables_detail'].keys()):
+        info = ss['sync_tables_detail'][table_name]
+        sync_detail_rows.append({
+            'stage': ss['stage'],
+            'end_date': ss['end_date'],
+            'table_name': table_name,
+            'size_gb': info['size'],
+            'unmigrated_producers': ', '.join(sorted(info['producers'])),
+            'migrated_consumers': ', '.join(sorted(info['consumers'])),
+        })
+
+sync_detail_csv_df = pd.DataFrame(sync_detail_rows)
+sync_detail_csv_path = f"{output_path}migration_order_analysis/cutover_sync_details_immediate_gamma_{resolution}.csv"
+sync_detail_csv_df.to_csv(sync_detail_csv_path, index=False)
+print(f"Immediate cutover sync details CSV saved: {sync_detail_csv_path}")
+print(f"Total sync table rows: {len(sync_detail_rows)} (one per table per stage)")
 
 # --- Step 4: Generate TXT report ---
 cutover_imm_txt_path = f"{output_path}migration_order_analysis/cutover_readiness_immediate_analysis_gamma_{resolution}.txt"
@@ -3683,6 +3753,24 @@ with open(cutover_imm_txt_path, 'w') as f:
         f.write(f"Cumulative Cutover-Ready: {ss['cumulative_cutover_total']}/{len(all_streams_set)} ({ss['cumulative_cutover_pct']:.2f}%)\n")
         f.write(f"  - ETL: {ss['cumulative_cutover_etl']}/{len(etl_streams_all)}\n")
         f.write(f"  - BI: {ss['cumulative_cutover_bi']}/{len(bi_streams_all)}\n\n")
+
+        # Sync requirements for this stage
+        sync_detail = ss['sync_tables_detail']
+        f.write(f"--- Sync Requirements (SRC tables from unmigrated upstream streams) ---\n")
+        f.write(f"Tables to sync: {ss['sync_table_count']} | Total size: {ss['sync_total_size_gb']:.2f} GB\n\n")
+
+        if sync_detail:
+            for table_name in sorted(sync_detail.keys()):
+                info = sync_detail[table_name]
+                producers = sorted(info['producers'])
+                consumers = sorted(info['consumers'])
+                f.write(f"  Table: {table_name} ({info['size']:.2f} GB)\n")
+                f.write(f"    Produced by (unmigrated): {', '.join(producers)}\n")
+                f.write(f"    Consumed by (migrated):   {', '.join(consumers)}\n")
+        else:
+            f.write(f"  (No sync required — all upstream dependencies are migrated)\n")
+
+        f.write(f"\n")
 
         if ss['newly_cutover_etl_streams']:
             f.write(f"--- ETL Streams Ready for Cutover ---\n")
@@ -3726,6 +3814,14 @@ with open(cutover_imm_txt_path, 'w') as f:
     f.write(f" ({bi_ready_imm/len(bi_streams_all)*100:.1f}%)\n" if bi_streams_all else "\n")
     f.write(f"Total cutover-ready: {total_ready_imm}/{len(all_streams_set)}")
     f.write(f" ({final_imm.get('cumulative_cutover_pct', 0):.1f}%)\n\n")
+
+    # Sync summary across all stages
+    f.write(f"--- Sync Requirements Summary ---\n\n")
+    f.write(f"{'Stage':<8} {'Date':<14} {'Sync Tables':>12} {'Sync GB':>12}\n")
+    f.write(f"{'-'*46}\n")
+    for ss in stage_summaries_imm:
+        f.write(f"{ss['stage']:<8} {ss['end_date']:<14} {ss['sync_table_count']:>12} {ss['sync_total_size_gb']:>12.2f}\n")
+    f.write(f"\n")
 
     # Comparison with recursive analysis
     f.write(f"--- Comparison: Immediate vs Recursive ---\n\n")
