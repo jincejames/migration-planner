@@ -3131,15 +3131,14 @@ display(timeline_csv_df.head())
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Cutover Readiness Analysis
+# MAGIC ## Cutover Readiness Analysis (Recursive Upstream)
 # MAGIC
 # MAGIC Determines when streams can be fully cut over from the legacy system to production
 # MAGIC (i.e., switched off in legacy).
 # MAGIC
-# MAGIC **ETL Streams**: A stream is cutover-ready when its entire end-to-end dependency chain
-# MAGIC (all recursive upstream AND downstream ETL dependencies) has been migrated.
-# MAGIC Computed by finding connected components in the undirected ETL dependency graph —
-# MAGIC a stream's component must be entirely migrated for cutover.
+# MAGIC **ETL Streams**: A stream is cutover-ready when ALL its **recursive upstream**
+# MAGIC dependencies are migrated. Downstream state does not block cutover —
+# MAGIC a stream can produce output once all its inputs are available.
 # MAGIC
 # MAGIC **BI/JSON Streams**: Evaluated separately based on table availability
 # MAGIC (tables produced by migrated streams + static tables from `static_tables_for_report.csv`).
@@ -3148,41 +3147,58 @@ display(timeline_csv_df.head())
 
 # DBTITLE 1,Cutover Readiness Analysis
 import builtins
+from collections import defaultdict
 
 print("\n" + "="*100)
-print("CUTOVER READINESS ANALYSIS")
+print("CUTOVER READINESS ANALYSIS (Recursive Upstream)")
 print("="*100)
 
-# --- Step 1: Build ETL-only subgraph from existing undirected graph G ---
-# G already contains all streams (including isolated) with undirected edges.
-# Filter out BI/json nodes to get the ETL dependency graph.
+# --- Step 1: Build directed ETL upstream neighbor map ---
+# For recursive cutover: a stream is ready when ALL its transitive upstream
+# dependencies are migrated. Downstream state does not block cutover.
 
 all_streams_set = set(leiden_df['stream'].tolist())
 bi_streams_all = set(s for s in all_streams_set if 'json' in s.lower())
 etl_streams_all = all_streams_set - bi_streams_all
 
-etl_subgraph = G.subgraph([n for n in G.nodes() if n in etl_streams_all]).copy()
+# Build directed upstream map from stream_stream_dependency_df
+stream_deps_recursive = stream_stream_dependency_df.select("from", "to").distinct().toPandas()
+etl_deps_recursive = stream_deps_recursive[
+    ~stream_deps_recursive['from'].str.lower().str.contains('json') &
+    ~stream_deps_recursive['to'].str.lower().str.contains('json')
+].copy()
+
+recursive_upstream = defaultdict(set)
+for _, row in etl_deps_recursive.iterrows():
+    src, tgt = row['from'], row['to']
+    if src in etl_streams_all and tgt in etl_streams_all:
+        recursive_upstream[tgt].add(src)
 
 print(f"Total streams: {len(all_streams_set)}")
 print(f"ETL streams: {len(etl_streams_all)}")
 print(f"BI/JSON streams: {len(bi_streams_all)}")
-print(f"ETL subgraph: {etl_subgraph.number_of_nodes()} nodes, {etl_subgraph.number_of_edges()} edges")
+print(f"Directed ETL upstream edges: {len(etl_deps_recursive)}")
 
-# --- Step 2: Find connected components in ETL subgraph ---
-components = list(nx.connected_components(etl_subgraph))
-print(f"\nETL connected components: {len(components)}")
+# --- Step 2: Compute transitive upstream closure for each stream ---
+def get_all_recursive_upstreams(stream, upstream_map):
+    """BFS to find all transitive upstream dependencies of a stream."""
+    visited = set()
+    queue = [stream]
+    while queue:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        for up in upstream_map.get(current, set()):
+            if up not in visited:
+                queue.append(up)
+    visited.discard(stream)  # exclude the stream itself
+    return visited
 
-# Map stream -> component_id and component_id -> set of streams
-stream_to_component = {}
-component_streams_map = {}
-for comp_id, comp in enumerate(components):
-    component_streams_map[comp_id] = comp
-    for stream in comp:
-        stream_to_component[stream] = comp_id
-
-comp_sizes = sorted([len(c) for c in components], reverse=True)
-print(f"Component sizes (top 10): {comp_sizes[:10]}")
-print(f"Single-stream components: {builtins.sum(1 for s in comp_sizes if s == 1)}")
+streams_with_upstream = builtins.sum(1 for s in etl_streams_all if recursive_upstream[s])
+streams_no_upstream = len(etl_streams_all) - streams_with_upstream
+print(f"\nETL streams with upstream dependencies: {streams_with_upstream}")
+print(f"ETL streams with no upstream (source streams): {streams_no_upstream}")
 
 # --- Step 3: Get BI stream table requirements from dependency_df ---
 bi_stream_src_df = dependency_df.filter(
@@ -3223,17 +3239,14 @@ for _, stage_row in timeline_df.iterrows():
             if stream in stream_produces:
                 bi_available_tables_cutover.update(stream_produces[stream])
 
-    # ETL cutover: check which components are now fully migrated
+    # ETL cutover: check which migrated streams have ALL recursive upstreams migrated
     newly_cutover_etl = []
-    newly_cutover_components = []
-    for comp_id, comp_streams in component_streams_map.items():
-        if comp_streams.issubset(cutover_ready_etl):
-            continue
-        if comp_streams.issubset(migrated_streams_cutover):
-            new_streams = sorted(comp_streams - cutover_ready_etl)
-            newly_cutover_etl.extend(new_streams)
-            newly_cutover_components.append((comp_id, len(comp_streams), new_streams))
-            cutover_ready_etl.update(comp_streams)
+    candidates_recursive = (etl_streams_all & migrated_streams_cutover) - cutover_ready_etl
+    for stream in sorted(candidates_recursive):
+        all_upstreams = get_all_recursive_upstreams(stream, recursive_upstream)
+        if all_upstreams.issubset(migrated_streams_cutover):
+            newly_cutover_etl.append(stream)
+            cutover_ready_etl.add(stream)
 
     # BI cutover: check table availability
     newly_cutover_bi_list = []
@@ -3250,15 +3263,14 @@ for _, stage_row in timeline_df.iterrows():
 
     # Record per-stream rows for CSV
     for stream in newly_cutover_etl:
-        comp_id = stream_to_component.get(stream, -1)
+        all_up = get_all_recursive_upstreams(stream, recursive_upstream)
         cutover_rows.append({
             'stage': stage_num,
             'end_date': stage_end_date,
             'community_id': int(stream_to_community.get(stream, -1)),
             'stream_name': stream,
             'stream_type': 'ETL',
-            'component_id': comp_id,
-            'component_size': len(component_streams_map.get(comp_id, set())),
+            'recursive_upstream_count': len(all_up),
         })
 
     for stream in newly_cutover_bi_list:
@@ -3268,8 +3280,7 @@ for _, stage_row in timeline_df.iterrows():
             'community_id': int(stream_to_community.get(stream, -1)),
             'stream_name': stream,
             'stream_type': 'BI',
-            'component_id': -1,
-            'component_size': -1,
+            'recursive_upstream_count': -1,
         })
 
     total_cutover = len(cutover_ready_etl) + len(cutover_ready_bi)
@@ -3284,7 +3295,6 @@ for _, stage_row in timeline_df.iterrows():
         'newly_cutover_bi': len(newly_cutover_bi_list),
         'newly_cutover_etl_streams': newly_cutover_etl,
         'newly_cutover_bi_streams': newly_cutover_bi_list,
-        'newly_cutover_components': newly_cutover_components,
         'cumulative_cutover_etl': len(cutover_ready_etl),
         'cumulative_cutover_bi': len(cutover_ready_bi),
         'cumulative_cutover_total': total_cutover,
@@ -3313,12 +3323,14 @@ with open(cutover_txt_path, 'w') as f:
     f.write("="*120 + "\n\n")
 
     f.write("A stream is cutover-ready (can be switched off in legacy / moved to production) when:\n")
-    f.write("  - ETL streams: entire end-to-end dependency chain (connected component) is migrated\n")
+    f.write("  - ETL streams: ALL recursive upstream dependencies are migrated\n")
+    f.write("    (downstream state does not block cutover — a stream can produce once its inputs are ready)\n")
     f.write("  - BI/JSON streams: all required source tables are available (produced + static tables)\n\n")
 
     f.write(f"Total ETL Streams: {len(etl_streams_all)}\n")
     f.write(f"Total BI/JSON Streams: {len(bi_streams_all)}\n")
-    f.write(f"Total Connected Components (ETL): {len(components)}\n")
+    f.write(f"ETL streams with upstream deps: {streams_with_upstream}\n")
+    f.write(f"ETL source streams (no upstream): {streams_no_upstream}\n")
     f.write(f"Migration Start Date: {START_DATE.strftime('%Y-%m-%d')}\n")
     f.write(f"Total Stages: {len(stage_summaries)}\n\n")
 
@@ -3336,12 +3348,14 @@ with open(cutover_txt_path, 'w') as f:
         f.write(f"  - ETL: {ss['cumulative_cutover_etl']}/{len(etl_streams_all)}\n")
         f.write(f"  - BI: {ss['cumulative_cutover_bi']}/{len(bi_streams_all)}\n\n")
 
-        if ss['newly_cutover_components']:
+        if ss['newly_cutover_etl_streams']:
             f.write(f"--- ETL Streams Ready for Cutover ---\n")
-            for comp_id, comp_size, streams in ss['newly_cutover_components']:
-                f.write(f"\n  Component {comp_id} ({comp_size} streams - fully migrated):\n")
-                for stream in streams:
-                    f.write(f"    - {stream}\n")
+            for stream in ss['newly_cutover_etl_streams']:
+                all_up = get_all_recursive_upstreams(stream, recursive_upstream)
+                if all_up:
+                    f.write(f"    - {stream} ({len(all_up)} recursive upstreams, all migrated)\n")
+                else:
+                    f.write(f"    - {stream} (source stream — no upstream dependencies)\n")
         else:
             f.write(f"--- ETL Streams Ready for Cutover ---\n")
             f.write(f"  (No new ETL streams ready for cutover at this stage)\n")
@@ -3382,15 +3396,13 @@ with open(cutover_txt_path, 'w') as f:
         if not_cutover_etl:
             f.write(f"ETL Streams ({len(not_cutover_etl)}):\n")
             for stream in sorted(not_cutover_etl):
-                comp_id = stream_to_component.get(stream, -1)
-                comp = component_streams_map.get(comp_id, set())
-                migrated_in_comp = comp & migrated_streams_cutover
-                not_migrated = sorted(comp - migrated_streams_cutover)
-                f.write(f"  - {stream} (component {comp_id}, {len(migrated_in_comp)}/{len(comp)} migrated)\n")
-                if not_migrated:
-                    f.write(f"    Unmigrated in chain: {', '.join(not_migrated[:10])}")
-                    if len(not_migrated) > 10:
-                        f.write(f" ... and {len(not_migrated) - 10} more")
+                all_up = get_all_recursive_upstreams(stream, recursive_upstream)
+                unmigrated_up = sorted(all_up - migrated_streams_cutover)
+                f.write(f"  - {stream} ({len(unmigrated_up)} unmigrated upstream)\n")
+                if unmigrated_up:
+                    f.write(f"    Unmigrated upstreams: {', '.join(unmigrated_up[:10])}")
+                    if len(unmigrated_up) > 10:
+                        f.write(f" ... and {len(unmigrated_up) - 10} more")
                     f.write("\n")
         if not_cutover_bi:
             f.write(f"\nBI Streams ({len(not_cutover_bi)}):\n")
@@ -3415,53 +3427,39 @@ print(f"{'='*100}")
 # COMMAND ----------
 
 # DBTITLE 1,Cutover Readiness Verification
-# Sanity checks on cutover analysis results
+# Sanity checks on recursive upstream cutover analysis
 
 print("="*80)
-print("CUTOVER READINESS VERIFICATION")
+print("CUTOVER READINESS VERIFICATION (Recursive Upstream)")
 print("="*80)
 
 errors = []
 
-# 1. Every ETL stream belongs to exactly one component
-etl_in_components = set()
-for comp in components:
-    overlap = etl_in_components & comp
-    if overlap:
-        errors.append(f"Streams in multiple components: {overlap}")
-    etl_in_components.update(comp)
-missing_from_components = etl_streams_all - etl_in_components
-extra_in_components = etl_in_components - etl_streams_all
-if missing_from_components:
-    errors.append(f"{len(missing_from_components)} ETL streams not in any component")
-if extra_in_components:
-    errors.append(f"{len(extra_in_components)} non-ETL streams in components")
-print(f"[{'PASS' if not missing_from_components and not extra_in_components else 'FAIL'}] All ETL streams in exactly one component")
-
-# 2. Cutover-ready never exceeds migrated
+# 1. Cutover-ready never exceeds migrated
 if cutover_ready_etl - migrated_streams_cutover:
     errors.append(f"ETL cutover-ready but not migrated: {cutover_ready_etl - migrated_streams_cutover}")
 print(f"[{'PASS' if not (cutover_ready_etl - migrated_streams_cutover) else 'FAIL'}] Cutover-ready ⊆ migrated")
 
-# 3. No component is partially cutover (all-or-nothing)
-partial_components = []
-for comp_id, comp_streams in component_streams_map.items():
-    in_cutover = comp_streams & cutover_ready_etl
-    if in_cutover and in_cutover != comp_streams:
-        partial_components.append(comp_id)
-if partial_components:
-    errors.append(f"Partially cutover components: {partial_components}")
-print(f"[{'PASS' if not partial_components else 'FAIL'}] All components are all-or-nothing cutover")
+# 2. Every cutover-ready stream must have ALL recursive upstreams migrated
+bad_upstream = []
+for stream in cutover_ready_etl:
+    all_up = get_all_recursive_upstreams(stream, recursive_upstream)
+    unmigrated = all_up - migrated_streams_cutover
+    if unmigrated:
+        bad_upstream.append((stream, unmigrated))
+if bad_upstream:
+    errors.append(f"{len(bad_upstream)} cutover-ready streams have unmigrated recursive upstreams")
+print(f"[{'PASS' if not bad_upstream else 'FAIL'}] All cutover-ready streams have fully migrated upstream chains")
 
-# 4. Isolated ETL streams (degree 0 in ETL subgraph) are cutover-ready if migrated
-isolated_etl = set(n for n in etl_subgraph.nodes() if etl_subgraph.degree(n) == 0)
-isolated_migrated = isolated_etl & migrated_streams_cutover
-isolated_not_cutover = isolated_migrated - cutover_ready_etl
-if isolated_not_cutover:
-    errors.append(f"Isolated migrated ETL streams not cutover-ready: {isolated_not_cutover}")
-print(f"[{'PASS' if not isolated_not_cutover else 'FAIL'}] All isolated migrated streams are cutover-ready ({len(isolated_migrated)} isolated & migrated)")
+# 3. Source streams (no upstream) are cutover-ready if migrated
+source_streams = set(s for s in etl_streams_all if not recursive_upstream[s])
+source_migrated = source_streams & migrated_streams_cutover
+source_not_cutover = source_migrated - cutover_ready_etl
+if source_not_cutover:
+    errors.append(f"Source streams migrated but not cutover-ready: {source_not_cutover}")
+print(f"[{'PASS' if not source_not_cutover else 'FAIL'}] All migrated source streams are cutover-ready ({len(source_migrated)} source & migrated)")
 
-# 5. ETL + BI = total streams (no overlap, no gap)
+# 4. ETL + BI = total streams (no overlap, no gap)
 overlap = etl_streams_all & bi_streams_all
 gap = all_streams_set - (etl_streams_all | bi_streams_all)
 if overlap:
@@ -3470,12 +3468,22 @@ if gap:
     errors.append(f"Streams in neither ETL nor BI: {gap}")
 print(f"[{'PASS' if not overlap and not gap else 'FAIL'}] ETL ∪ BI = all streams (no overlap, no gap)")
 
-# 6. CSV row count matches cutover-ready count
+# 5. CSV row count matches cutover-ready count
 expected_rows = len(cutover_ready_etl) + len(cutover_ready_bi)
 actual_rows = len(cutover_csv_df)
 if actual_rows != expected_rows:
     errors.append(f"CSV rows ({actual_rows}) != cutover-ready ({expected_rows})")
 print(f"[{'PASS' if actual_rows == expected_rows else 'FAIL'}] CSV row count matches ({actual_rows} rows)")
+
+# 6. Monotonicity: if all upstreams of X are cutover-ready, X should be too (if migrated)
+monotonicity_violations = []
+for stream in (etl_streams_all & migrated_streams_cutover) - cutover_ready_etl:
+    all_up = get_all_recursive_upstreams(stream, recursive_upstream)
+    if all_up.issubset(cutover_ready_etl):
+        monotonicity_violations.append(stream)
+if monotonicity_violations:
+    errors.append(f"Monotonicity violation: {len(monotonicity_violations)} streams should be cutover-ready")
+print(f"[{'PASS' if not monotonicity_violations else 'FAIL'}] Monotonicity: all eligible streams are cutover-ready")
 
 if errors:
     print(f"\n{'!'*80}")
@@ -3785,7 +3793,7 @@ for _, stage_row in timeline_df.iterrows():
             'stream_type': 'ETL',
             'immediate_upstream_count': up_count,
             'immediate_downstream_count': down_count,
-            'component_id': stream_to_component.get(stream, -1),
+            'recursive_upstream_count': len(get_all_recursive_upstreams(stream, recursive_upstream)),
         })
 
     for stream in newly_cutover_bi_imm:
@@ -4026,18 +4034,17 @@ with open(cutover_imm_txt_path, 'w') as f:
     # Streams that are immediate-ready but NOT recursive-ready
     imm_only = cutover_ready_etl_imm - cutover_ready_etl
     if imm_only:
-        f.write(f"--- Streams Cutover-Ready (Immediate) but NOT (Recursive) ---\n")
+        f.write(f"--- Streams Cutover-Ready (Immediate) but NOT (Recursive Upstream) ---\n")
         f.write(f"These {len(imm_only)} streams have all immediate neighbors migrated,\n")
-        f.write(f"but their wider connected component is not fully migrated.\n\n")
+        f.write(f"but have unmigrated transitive upstream dependencies.\n\n")
         for stream in sorted(imm_only):
-            comp_id = stream_to_component.get(stream, -1)
-            comp = component_streams_map.get(comp_id, set())
-            not_migrated_in_comp = sorted(comp - migrated_streams_cutover)
-            f.write(f"  - {stream} (component {comp_id}, {len(comp)} streams, {len(not_migrated_in_comp)} unmigrated)\n")
-            if not_migrated_in_comp:
-                f.write(f"    Unmigrated in component: {', '.join(not_migrated_in_comp[:10])}")
-                if len(not_migrated_in_comp) > 10:
-                    f.write(f" ... and {len(not_migrated_in_comp) - 10} more")
+            all_up = get_all_recursive_upstreams(stream, recursive_upstream)
+            unmigrated_up = sorted(all_up - migrated_streams_cutover)
+            f.write(f"  - {stream} ({len(all_up)} recursive upstreams, {len(unmigrated_up)} unmigrated)\n")
+            if unmigrated_up:
+                f.write(f"    Unmigrated upstreams: {', '.join(unmigrated_up[:10])}")
+                if len(unmigrated_up) > 10:
+                    f.write(f" ... and {len(unmigrated_up) - 10} more")
                 f.write("\n")
 
     # Streams NOT cutover-ready
