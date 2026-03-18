@@ -3506,11 +3506,11 @@ if actual_rows != expected_rows:
     errors.append(f"CSV rows ({actual_rows}) != cutover-ready ({expected_rows})")
 print(f"[{'PASS' if actual_rows == expected_rows else 'FAIL'}] CSV row count matches ({actual_rows} rows)")
 
-# 6. Monotonicity: if all upstreams of X are cutover-ready, X should be too (if migrated)
+# 6. Monotonicity: if all upstreams of X are migrated, X should be cutover-ready (if migrated)
 monotonicity_violations = []
 for stream in (etl_streams_all & migrated_streams_cutover) - cutover_ready_etl:
     all_up = get_all_recursive_upstreams(stream, recursive_upstream)
-    if all_up.issubset(cutover_ready_etl):
+    if all_up.issubset(migrated_streams_cutover):
         monotonicity_violations.append(stream)
 if monotonicity_violations:
     errors.append(f"Monotonicity violation: {len(monotonicity_violations)} streams should be cutover-ready")
@@ -3696,11 +3696,12 @@ for _, stage_row in timeline_df.iterrows():
                 baseline_sync[tbl] = sz
     baseline_total = builtins.sum(baseline_sync.values())
 
-    # --- Find candidates: migrated ETL streams with all immediate neighbors migrated ---
+    # --- Find candidates: migrated ETL streams with all immediate UPSTREAM neighbors migrated ---
+    # Upstream-only check, consistent with recursive analysis
     candidates = []
     candidates_all = (etl_streams_all & migrated_streams_imm) - cutover_ready_etl_imm
     for stream in sorted(candidates_all):
-        if all_immediate_neighbors[stream].issubset(migrated_streams_imm):
+        if upstream_neighbors[stream].issubset(migrated_streams_imm):
             candidates.append(stream)
 
     # --- Compute per-candidate sync tables ---
@@ -4125,16 +4126,15 @@ if not_migrated_but_cutover:
     errors_imm.append(f"ETL cutover-ready but not migrated: {not_migrated_but_cutover}")
 print(f"[{'PASS' if not not_migrated_but_cutover else 'FAIL'}] Cutover-ready ⊆ migrated")
 
-# 2. Every immediate-cutover-ready stream must have all neighbors migrated
+# 2. Every immediate-cutover-ready stream must have all upstream neighbors migrated
 bad_neighbors = []
 for stream in cutover_ready_etl_imm:
-    neighbors = all_immediate_neighbors[stream]
-    unmigrated = neighbors - migrated_streams_imm
+    unmigrated = upstream_neighbors[stream] - migrated_streams_imm
     if unmigrated:
         bad_neighbors.append((stream, unmigrated))
 if bad_neighbors:
-    errors_imm.append(f"{len(bad_neighbors)} cutover-ready streams have unmigrated neighbors")
-print(f"[{'PASS' if not bad_neighbors else 'FAIL'}] All cutover-ready streams have all neighbors migrated")
+    errors_imm.append(f"{len(bad_neighbors)} cutover-ready streams have unmigrated upstream neighbors")
+print(f"[{'PASS' if not bad_neighbors else 'FAIL'}] All cutover-ready streams have all upstream neighbors migrated")
 
 # 3. Recursive cutover-ready should generally be a subset of immediate cutover-ready
 # Note: with sync threshold gating, some immediate-eligible streams may be held back,
@@ -4147,9 +4147,9 @@ if recursive_not_in_immediate:
 else:
     print(f"[PASS] Recursive cutover ⊆ immediate cutover")
 
-# 4. Isolated ETL streams (no sync cost) should be cutover-ready if migrated
-# Isolated streams have 0 sync cost, so sync threshold should never block them
-isolated_etl_imm = set(s for s in etl_streams_all if not all_immediate_neighbors[s])
+# 4. Streams with no upstream (source streams) should be cutover-ready if migrated
+# Source streams have 0 sync cost, so sync threshold should never block them
+isolated_etl_imm = set(s for s in etl_streams_all if not upstream_neighbors[s])
 isolated_migrated_imm = isolated_etl_imm & migrated_streams_imm
 isolated_not_cutover_imm = isolated_migrated_imm - cutover_ready_etl_imm
 if isolated_not_cutover_imm:
