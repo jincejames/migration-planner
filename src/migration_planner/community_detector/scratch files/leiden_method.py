@@ -1803,36 +1803,36 @@ class BruteForceCommunityOrdering:
       to_sync(step) = incoming_tables[community] - available_tables_so_far
       step_cost     = sum(table_weight[table] for table in to_sync)
       total_cost    = sum(step_cost)
-      
+
     Supports pre-available tables: when optimizing a subset of communities,
     you can specify other communities whose produced tables should be considered
     already available (e.g., when optimizing top N after rest communities).
+
+    Optimized with:
+      - Bitmask representation for table sets (bitwise OR/AND instead of Python sets)
+      - Numpy weight vector for vectorized cost calculation
+      - Branch-and-bound pruning to skip permutations that exceed current best
+      - Lazy step_costs (only computed for new best solutions)
     """
 
-    def __init__(self, stream_table_dependency_df_scaled, leiden_df, communities_subset=None, 
+    def __init__(self, dep_pdf, leiden_df, communities_subset=None,
                  pre_available_communities=None):
         """
         Parameters
         ----------
-        stream_table_dependency_df_scaled : Spark DataFrame
-            DataFrame with columns: from, to, table, weight
+        dep_pdf : pd.DataFrame
+            DataFrame with columns: from, to, table, weight.
+            Pre-collected pandas DataFrame (avoids repeated .toPandas() calls).
         leiden_df : pd.DataFrame
             DataFrame with columns: stream, community
         communities_subset : list or None
             List of community IDs to optimize. If None, uses all communities.
         pre_available_communities : list or None
             List of community IDs whose produced tables should be considered
-            already available at the start of optimization. Useful when optimizing
-            top N communities after rest communities have been ordered.
+            already available at the start of optimization.
         """
 
-        self.dep = (
-            stream_table_dependency_df_scaled
-            .select("from", "to", "table", "weight")
-            .toPandas()
-            .copy()
-        )
-
+        self.dep = dep_pdf.copy()
         self.dep["from"] = self.dep["from"].astype(str)
         self.dep["to"] = self.dep["to"].astype(str)
         self.dep["table"] = self.dep["table"].astype(str)
@@ -1855,7 +1855,7 @@ class BruteForceCommunityOrdering:
             int(c): set(leiden_df.loc[leiden_df["community"] == c, "stream"].astype(str).tolist())
             for c in all_comms
         }
-        
+
         # Store only the subset we're optimizing
         self.community_streams = {c: all_community_streams[c] for c in comms}
 
@@ -1876,7 +1876,7 @@ class BruteForceCommunityOrdering:
             self.incoming_tables[c] = set(incoming)
 
         self.communities = list(self.community_streams.keys())
-        
+
         # Calculate pre-available tables from other communities
         self.pre_available_tables = set()
         if pre_available_communities is not None:
@@ -1890,66 +1890,90 @@ class BruteForceCommunityOrdering:
                     self.pre_available_tables |= tables
             print(f"  Pre-available tables count: {len(self.pre_available_tables)}")
 
-    def evaluate_ordering_cost(self, ordering, initial_available=None):
+        # --- Build bitmask representation for fast evaluation ---
+        # Assign each unique table a bit index
+        all_tables = sorted(self.table_weight.keys())
+        self._table_to_idx = {t: i for i, t in enumerate(all_tables)}
+        self._n_tables = len(all_tables)
+
+        # Weight vector indexed by table index
+        self._weight_vec = np.zeros(self._n_tables, dtype=np.float64)
+        for t, w in self.table_weight.items():
+            self._weight_vec[self._table_to_idx[t]] = w
+
+        # Bitmask per community: incoming tables
+        self._incoming_mask = {}
+        for c in self.communities:
+            mask = np.zeros(self._n_tables, dtype=np.bool_)
+            for t in self.incoming_tables[c]:
+                if t in self._table_to_idx:
+                    mask[self._table_to_idx[t]] = True
+            self._incoming_mask[c] = mask
+
+        # Bitmask per community: produced tables
+        self._produced_mask = {}
+        for c in self.communities:
+            mask = np.zeros(self._n_tables, dtype=np.bool_)
+            for t in self.produced_tables[c]:
+                if t in self._table_to_idx:
+                    mask[self._table_to_idx[t]] = True
+            self._produced_mask[c] = mask
+
+        # Pre-available bitmask
+        self._pre_available_mask = np.zeros(self._n_tables, dtype=np.bool_)
+        for t in self.pre_available_tables:
+            if t in self._table_to_idx:
+                self._pre_available_mask[self._table_to_idx[t]] = True
+
+        print(f"  Bitmask optimization: {self._n_tables} unique tables indexed")
+
+    def evaluate_ordering_cost(self, ordering, best_cost=float("inf"), return_step_costs=False):
         """
-        Evaluate the total sync cost for a given ordering.
-        
-        At each step, calculates the immediate sync cost for the current community:
-        - Tables needed by this community that are not yet available
-        
-        The total cost is the sum of immediate sync costs across all steps.
-        This minimizes the total amount of data that needs to be synced.
-        
+        Evaluate the total sync cost for a given ordering using bitmask + numpy.
+        Supports branch-and-bound pruning.
+
         Parameters
         ----------
         ordering : tuple or list
             Sequence of community IDs
-        initial_available : set or None
-            Set of tables that are already available at the start.
-            If None, uses self.pre_available_tables.
-        
+        best_cost : float
+            Current best cost for pruning. If total reaches or exceeds this,
+            returns early with cost=inf. Default inf (no pruning).
+        return_step_costs : bool
+            If True, also compute and return per-step costs. Default False
+            (skip for performance in the hot loop).
+
         Returns
         -------
         total : float
-            Total sync cost (sum of immediate sync costs at each step)
-        step_costs : list
-            Immediate sync cost at each step
+            Total sync cost, or float('inf') if pruned.
+        step_costs : list or None
+            Per-step costs if return_step_costs=True, else None.
         """
-        if initial_available is None:
-            available = self.pre_available_tables.copy()
-        else:
-            available = initial_available.copy()
-            
+        available = self._pre_available_mask.copy()
         total = 0.0
-        step_costs = []
+        step_costs = [] if return_step_costs else None
 
         for c in ordering:
-            # Calculate immediate sync cost for this community
-            to_sync = self.incoming_tables[c] - available
-            step = float(builtins.sum(self.table_weight.get(t, 0.0) for t in to_sync))
+            to_sync = self._incoming_mask[c] & ~available
+            step = float(np.dot(to_sync, self._weight_vec))
             total += step
-            step_costs.append(step)
-            
-            # Update available tables with what this community produces
-            available |= self.produced_tables[c]
+
+            if return_step_costs:
+                step_costs.append(step)
+
+            # Branch-and-bound: prune if already worse than best
+            if total >= best_cost:
+                return float("inf"), None
+
+            available |= self._produced_mask[c]
 
         return total, step_costs
 
     def brute_force(self, log_every=5000, label="subset"):
         """
-        Perform brute force search over all permutations.
-        
-        Parameters
-        ----------
-        log_every : int
-            Print progress every N permutations
-        label : str
-            Label for logging
-        
-        Returns
-        -------
-        dict
-            Results including best_cost, best_order, best_step_costs, total_time_sec, total_perms
+        Perform brute force search over all permutations with bitmask optimization
+        and branch-and-bound pruning.
         """
         n = len(self.communities)
         total_perms = factorial(n)
@@ -1957,34 +1981,41 @@ class BruteForceCommunityOrdering:
         best_cost = float("inf")
         best_order = None
         best_step_costs = None
+        pruned_count = 0
 
         start = time.time()
 
         print(f"\n=== Brute force ({label}) | communities={n} | perms={total_perms} ===")
         print(f"  Optimization objective: Minimize total sync cost across all steps")
+        print(f"  Optimizations: bitmask + numpy + branch-and-bound pruning")
         if len(self.pre_available_tables) > 0:
             print(f"  Starting with {len(self.pre_available_tables)} pre-available tables")
 
         for i, perm in enumerate(itertools.permutations(self.communities), 1):
 
-            cost, step_costs = self.evaluate_ordering_cost(perm)
+            cost, _ = self.evaluate_ordering_cost(perm, best_cost=best_cost)
 
             if cost < best_cost:
                 best_cost = cost
                 best_order = perm
-                best_step_costs = step_costs
+                # Re-evaluate with step_costs only for the new best
+                _, best_step_costs = self.evaluate_ordering_cost(perm, return_step_costs=True)
                 print(f"[NEW BEST] {i}/{total_perms} cost={best_cost:.6f} order={list(best_order)}")
+            elif cost == float("inf"):
+                pruned_count += 1
 
             if i % log_every == 0:
                 elapsed = time.time() - start
                 rate = i / elapsed if elapsed > 0 else 0
                 remaining = total_perms - i
                 eta = remaining / rate if rate > 0 else float("inf")
+                prune_pct = (pruned_count / i * 100) if i > 0 else 0
 
                 print(f"[PROGRESS] {i}/{total_perms} "
                       f"({100*i/total_perms:.2f}%) | "
                       f"best={best_cost:.6f} | "
                       f"{rate:.1f} perms/sec | "
+                      f"pruned={prune_pct:.1f}% | "
                       f"elapsed={elapsed/60:.2f} min | "
                       f"eta={eta/60:.2f} min")
 
@@ -1992,6 +2023,7 @@ class BruteForceCommunityOrdering:
         print(f"\nDONE ({label}) in {total_time/60:.2f} min")
         print(f"BEST COST: {best_cost:.6f}")
         print(f"BEST ORDER: {list(best_order)}")
+        print(f"Pruned: {pruned_count}/{total_perms} ({pruned_count/total_perms*100:.1f}%)")
 
         return {
             "best_cost": float(best_cost),
@@ -2579,42 +2611,41 @@ for resolution in resolutions:
     print(f"\n--- REST communities reordered: ASCENDING by weight (lowest first) ---")
 
     dep_scaled_df = unique_table_weights.select("from", "to", "table", "weight")
-    
+
+    # Collect Spark DF to pandas ONCE — reused by all BruteForceCommunityOrdering instances
+    dep_pdf = dep_scaled_df.toPandas()
+
     # Step 1: Optimize REST communities as a single batch
     # But identify communities with 0 sync requirement to migrate first
     print(f"\n--- Step 1: Optimizing REST communities ({len(rest_ids)} communities) ---")
-    
+
     # Identify communities with 0 sync requirement (no incoming dependencies from outside)
     zero_sync_communities = []
     non_zero_sync_communities = []
-    
+
     for comm_id in rest_ids:
         # Get streams in this community
         streams_in_community = set(leiden_df[leiden_df['community'] == comm_id]['stream'].tolist())
-        
-        # Check if there are any incoming dependencies from outside this community
-        # Convert to pandas for easier filtering
-        dep_pdf = dep_scaled_df.toPandas()
-        
+
         # Find incoming dependencies: tables consumed by this community but produced outside
         incoming_deps = dep_pdf[
-            (~dep_pdf['from'].isin(streams_in_community)) & 
+            (~dep_pdf['from'].isin(streams_in_community)) &
             (dep_pdf['to'].isin(streams_in_community))
         ]
-        
+
         if len(incoming_deps) == 0:
             zero_sync_communities.append(comm_id)
         else:
             non_zero_sync_communities.append(comm_id)
-    
+
     print(f"Communities with 0 sync requirement: {len(zero_sync_communities)} - {zero_sync_communities}")
     print(f"Communities with non-zero sync requirement: {len(non_zero_sync_communities)}")
-    
+
     # Optimize non-zero sync communities
     if len(non_zero_sync_communities) > 0:
         bf_rest = BruteForceCommunityOrdering(
-            dep_scaled_df, 
-            leiden_df, 
+            dep_pdf,
+            leiden_df,
             non_zero_sync_communities,
             pre_available_communities=None  # No pre-available tables for rest
         )
@@ -2624,18 +2655,18 @@ for resolution in resolutions:
     else:
         optimized_rest_order = []
         rest_cost = 0.0
-    
+
     # Final REST order: zero-sync communities first, then optimized non-zero communities
     rest_order = zero_sync_communities + optimized_rest_order
-    
+
     print(f"\n--- REST order (0-sync first, then optimized): {rest_order} ---")
     print(f"--- REST cost (optimization metric): {rest_cost:.2f} ---")
 
     # Step 2: Optimize TOP N communities with all REST communities as pre-available
     print(f"\n--- Step 2: Optimizing TOP N communities (with all REST tables pre-available) ---")
     bf_top = BruteForceCommunityOrdering(
-        dep_scaled_df, 
-        leiden_df, 
+        dep_pdf,
+        leiden_df,
         topN_ids,
         pre_available_communities=rest_ids  # All REST communities are already available
     )
@@ -2776,7 +2807,7 @@ stream_produces_tables_df = dependency_df.filter(
     upper(col('DB_Table_Name')).alias('table_name')
 ).distinct().toPandas()
 
-stream_produces = stream_produces_tables_df.groupby('stream_name')['table_name'].apply(set).to_dict()
+stream_produces = stream_produces_tables_df.groupby('stream_name', group_keys=False)['table_name'].apply(set).to_dict()
 
 # Get report-to-table dependencies if available
 try:
@@ -2784,7 +2815,7 @@ try:
         col('stream_name').alias('report_name'),
         upper(col('table_name')).alias('table_name')
     ).distinct().toPandas()
-    report_required_tables = report_to_tables_pd.groupby('report_name')['table_name'].apply(set).to_dict()
+    report_required_tables = report_to_tables_pd.groupby('report_name', group_keys=False)['table_name'].apply(set).to_dict()
     has_report_data = True
 except:
     report_required_tables = {}
@@ -3209,7 +3240,7 @@ bi_stream_src_df = dependency_df.filter(
     upper(col('DB_Table_Name')).alias('table_name')
 ).distinct().toPandas()
 
-bi_stream_required_tables = bi_stream_src_df.groupby('stream_name')['table_name'].apply(set).to_dict()
+bi_stream_required_tables = bi_stream_src_df.groupby('stream_name', group_keys=False)['table_name'].apply(set).to_dict()
 print(f"\nBI streams with known table requirements: {len(bi_stream_required_tables)}")
 
 # --- Step 4: Process each clubbed stage for cutover readiness ---
@@ -4246,7 +4277,7 @@ print(f"Unique reports: {report_to_tables_pd['report_name'].nunique()}")
 print(f"Unique tables required by reports: {report_to_tables_pd['table_name'].nunique()}")
 
 # Group by report to get all tables required per report
-report_required_tables = report_to_tables_pd.groupby('report_name')['table_name'].apply(set).to_dict()
+report_required_tables = report_to_tables_pd.groupby('report_name', group_keys=False)['table_name'].apply(set).to_dict()
 
 print(f"\nExample - First 3 reports and their required tables:")
 for i, (report, tables) in enumerate(list(report_required_tables.items())[:3]):
@@ -4269,7 +4300,7 @@ stream_produces_tables_pd = stream_produces_tables_df.toPandas()
 print(f"Total stream-produces-table mappings: {len(stream_produces_tables_pd)}")
 
 # Group by stream to get all tables produced per stream
-stream_produces = stream_produces_tables_pd.groupby('stream_name')['table_name'].apply(set).to_dict()
+stream_produces = stream_produces_tables_pd.groupby('stream_name', group_keys=False)['table_name'].apply(set).to_dict()
 
 print(f"Total streams that produce tables: {len(stream_produces)}")
 print(f"\nExample - First 3 streams and tables they produce:")
@@ -4292,7 +4323,7 @@ try:
     
     # Extract tables that need to be synced for each community
     # These are the incoming dependencies (tables needed but not yet available)
-    community_sync_tables = sync_details_pd.groupby('community_id')['table_name'].apply(set).to_dict()
+    community_sync_tables = sync_details_pd.groupby('community_id', group_keys=False)['table_name'].apply(set).to_dict()
     
     print(f"\nCommunities with sync requirements: {len(community_sync_tables)}")
     display(sync_details_pd.head(10))
