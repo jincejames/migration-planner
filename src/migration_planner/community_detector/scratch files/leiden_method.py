@@ -41,7 +41,7 @@ from pyspark.sql.functions import ceil, sum, when, array, sort_array
 # DBTITLE 1,Widgets
 dbutils.widgets.text(
     "volume_name",
-    "/Volumes/odp_adw_mvp_n/migration/utilities/community_detection/",
+    "/Volumes/odp_adw_utilities_n/planning/utilities/community_detection/",
     "Input Volume Path"
 )
 dbutils.widgets.text(
@@ -2024,7 +2024,7 @@ def append_execution_metadata(weight_method, top_n, resolutions_dict):
     str
         Name of the metadata table
     """
-    table_name = "odp_adw_mvp_n.migration.execution_metadata"
+    table_name = "odp_adw_utilities_n.planning.execution_metadata"
     
     # Current timestamp
     execution_datetime = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -2754,7 +2754,7 @@ total_streams = leiden_df.shape[0]
 print(f"Total complexity score: {total_complexity:.2f}")
 print(f"Total streams: {total_streams}")
 
-missing_static_tables_df = spark.read.option("header", True).csv("/Volumes/odp_adw_mvp_n/migration/utilities/community_detection/static_tables_for_report.csv").select("table_name")
+missing_static_tables_df = spark.read.option("header", True).csv(f"{volume_path}static_tables_for_report.csv").select("table_name")
 missing_static_tables = set(row["table_name"] for row in missing_static_tables_df.collect())
 
 # Prepare timeline data
@@ -3147,6 +3147,7 @@ display(timeline_csv_df.head())
 # COMMAND ----------
 
 # DBTITLE 1,Cutover Readiness Analysis
+import builtins
 
 print("\n" + "="*100)
 print("CUTOVER READINESS ANALYSIS")
@@ -3181,7 +3182,7 @@ for comp_id, comp in enumerate(components):
 
 comp_sizes = sorted([len(c) for c in components], reverse=True)
 print(f"Component sizes (top 10): {comp_sizes[:10]}")
-print(f"Single-stream components: {sum(1 for s in comp_sizes if s == 1)}")
+print(f"Single-stream components: {builtins.sum(1 for s in comp_sizes if s == 1)}")
 
 # --- Step 3: Get BI stream table requirements from dependency_df ---
 bi_stream_src_df = dependency_df.filter(
@@ -3493,6 +3494,378 @@ print(f"  Total:             {len(cutover_ready_etl) + len(cutover_ready_bi)}/{l
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Immediate Dependency Cutover Readiness Analysis
+# MAGIC
+# MAGIC A **less strict** cutover check: a stream is cutover-ready when all its
+# MAGIC **immediate** (one-hop) upstream and downstream ETL dependencies are migrated.
+# MAGIC
+# MAGIC Unlike the recursive analysis (which requires the entire connected component),
+# MAGIC this only checks direct neighbors. A stream can be immediate-cutover-ready
+# MAGIC even if a transitive dependency two hops away is not yet migrated.
+# MAGIC
+# MAGIC **BI/JSON Streams**: Same logic as recursive (table availability + static tables).
+
+# COMMAND ----------
+
+# DBTITLE 1,Immediate Dependency Cutover Readiness Analysis
+from collections import defaultdict
+
+print("\n" + "="*100)
+print("IMMEDIATE DEPENDENCY CUTOVER READINESS ANALYSIS")
+print("="*100)
+
+# --- Step 1: Build directed neighbor maps from stream_stream_dependency_df ---
+# 'from' produces table, 'to' consumes table
+# upstream[X]   = {Y : Y→X} i.e. streams that produce data X reads
+# downstream[X] = {Z : X→Z} i.e. streams that consume data X produces
+
+stream_deps_directed = stream_stream_dependency_df.select("from", "to").distinct().toPandas()
+
+# Filter to ETL-only edges
+etl_directed = stream_deps_directed[
+    ~stream_deps_directed['from'].str.lower().str.contains('json') &
+    ~stream_deps_directed['to'].str.lower().str.contains('json')
+].copy()
+
+upstream_neighbors = defaultdict(set)
+downstream_neighbors = defaultdict(set)
+
+for _, row in etl_directed.iterrows():
+    src, tgt = row['from'], row['to']
+    if src in etl_streams_all and tgt in etl_streams_all:
+        upstream_neighbors[tgt].add(src)
+        downstream_neighbors[src].add(tgt)
+
+# All immediate neighbors (union of upstream + downstream)
+all_immediate_neighbors = defaultdict(set)
+for stream in etl_streams_all:
+    all_immediate_neighbors[stream] = upstream_neighbors[stream] | downstream_neighbors[stream]
+
+streams_with_neighbors = builtins.sum(1 for s in etl_streams_all if all_immediate_neighbors[s])
+streams_isolated = len(etl_streams_all) - streams_with_neighbors
+
+print(f"Directed ETL edges: {len(etl_directed)}")
+print(f"ETL streams with immediate neighbors: {streams_with_neighbors}")
+print(f"ETL streams without neighbors (isolated): {streams_isolated}")
+
+# --- Step 2: Process each clubbed stage ---
+migrated_streams_imm = set()
+cutover_ready_etl_imm = set()
+cutover_ready_bi_imm = set()
+bi_available_tables_imm = missing_static_tables.copy()
+
+cutover_rows_imm = []
+stage_summaries_imm = []
+
+for _, stage_row in timeline_df.iterrows():
+    stage_num = stage_row['Stage']
+    stage_end_date = stage_row['End_Date']
+    stage_start_date = stage_row['Start_Date']
+    stage_communities = stage_row['Original_Community_IDs']
+    stage_community_label = stage_row['Community_ID']
+
+    # Migrate all streams from this stage's communities
+    for comm_id in stage_communities:
+        comm_streams_set = set(leiden_df[leiden_df['community'] == comm_id]['stream'].tolist())
+        migrated_streams_imm.update(comm_streams_set)
+        for stream in comm_streams_set:
+            if stream in stream_produces:
+                bi_available_tables_imm.update(stream_produces[stream])
+
+    # ETL immediate cutover: check all migrated-but-not-yet-cutover streams
+    # A stream may become cutover-ready in a later stage when its last neighbor gets migrated
+    newly_cutover_etl_imm = []
+    candidates = (etl_streams_all & migrated_streams_imm) - cutover_ready_etl_imm
+    for stream in sorted(candidates):
+        neighbors = all_immediate_neighbors[stream]
+        if neighbors.issubset(migrated_streams_imm):
+            newly_cutover_etl_imm.append(stream)
+            cutover_ready_etl_imm.add(stream)
+
+    # BI cutover (same logic as recursive)
+    newly_cutover_bi_imm = []
+    for bi_stream in sorted(bi_streams_all - cutover_ready_bi_imm):
+        required = bi_stream_required_tables.get(bi_stream, set())
+        if not required:
+            if bi_stream in migrated_streams_imm:
+                newly_cutover_bi_imm.append(bi_stream)
+                cutover_ready_bi_imm.add(bi_stream)
+        elif required.issubset(bi_available_tables_imm):
+            newly_cutover_bi_imm.append(bi_stream)
+            cutover_ready_bi_imm.add(bi_stream)
+
+    # Record per-stream rows for CSV
+    for stream in newly_cutover_etl_imm:
+        up_count = len(upstream_neighbors[stream])
+        down_count = len(downstream_neighbors[stream])
+        cutover_rows_imm.append({
+            'stage': stage_num,
+            'end_date': stage_end_date,
+            'community_id': int(stream_to_community.get(stream, -1)),
+            'stream_name': stream,
+            'stream_type': 'ETL',
+            'immediate_upstream_count': up_count,
+            'immediate_downstream_count': down_count,
+            'component_id': stream_to_component.get(stream, -1),
+        })
+
+    for stream in newly_cutover_bi_imm:
+        cutover_rows_imm.append({
+            'stage': stage_num,
+            'end_date': stage_end_date,
+            'community_id': int(stream_to_community.get(stream, -1)),
+            'stream_name': stream,
+            'stream_type': 'BI',
+            'immediate_upstream_count': -1,
+            'immediate_downstream_count': -1,
+            'component_id': -1,
+        })
+
+    total_cutover_imm = len(cutover_ready_etl_imm) + len(cutover_ready_bi_imm)
+    total_all = len(all_streams_set)
+
+    stage_summaries_imm.append({
+        'stage': stage_num,
+        'community_label': stage_community_label,
+        'start_date': stage_start_date,
+        'end_date': stage_end_date,
+        'newly_cutover_etl': len(newly_cutover_etl_imm),
+        'newly_cutover_bi': len(newly_cutover_bi_imm),
+        'newly_cutover_etl_streams': newly_cutover_etl_imm,
+        'newly_cutover_bi_streams': newly_cutover_bi_imm,
+        'cumulative_cutover_etl': len(cutover_ready_etl_imm),
+        'cumulative_cutover_bi': len(cutover_ready_bi_imm),
+        'cumulative_cutover_total': total_cutover_imm,
+        'cumulative_cutover_pct': (total_cutover_imm / total_all * 100) if total_all > 0 else 0.0,
+        'cumulative_migrated': len(migrated_streams_imm),
+    })
+
+    print(f"\nStage {stage_num} ({stage_end_date}):")
+    print(f"  Newly cutover-ready: {len(newly_cutover_etl_imm)} ETL, {len(newly_cutover_bi_imm)} BI")
+    print(f"  Cumulative cutover: {total_cutover_imm}/{total_all} ({total_cutover_imm/total_all*100:.1f}%)")
+
+# --- Step 3: Save CSV ---
+cutover_imm_csv_df = pd.DataFrame(cutover_rows_imm)
+cutover_imm_csv_path = f"{output_path}migration_order_analysis/cutover_readiness_immediate_gamma_{resolution}.csv"
+cutover_imm_csv_df.to_csv(cutover_imm_csv_path, index=False)
+print(f"\nImmediate cutover readiness CSV saved: {cutover_imm_csv_path}")
+
+# --- Step 4: Generate TXT report ---
+cutover_imm_txt_path = f"{output_path}migration_order_analysis/cutover_readiness_immediate_analysis_gamma_{resolution}.txt"
+
+with open(cutover_imm_txt_path, 'w') as f:
+    f.write("="*120 + "\n")
+    f.write(f"IMMEDIATE DEPENDENCY CUTOVER READINESS ANALYSIS\n")
+    f.write(f"Resolution γ={resolution}\n")
+    f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write("="*120 + "\n\n")
+
+    f.write("A stream is cutover-ready (immediate) when:\n")
+    f.write("  - ETL streams: ALL immediate upstream AND downstream ETL neighbors are migrated\n")
+    f.write("  - BI/JSON streams: all required source tables are available (produced + static tables)\n")
+    f.write("  Note: This is LESS strict than the recursive check — transitive dependencies are not checked.\n\n")
+
+    f.write(f"Total ETL Streams: {len(etl_streams_all)}\n")
+    f.write(f"Total BI/JSON Streams: {len(bi_streams_all)}\n")
+    f.write(f"Migration Start Date: {START_DATE.strftime('%Y-%m-%d')}\n")
+    f.write(f"Total Stages: {len(stage_summaries_imm)}\n\n")
+
+    for ss in stage_summaries_imm:
+        f.write(f"{'='*120}\n")
+        if 'Clubbed' in str(ss['community_label']):
+            f.write(f"STAGE {ss['stage']}: {ss['community_label']} | {ss['start_date']} to {ss['end_date']}\n")
+        else:
+            f.write(f"STAGE {ss['stage']}: Community {ss['community_label']} | {ss['start_date']} to {ss['end_date']}\n")
+        f.write(f"{'='*120}\n\n")
+
+        f.write(f"Newly Cutover-Ready ETL Streams: {ss['newly_cutover_etl']}\n")
+        f.write(f"Newly Cutover-Ready BI Streams: {ss['newly_cutover_bi']}\n")
+        f.write(f"Cumulative Cutover-Ready: {ss['cumulative_cutover_total']}/{len(all_streams_set)} ({ss['cumulative_cutover_pct']:.2f}%)\n")
+        f.write(f"  - ETL: {ss['cumulative_cutover_etl']}/{len(etl_streams_all)}\n")
+        f.write(f"  - BI: {ss['cumulative_cutover_bi']}/{len(bi_streams_all)}\n\n")
+
+        if ss['newly_cutover_etl_streams']:
+            f.write(f"--- ETL Streams Ready for Cutover ---\n")
+            for stream in ss['newly_cutover_etl_streams']:
+                up = sorted(upstream_neighbors[stream])
+                down = sorted(downstream_neighbors[stream])
+                f.write(f"    - {stream}\n")
+                if up:
+                    f.write(f"        Upstream ({len(up)}): {', '.join(up)}\n")
+                if down:
+                    f.write(f"        Downstream ({len(down)}): {', '.join(down)}\n")
+                if not up and not down:
+                    f.write(f"        (Isolated — no immediate dependencies)\n")
+        else:
+            f.write(f"--- ETL Streams Ready for Cutover ---\n")
+            f.write(f"  (No new ETL streams ready for cutover at this stage)\n")
+
+        if ss['newly_cutover_bi_streams']:
+            f.write(f"\n--- BI Streams Ready for Cutover ---\n")
+            for stream in ss['newly_cutover_bi_streams']:
+                f.write(f"    - {stream}\n")
+        else:
+            f.write(f"\n--- BI Streams Ready for Cutover ---\n")
+            f.write(f"  (No new BI streams ready for cutover at this stage)\n")
+
+        f.write("\n")
+
+    # Final summary
+    f.write(f"\n{'='*120}\n")
+    f.write(f"IMMEDIATE CUTOVER READINESS SUMMARY\n")
+    f.write(f"{'='*120}\n\n")
+
+    final_imm = stage_summaries_imm[-1] if stage_summaries_imm else {}
+    etl_ready_imm = final_imm.get('cumulative_cutover_etl', 0)
+    bi_ready_imm = final_imm.get('cumulative_cutover_bi', 0)
+    total_ready_imm = final_imm.get('cumulative_cutover_total', 0)
+
+    f.write(f"Total ETL cutover-ready (immediate): {etl_ready_imm}/{len(etl_streams_all)}")
+    f.write(f" ({etl_ready_imm/len(etl_streams_all)*100:.1f}%)\n" if etl_streams_all else "\n")
+    f.write(f"Total BI cutover-ready: {bi_ready_imm}/{len(bi_streams_all)}")
+    f.write(f" ({bi_ready_imm/len(bi_streams_all)*100:.1f}%)\n" if bi_streams_all else "\n")
+    f.write(f"Total cutover-ready: {total_ready_imm}/{len(all_streams_set)}")
+    f.write(f" ({final_imm.get('cumulative_cutover_pct', 0):.1f}%)\n\n")
+
+    # Comparison with recursive analysis
+    f.write(f"--- Comparison: Immediate vs Recursive ---\n\n")
+    f.write(f"{'Metric':<40} {'Immediate':>12} {'Recursive':>12} {'Diff':>8}\n")
+    f.write(f"{'-'*72}\n")
+    diff_etl = etl_ready_imm - len(cutover_ready_etl)
+    diff_bi = bi_ready_imm - len(cutover_ready_bi)
+    diff_total = total_ready_imm - (len(cutover_ready_etl) + len(cutover_ready_bi))
+    f.write(f"{'ETL cutover-ready':<40} {etl_ready_imm:>12} {len(cutover_ready_etl):>12} {diff_etl:>+8}\n")
+    f.write(f"{'BI cutover-ready':<40} {bi_ready_imm:>12} {len(cutover_ready_bi):>12} {diff_bi:>+8}\n")
+    f.write(f"{'Total cutover-ready':<40} {total_ready_imm:>12} {len(cutover_ready_etl) + len(cutover_ready_bi):>12} {diff_total:>+8}\n\n")
+
+    # Streams that are immediate-ready but NOT recursive-ready
+    imm_only = cutover_ready_etl_imm - cutover_ready_etl
+    if imm_only:
+        f.write(f"--- Streams Cutover-Ready (Immediate) but NOT (Recursive) ---\n")
+        f.write(f"These {len(imm_only)} streams have all immediate neighbors migrated,\n")
+        f.write(f"but their wider connected component is not fully migrated.\n\n")
+        for stream in sorted(imm_only):
+            comp_id = stream_to_component.get(stream, -1)
+            comp = component_streams_map.get(comp_id, set())
+            not_migrated_in_comp = sorted(comp - migrated_streams_cutover)
+            f.write(f"  - {stream} (component {comp_id}, {len(comp)} streams, {len(not_migrated_in_comp)} unmigrated)\n")
+            if not_migrated_in_comp:
+                f.write(f"    Unmigrated in component: {', '.join(not_migrated_in_comp[:10])}")
+                if len(not_migrated_in_comp) > 10:
+                    f.write(f" ... and {len(not_migrated_in_comp) - 10} more")
+                f.write("\n")
+
+    # Streams NOT cutover-ready
+    not_cutover_etl_imm = etl_streams_all - cutover_ready_etl_imm
+    not_cutover_bi_imm = bi_streams_all - cutover_ready_bi_imm
+
+    if not_cutover_etl_imm or not_cutover_bi_imm:
+        f.write(f"\n--- Streams NOT Cutover-Ready (Immediate) After All Stages ---\n\n")
+        if not_cutover_etl_imm:
+            f.write(f"ETL Streams ({len(not_cutover_etl_imm)}):\n")
+            for stream in sorted(not_cutover_etl_imm):
+                up_not_migrated = sorted(upstream_neighbors[stream] - migrated_streams_imm)
+                down_not_migrated = sorted(downstream_neighbors[stream] - migrated_streams_imm)
+                f.write(f"  - {stream}\n")
+                if up_not_migrated:
+                    f.write(f"    Unmigrated upstream: {', '.join(up_not_migrated)}\n")
+                if down_not_migrated:
+                    f.write(f"    Unmigrated downstream: {', '.join(down_not_migrated)}\n")
+        if not_cutover_bi_imm:
+            f.write(f"\nBI Streams ({len(not_cutover_bi_imm)}):\n")
+            for stream in sorted(not_cutover_bi_imm):
+                required = bi_stream_required_tables.get(stream, set())
+                missing = required - bi_available_tables_imm
+                f.write(f"  - {stream} ({len(missing)} missing tables)\n")
+
+    f.write(f"\n{'='*120}\n")
+
+print(f"Immediate cutover readiness report saved: {cutover_imm_txt_path}")
+
+print(f"\n{'='*100}")
+print(f"IMMEDIATE CUTOVER ANALYSIS COMPLETE")
+print(f"{'='*100}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Immediate Cutover Readiness Verification
+
+print("="*80)
+print("IMMEDIATE CUTOVER READINESS VERIFICATION")
+print("="*80)
+
+errors_imm = []
+
+# 1. Every immediate-cutover-ready stream must be migrated
+not_migrated_but_cutover = cutover_ready_etl_imm - migrated_streams_imm
+if not_migrated_but_cutover:
+    errors_imm.append(f"ETL cutover-ready but not migrated: {not_migrated_but_cutover}")
+print(f"[{'PASS' if not not_migrated_but_cutover else 'FAIL'}] Cutover-ready ⊆ migrated")
+
+# 2. Every immediate-cutover-ready stream must have all neighbors migrated
+bad_neighbors = []
+for stream in cutover_ready_etl_imm:
+    neighbors = all_immediate_neighbors[stream]
+    unmigrated = neighbors - migrated_streams_imm
+    if unmigrated:
+        bad_neighbors.append((stream, unmigrated))
+if bad_neighbors:
+    errors_imm.append(f"{len(bad_neighbors)} cutover-ready streams have unmigrated neighbors")
+print(f"[{'PASS' if not bad_neighbors else 'FAIL'}] All cutover-ready streams have all neighbors migrated")
+
+# 3. Recursive cutover-ready must be a subset of immediate cutover-ready
+# (recursive is stricter, so anything recursive-ready should also be immediate-ready)
+recursive_not_in_immediate = cutover_ready_etl - cutover_ready_etl_imm
+if recursive_not_in_immediate:
+    errors_imm.append(f"Recursive-ready but NOT immediate-ready: {recursive_not_in_immediate}")
+print(f"[{'PASS' if not recursive_not_in_immediate else 'FAIL'}] Recursive cutover ⊆ immediate cutover")
+
+# 4. Isolated ETL streams are cutover-ready if migrated
+isolated_etl_imm = set(s for s in etl_streams_all if not all_immediate_neighbors[s])
+isolated_migrated_imm = isolated_etl_imm & migrated_streams_imm
+isolated_not_cutover_imm = isolated_migrated_imm - cutover_ready_etl_imm
+if isolated_not_cutover_imm:
+    errors_imm.append(f"Isolated migrated ETL streams not cutover-ready: {isolated_not_cutover_imm}")
+print(f"[{'PASS' if not isolated_not_cutover_imm else 'FAIL'}] All isolated migrated streams are cutover-ready ({len(isolated_migrated_imm)} isolated & migrated)")
+
+# 5. ETL + BI = total (partition check — reuses sets from recursive)
+overlap_imm = etl_streams_all & bi_streams_all
+gap_imm = all_streams_set - (etl_streams_all | bi_streams_all)
+print(f"[{'PASS' if not overlap_imm and not gap_imm else 'FAIL'}] ETL ∪ BI = all streams")
+
+# 6. CSV row count matches cutover-ready count
+expected_imm = len(cutover_ready_etl_imm) + len(cutover_ready_bi_imm)
+actual_imm = len(cutover_imm_csv_df)
+if actual_imm != expected_imm:
+    errors_imm.append(f"CSV rows ({actual_imm}) != cutover-ready ({expected_imm})")
+print(f"[{'PASS' if actual_imm == expected_imm else 'FAIL'}] CSV row count matches ({actual_imm} rows)")
+
+# 7. Immediate count >= Recursive count (immediate is less strict)
+if len(cutover_ready_etl_imm) < len(cutover_ready_etl):
+    errors_imm.append(f"Immediate ETL ({len(cutover_ready_etl_imm)}) < Recursive ETL ({len(cutover_ready_etl)})")
+print(f"[{'PASS' if len(cutover_ready_etl_imm) >= len(cutover_ready_etl) else 'FAIL'}] Immediate count >= Recursive count ({len(cutover_ready_etl_imm)} >= {len(cutover_ready_etl)})")
+
+if errors_imm:
+    print(f"\n{'!'*80}")
+    print(f"ERRORS FOUND ({len(errors_imm)}):")
+    for e in errors_imm:
+        print(f"  - {e}")
+    print(f"{'!'*80}")
+else:
+    print(f"\nAll checks passed.")
+
+print(f"\nFinal counts (immediate):")
+print(f"  ETL cutover-ready: {len(cutover_ready_etl_imm)}/{len(etl_streams_all)}")
+print(f"  BI cutover-ready:  {len(cutover_ready_bi_imm)}/{len(bi_streams_all)}")
+print(f"  Total:             {len(cutover_ready_etl_imm) + len(cutover_ready_bi_imm)}/{len(all_streams_set)}")
+
+print(f"\nComparison (immediate vs recursive):")
+print(f"  ETL: {len(cutover_ready_etl_imm)} vs {len(cutover_ready_etl)} ({len(cutover_ready_etl_imm) - len(cutover_ready_etl):+d})")
+print(f"  BI:  {len(cutover_ready_bi_imm)} vs {len(cutover_ready_bi)} ({len(cutover_ready_bi_imm) - len(cutover_ready_bi):+d})")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC
 # MAGIC ## Report Migration Readiness Analysis
 # MAGIC
@@ -3619,7 +3992,7 @@ execution_stages = stream_ordering_pd['execution_order'].unique().tolist()
 print(f"Total execution stages: {len(execution_stages)}")
 print(f"Execution order (optimized): {execution_stages}")
 
-missing_static_tables_df = spark.read.option("header", True).csv("/Volumes/odp_adw_mvp_n/migration/utilities/community_detection/static_tables_for_report.csv").select("table_name")
+missing_static_tables_df = spark.read.option("header", True).csv(f"{volume_path}static_tables_for_report.csv").select("table_name")
 missing_static_tables = set(row["table_name"] for row in missing_static_tables_df.collect())
 
 
