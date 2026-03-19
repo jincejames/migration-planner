@@ -498,7 +498,7 @@ class TestLoadConfigYAML:
     def test_project_root_config_yaml_loads_all_fields(self):
         root_config = Path(__file__).parent.parent / "config.yaml"
         cfg = load_config(["--config", str(root_config)])
-        assert cfg.volume_name == "/Volumes/odp_adw_mvp_n/migration/utilities/community_detection/"
+        assert cfg.volume_name == "/Volumes/odp_adw_utilities_n/planning/utilities/community_detection/"
         assert cfg.input_dependency_name == "ETL-table-dependencies_20251223_1218.csv"
         assert cfg.outofscope_stream_file_name == "out-of-scopte-streams.csv"
         assert cfg.report_dependency_file_name == "stream_to_report_mapping_new.csv"

@@ -295,12 +295,6 @@ class TestBruteForceCommunityOrdering:
     Some tests use real data to verify the brute-force algorithm correctness.
     """
 
-    def _make_spark_dep(self, pdf: pd.DataFrame) -> MagicMock:
-        df = MagicMock()
-        df.select.return_value = df
-        df.toPandas.return_value = pdf
-        return df
-
     def _simple_dep_pdf(self) -> pd.DataFrame:
         return _simple_dep_pdf()
 
@@ -310,9 +304,8 @@ class TestBruteForceCommunityOrdering:
             pdf = self._simple_dep_pdf()
         if leiden_df is None:
             leiden_df = _simple_leiden_df()
-        spark_dep = self._make_spark_dep(pdf)
         return BruteForceCommunityOrdering(
-            spark_dep, leiden_df,
+            pdf, leiden_df,
             communities_subset=communities_subset,
             pre_available_communities=pre_available_communities,
         )
@@ -357,13 +350,28 @@ class TestBruteForceCommunityOrdering:
         # Community 1 (s3) should have incoming tables T1 and T2
         assert len(bf.incoming_tables.get(1, set())) > 0
 
+    def test_bitmask_attributes_initialised(self):
+        bf = self._make_bf()
+        assert bf._n_tables > 0
+        assert len(bf._table_to_idx) == bf._n_tables
+        assert bf._weight_vec.shape == (bf._n_tables,)
+        assert len(bf._incoming_mask) == len(bf.communities)
+        assert len(bf._produced_mask) == len(bf.communities)
+        assert bf._pre_available_mask.shape == (bf._n_tables,)
+
     # --- evaluate_ordering_cost ---
 
     def test_returns_tuple_with_total_and_steps(self):
         bf = self._make_bf()
-        total, steps = bf.evaluate_ordering_cost([0, 1])
+        total, steps = bf.evaluate_ordering_cost([0, 1], return_step_costs=True)
         assert isinstance(total, float)
         assert isinstance(steps, list)
+
+    def test_returns_none_steps_by_default(self):
+        bf = self._make_bf()
+        total, steps = bf.evaluate_ordering_cost([0, 1])
+        assert isinstance(total, float)
+        assert steps is None
 
     def test_ordering_starting_with_producer_has_lower_cost(self):
         """Ordering [0, 1]: community 0 first → community 1's tables already available."""
@@ -374,16 +382,23 @@ class TestBruteForceCommunityOrdering:
 
     def test_empty_ordering_has_zero_cost(self):
         bf = self._make_bf(communities_subset=[0])
-        total, steps = bf.evaluate_ordering_cost([])
+        total, steps = bf.evaluate_ordering_cost([], return_step_costs=True)
         assert total == 0.0
         assert steps == []
 
-    def test_custom_initial_available_reduces_cost(self):
+    def test_pruning_returns_inf_when_exceeding_best_cost(self):
         bf = self._make_bf()
-        # Pre-supply all incoming tables for community 1
-        pre_available = {"T1", "T2"}
-        cost_with, _ = bf.evaluate_ordering_cost([0, 1], initial_available=pre_available)
-        cost_without, _ = bf.evaluate_ordering_cost([0, 1])
+        # Use a very small best_cost so pruning kicks in
+        cost, steps = bf.evaluate_ordering_cost([1, 0], best_cost=0.0)
+        assert cost == float("inf")
+        assert steps is None
+
+    def test_pre_available_communities_reduces_cost(self):
+        """When pre_available_communities=[0], community 1's incoming tables are already available."""
+        bf_without = self._make_bf()
+        bf_with = self._make_bf(communities_subset=[1], pre_available_communities=[0])
+        cost_without, _ = bf_without.evaluate_ordering_cost([1])
+        cost_with, _ = bf_with.evaluate_ordering_cost([1])
         assert cost_with <= cost_without
 
     # --- brute_force ---
@@ -417,7 +432,9 @@ class TestBruteForceCommunityOrdering:
         order [0, 1] should be optimal (lower cost than [1, 0])."""
         bf = self._make_bf()
         result = bf.brute_force(log_every=10000, label="test")
-        cost_optimal, _ = bf.evaluate_ordering_cost(result["best_order"])
+        cost_optimal, _ = bf.evaluate_ordering_cost(
+            result["best_order"], return_step_costs=False,
+        )
         assert cost_optimal == result["best_cost"]
 
     def test_single_community_brute_force(self):
@@ -441,7 +458,7 @@ class TestAppendExecutionMetadata:
     def test_table_name_is_correct(self):
         spark = _make_spark()
         result = append_execution_metadata(spark, "factor", 10, {1.8: (100.0, 5)})
-        assert result == "odp_adw_mvp_n.migration.execution_metadata"
+        assert result == "odp_adw_utilities_n.planning.execution_metadata"
 
     def test_creates_dataframe_with_row_count(self):
         spark = _make_spark()

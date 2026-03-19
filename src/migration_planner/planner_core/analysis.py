@@ -6,7 +6,6 @@ explicit parameters — no values are recomputed here.
 """
 from __future__ import annotations
 
-import builtins
 import itertools
 import os
 import time
@@ -426,11 +425,18 @@ class BruteForceCommunityOrdering:
     Supports pre-available tables: when optimising a subset of communities you
     can specify other communities whose produced tables should be considered
     already available (e.g. when optimising top-N after rest communities).
+
+    Optimised with:
+
+    * Bitmask representation for table sets (bitwise OR/AND instead of Python sets)
+    * Numpy weight vector for vectorised cost calculation
+    * Branch-and-bound pruning to skip permutations that exceed the current best
+    * Lazy ``step_costs`` (only computed for new best solutions)
     """
 
     def __init__(
         self,
-        stream_table_dependency_df_scaled: "DataFrame",
+        dep_pdf: pd.DataFrame,
         leiden_df: pd.DataFrame,
         communities_subset: list | None = None,
         pre_available_communities: list | None = None,
@@ -438,8 +444,10 @@ class BruteForceCommunityOrdering:
         """
         Parameters
         ----------
-        stream_table_dependency_df_scaled:
-            Spark DataFrame with columns ``from``, ``to``, ``table``, ``weight``.
+        dep_pdf:
+            Pre-collected pandas DataFrame with columns ``from``, ``to``,
+            ``table``, ``weight``.  Avoids repeated ``.toPandas()`` calls
+            when multiple instances are created from the same Spark source.
         leiden_df:
             DataFrame with columns ``stream``, ``community``.
         communities_subset:
@@ -448,12 +456,7 @@ class BruteForceCommunityOrdering:
             Community IDs whose produced tables are considered already available
             at the start of the optimisation.
         """
-        self.dep = (
-            stream_table_dependency_df_scaled
-            .select("from", "to", "table", "weight")
-            .toPandas()
-            .copy()
-        )
+        self.dep = dep_pdf.copy()
 
         self.dep["from"] = self.dep["from"].astype(str)
         self.dep["to"] = self.dep["to"].astype(str)
@@ -512,49 +515,82 @@ class BruteForceCommunityOrdering:
                     self.pre_available_tables |= tables
             print(f"  Pre-available tables count: {len(self.pre_available_tables)}")
 
+        # --- Build bitmask representation for fast evaluation ---
+        all_tables = sorted(self.table_weight.keys())
+        self._table_to_idx = {t: i for i, t in enumerate(all_tables)}
+        self._n_tables = len(all_tables)
+
+        self._weight_vec = np.zeros(self._n_tables, dtype=np.float64)
+        for t, w in self.table_weight.items():
+            self._weight_vec[self._table_to_idx[t]] = w
+
+        self._incoming_mask: dict[int, np.ndarray] = {}
+        for c in self.communities:
+            mask = np.zeros(self._n_tables, dtype=np.bool_)
+            for t in self.incoming_tables[c]:
+                if t in self._table_to_idx:
+                    mask[self._table_to_idx[t]] = True
+            self._incoming_mask[c] = mask
+
+        self._produced_mask: dict[int, np.ndarray] = {}
+        for c in self.communities:
+            mask = np.zeros(self._n_tables, dtype=np.bool_)
+            for t in self.produced_tables[c]:
+                if t in self._table_to_idx:
+                    mask[self._table_to_idx[t]] = True
+            self._produced_mask[c] = mask
+
+        self._pre_available_mask = np.zeros(self._n_tables, dtype=np.bool_)
+        for t in self.pre_available_tables:
+            if t in self._table_to_idx:
+                self._pre_available_mask[self._table_to_idx[t]] = True
+
+        print(f"  Bitmask optimization: {self._n_tables} unique tables indexed")
+
     def evaluate_ordering_cost(
         self,
         ordering: list | tuple,
-        initial_available: set | None = None,
-    ) -> tuple[float, list]:
-        """Evaluate the total sync cost for a given ordering.
-
-        At each step, calculates the immediate sync cost for the current
-        community: tables needed but not yet available.
+        best_cost: float = float("inf"),
+        return_step_costs: bool = False,
+    ) -> tuple[float, list | None]:
+        """Evaluate total sync cost with bitmask + numpy, with branch-and-bound pruning.
 
         Parameters
         ----------
         ordering:
             Sequence of community IDs.
-        initial_available:
-            Tables already available at the start.  Uses
-            ``self.pre_available_tables`` when ``None``.
+        best_cost:
+            Current best cost for pruning.  Returns ``(inf, None)`` early if
+            the running total reaches or exceeds this value.
+        return_step_costs:
+            If ``True``, also compute per-step costs.
 
         Returns
         -------
-        tuple[float, list]
-            ``(total_cost, step_costs)`` where ``step_costs`` is the per-step
-            list of immediate sync costs.
+        tuple[float, list | None]
+            ``(total_cost, step_costs or None)``
         """
-        if initial_available is None:
-            available = self.pre_available_tables.copy()
-        else:
-            available = initial_available.copy()
-
+        available = self._pre_available_mask.copy()
         total = 0.0
-        step_costs: list = []
+        step_costs: list | None = [] if return_step_costs else None
 
         for c in ordering:
-            to_sync = self.incoming_tables[c] - available
-            step = float(builtins.sum(self.table_weight.get(t, 0.0) for t in to_sync))
+            to_sync = self._incoming_mask[c] & ~available
+            step = float(np.dot(to_sync, self._weight_vec))
             total += step
-            step_costs.append(step)
-            available |= self.produced_tables[c]
+            if return_step_costs:
+                step_costs.append(step)
+            if total >= best_cost:
+                return float("inf"), None
+            available |= self._produced_mask[c]
 
         return total, step_costs
 
     def brute_force(self, log_every: int = 5000, label: str = "subset") -> dict:
         """Perform a brute-force search over all permutations.
+
+        Uses bitmask + numpy for fast cost evaluation and branch-and-bound
+        pruning to skip permutations that exceed the current best cost.
 
         Parameters
         ----------
@@ -575,33 +611,41 @@ class BruteForceCommunityOrdering:
         best_cost = float("inf")
         best_order = None
         best_step_costs = None
+        pruned_count = 0
 
         start = time.time()
 
         print(f"\n=== Brute force ({label}) | communities={n} | perms={total_perms} ===")
         print("  Optimization objective: Minimize total sync cost across all steps")
+        print("  Optimizations: bitmask + numpy + branch-and-bound pruning")
         if self.pre_available_tables:
             print(f"  Starting with {len(self.pre_available_tables)} pre-available tables")
 
         for i, perm in enumerate(itertools.permutations(self.communities), 1):
-            cost, step_costs = self.evaluate_ordering_cost(perm)
+            cost, _ = self.evaluate_ordering_cost(perm, best_cost=best_cost)
 
             if cost < best_cost:
                 best_cost = cost
                 best_order = perm
-                best_step_costs = step_costs
+                _, best_step_costs = self.evaluate_ordering_cost(
+                    perm, return_step_costs=True,
+                )
                 print(f"[NEW BEST] {i}/{total_perms} cost={best_cost:.6f} order={list(best_order)}")
+            elif cost == float("inf"):
+                pruned_count += 1
 
             if i % log_every == 0:
                 elapsed = time.time() - start
                 rate = i / elapsed if elapsed > 0 else 0
                 remaining = total_perms - i
                 eta = remaining / rate if rate > 0 else float("inf")
+                prune_pct = (pruned_count / i * 100) if i > 0 else 0
                 print(
                     f"[PROGRESS] {i}/{total_perms} "
                     f"({100 * i / total_perms:.2f}%) | "
                     f"best={best_cost:.6f} | "
                     f"{rate:.1f} perms/sec | "
+                    f"pruned={prune_pct:.1f}% | "
                     f"elapsed={elapsed / 60:.2f} min | "
                     f"eta={eta / 60:.2f} min"
                 )
@@ -610,6 +654,7 @@ class BruteForceCommunityOrdering:
         print(f"\nDONE ({label}) in {total_time / 60:.2f} min")
         print(f"BEST COST: {best_cost:.6f}")
         print(f"BEST ORDER: {list(best_order)}")
+        print(f"Pruned: {pruned_count}/{total_perms} ({pruned_count / total_perms * 100:.1f}%)")
 
         return {
             "best_cost": float(best_cost),
@@ -651,7 +696,7 @@ def append_execution_metadata(
     str
         Name of the metadata table.
     """
-    table_name = "odp_adw_mvp_n.migration.execution_metadata"
+    table_name = "odp_adw_utilities_n.planning.execution_metadata"
 
     execution_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 

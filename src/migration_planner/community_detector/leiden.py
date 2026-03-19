@@ -59,6 +59,10 @@ from migration_planner.planner_core.analysis import (
     split_bi_etl,
     split_communities_topN,
 )
+from migration_planner.planner_core.cutover_analysis import (
+    generate_recursive_cutover_analysis,
+    generate_immediate_cutover_analysis,
+)
 from migration_planner.planner_core.preprocessing import (
     preprocess_stream_dependencies,
 )
@@ -608,8 +612,8 @@ for resolution in resolutions:
     # Optimize non-zero sync communities
     if len(non_zero_sync_communities) > 0:
         bf_rest = BruteForceCommunityOrdering(
-            dep_scaled_df, 
-            leiden_df, 
+            dep_pdf,
+            leiden_df,
             non_zero_sync_communities,
             pre_available_communities=None  # No pre-available tables for rest
         )
@@ -629,8 +633,8 @@ for resolution in resolutions:
     # Step 2: Optimize TOP N communities with all REST communities as pre-available
     print(f"\n--- Step 2: Optimizing TOP N communities (with all REST tables pre-available) ---")
     bf_top = BruteForceCommunityOrdering(
-        dep_scaled_df, 
-        leiden_df, 
+        dep_pdf,
+        leiden_df,
         topN_ids,
         pre_available_communities=rest_ids  # All REST communities are already available
     )
@@ -1112,6 +1116,63 @@ print(f"{'='*120}\n")
 # Display first few rows (without internal columns)
 print("\nFirst 5 stages:")
 display(timeline_csv_df.head())
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Cutover Readiness Analysis
+
+# COMMAND ----------
+
+# DBTITLE 1,Recursive Upstream Cutover Analysis
+print("\n" + "=" * 100)
+print("CUTOVER READINESS ANALYSIS (Recursive Upstream)")
+print("=" * 100)
+
+cutover_ready_etl, cutover_ready_bi, cutover_stage_summaries, recursive_upstream = (
+    generate_recursive_cutover_analysis(
+        leiden_df=leiden_df,
+        stream_stream_dependency_df=stream_stream_dependency_df,
+        dependency_df=dependency_df,
+        timeline_df=timeline_df,
+        stream_produces=stream_produces,
+        missing_static_tables=missing_static_tables,
+        bi_stream_required_tables=report_required_tables,
+        resolution=resolution,
+        start_date=START_DATE,
+        output_path=output_path,
+    )
+)
+
+# COMMAND ----------
+
+# DBTITLE 1,Immediate Dependency Cutover Analysis
+print("\n" + "=" * 100)
+print("IMMEDIATE DEPENDENCY CUTOVER READINESS ANALYSIS")
+print("=" * 100)
+
+# Collect the final migrated set (all streams across all communities)
+all_migrated_streams = set(leiden_df["stream"].tolist())
+
+cutover_ready_etl_imm, cutover_ready_bi_imm, cutover_stage_summaries_imm = (
+    generate_immediate_cutover_analysis(
+        leiden_df=leiden_df,
+        stream_stream_dependency_df=stream_stream_dependency_df,
+        dependency_df=dependency_df,
+        timeline_df=timeline_df,
+        stream_produces=stream_produces,
+        missing_static_tables=missing_static_tables,
+        bi_stream_required_tables=report_required_tables,
+        resolution=resolution,
+        start_date=START_DATE,
+        output_path=output_path,
+        recursive_upstream=recursive_upstream,
+        cutover_ready_etl_recursive=cutover_ready_etl,
+        cutover_ready_bi_recursive=cutover_ready_bi,
+        migrated_streams_recursive=all_migrated_streams,
+        sync_threshold_gb=500.0,
+    )
+)
 
 # COMMAND ----------
 
