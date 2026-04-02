@@ -76,10 +76,18 @@ dbutils.fs.mkdirs(output_path)
 # COMMAND ----------
 
 # DBTITLE 1,Reading input stream-table dependency file
-dependency_df_full = (
-    spark.read.format("csv")
-    .option("header", "true")
-    .load(dependency_input_path)
+# Normalize column names to lowercase for consistent referencing
+_dep_raw = spark.read.format("csv").option("header", "true").load(dependency_input_path)
+dependency_df_full = _dep_raw.select(
+    [F.col(c).alias(c.lower()) for c in _dep_raw.columns]
+)
+
+# Filter out rows with empty DB_Table_Name or table_type (admin streams with no tables)
+dependency_df_full = dependency_df_full.filter(
+    F.col("db_table_name").isNotNull()
+    & (F.trim(F.col("db_table_name")) != "")
+    & F.col("table_type").isNotNull()
+    & (F.trim(F.col("table_type")) != "")
 )
 
 # COMMAND ----------
@@ -175,15 +183,25 @@ display(view_to_source_tables_df)
 raw_report_df = (
     spark.read.format("csv")
     .option("header", "true")
+    .option("multiLine", "true")
+    .option("escape", '"')
     .load(report_dependency_path)
     .select(
         F.col("Workbook Name").alias("report_name"),
-        F.upper(F.regexp_replace(F.col("fullName"), r"[\[\]]", "")).alias("table_name"),
+        F.upper(F.regexp_replace(F.col("fullName"), r"[\[\]']", "")).alias("table_name"),
     )
     .distinct()
     .filter(
         ~F.lower(F.col("report_name")).contains("corona")
         & ~F.lower(F.col("report_name")).contains("gdpr")
+    )
+    # Filter out malformed table names: must have non-empty schema AND table parts
+    # e.g. reject ".TABLE", "SCHEMA.", ".", "", or null
+    .filter(
+        F.col("table_name").isNotNull()
+        & ~F.col("table_name").startswith(".")
+        & ~F.col("table_name").endswith(".")
+        & (F.col("table_name") != "")
     )
 )
 
@@ -358,15 +376,17 @@ dependency_df = dependency_df_full.union(tgt_as_source).distinct()
 # COMMAND ----------
 
 # DBTITLE 1,Build table-to-stream production mapping
+# Include TGT, TGT_TRNS (tables written by streams) and File (file-based loads)
 stream_produces_df = (
     dependency_df
     .filter(
         (F.upper(F.col("table_type")) == "TGT")
         | (F.upper(F.col("table_type")) == "TGT_TRNS")
+        | (F.upper(F.col("table_type")) == "FILE")
     )
     .select(
         F.col("stream_name"),
-        F.upper(F.col("DB_Table_Name")).alias("table_name"),
+        F.upper(F.col("db_table_name")).alias("table_name"),
     )
     .distinct()
 )
