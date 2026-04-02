@@ -422,10 +422,10 @@ table_avail_map = dict(zip(table_avail_pd["table_name"], zip(
 # Community order lookup for display
 comm_order_pd = community_order_df.toPandas()
 
-# Report to tables (from report_table_dependency_df)
+# Report to tables (from report_table_dependency_df), dropping any null table names
 report_tables_pd = report_table_dependency_df.select(
     "report_name", "table_name",
-).distinct().toPandas()
+).filter(F.col("table_name").isNotNull() & F.col("report_name").isNotNull()).distinct().toPandas()
 
 report_required = report_tables_pd.groupby("report_name")["table_name"].apply(set).to_dict()
 
