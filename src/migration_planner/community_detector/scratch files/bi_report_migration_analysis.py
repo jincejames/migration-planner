@@ -1,8 +1,7 @@
 # Databricks notebook source
 # DBTITLE 1,Library imports
 import pandas as pd
-from datetime import datetime
-from pyspark.sql.functions import col, lit, when, upper, lower
+from datetime import datetime, timedelta
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
@@ -12,37 +11,37 @@ from pyspark.sql.window import Window
 dbutils.widgets.text(
     "volume_name",
     "/Volumes/odp_adw_utilities_n/planning/utilities/community_detection/",
-    "Input Volume Path"
+    "Input Volume Path",
 )
 dbutils.widgets.text(
     "input_dependency_name",
     "ODAT__202603301324.csv",
-    "Input CSV file name"
+    "Input CSV file name",
 )
 dbutils.widgets.text(
     "outofscope_stream_file_name",
     "out-of-scopte-streams.csv",
-    "Out of scope streams file name"
+    "Out of scope streams file name",
 )
 dbutils.widgets.text(
     "report_table_dependency_file_name",
     "Unique_Reports_With_Queries_and_Tables.csv",
-    "report to table dependency file name"
+    "Report to table dependency file name",
 )
 dbutils.widgets.text(
     "view_table_association",
     "View-Table-Association_20260401.csv",
-    "View Table dependencies"
+    "View Table dependencies",
 )
 dbutils.widgets.text(
     "community_mapping",
     "ETL_Scripts_20260106_Master_Communities.csv",
-    "Stream community mapping"
+    "Stream community mapping",
 )
 dbutils.widgets.text(
     "static_tables_file_name",
     "static_tables_for_report.csv",
-    "Static tables available from start"
+    "Static tables available from start",
 )
 
 # COMMAND ----------
@@ -72,17 +71,26 @@ dbutils.fs.mkdirs(output_path)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Loading Datasets:
+# MAGIC ## Loading Datasets
 
 # COMMAND ----------
 
-# DBTITLE 1,Reading input stream - table dependency file
-dependency_df_full = spark.read.format("csv").option("header", "true").load(dependency_input_path)
+# DBTITLE 1,Reading input stream-table dependency file
+dependency_df_full = (
+    spark.read.format("csv")
+    .option("header", "true")
+    .load(dependency_input_path)
+)
 
 # COMMAND ----------
 
-# DBTITLE 1,Reading out of scope stream names and filtering dependency data
-outofscope_stream_names_df = spark.read.format("csv").option("header","true").load(outofscope_stream_path).select(col("stream_name"))
+# DBTITLE 1,Reading out-of-scope stream names and filtering dependency data
+outofscope_stream_names_df = (
+    spark.read.format("csv")
+    .option("header", "true")
+    .load(outofscope_stream_path)
+    .select(F.col("stream_name"))
+)
 
 # Filter out out-of-scope streams from the dependency data
 dependency_df_full = dependency_df_full.join(
@@ -93,12 +101,14 @@ dependency_df_full = dependency_df_full.join(
 
 # COMMAND ----------
 
-# DBTITLE 1,Read view table dependencies and standardize
-# Read the csv file
-view_dependency_df = spark.read.format("csv").option("header", "true").load(view_table_association)
+# DBTITLE 1,Read view-table dependencies and resolve views to source tables
+view_dependency_df = (
+    spark.read.format("csv")
+    .option("header", "true")
+    .load(view_table_association)
+)
 
-# --- Resolve each view to its ultimate source TABLEs ---
-# A view can depend on other views or tables. We walk the chain iteratively:
+# Resolve each view to its ultimate source TABLEs iteratively:
 #   - rows where dep_object_type_cd = 'TABLE' are already resolved
 #   - rows where dep_object_type_cd = 'VIEW'  need another hop
 # We stop when no VIEW dependencies remain (all paths end at TABLEs).
@@ -111,74 +121,73 @@ view_dep = view_dependency_df.select(
 )
 
 # Split into already-resolved (TABLE deps) and still-to-resolve (VIEW deps)
-resolved   = view_dep.filter(F.col("dep_type") == "TABLE") \
-                      .select(F.col("view_fqn").alias("view_name"),
-                              F.col("dep_fqn").alias("source_table"))
-unresolved = view_dep.filter(F.col("dep_type") == "VIEW") \
-                      .select(F.col("view_fqn").alias("view_name"),
-                              F.col("dep_fqn").alias("intermediate_view"))
+resolved = (
+    view_dep.filter(F.col("dep_type") == "TABLE")
+    .select(F.col("view_fqn").alias("view_name"), F.col("dep_fqn").alias("source_table"))
+)
+unresolved = (
+    view_dep.filter(F.col("dep_type") == "VIEW")
+    .select(F.col("view_fqn").alias("view_name"), F.col("dep_fqn").alias("intermediate_view"))
+)
 
 # Iteratively replace each intermediate VIEW with its own dependencies
-# until no VIEW dependencies remain.
-max_iterations = 20  # safety limit
-for i in range(max_iterations):
+MAX_VIEW_DEPTH = 20
+for i in range(MAX_VIEW_DEPTH):
     if unresolved.count() == 0:
         break
 
-    # Join unresolved intermediate views back to the full dependency list
-    # to find what each intermediate view depends on
     next_hop = unresolved.join(
         view_dep,
         unresolved["intermediate_view"] == view_dep["view_fqn"],
         "inner",
     ).select(
-        unresolved["view_name"],            # original top-level view
+        unresolved["view_name"],
         view_dep["dep_fqn"].alias("dep_name"),
         view_dep["dep_type"],
     )
 
-    # Rows that landed on a TABLE are now resolved
-    newly_resolved = next_hop.filter(F.col("dep_type") == "TABLE") \
-                             .select("view_name", F.col("dep_name").alias("source_table"))
+    newly_resolved = (
+        next_hop.filter(F.col("dep_type") == "TABLE")
+        .select("view_name", F.col("dep_name").alias("source_table"))
+    )
     resolved = resolved.union(newly_resolved).distinct()
 
-    # Rows still pointing at a VIEW need another iteration
-    unresolved = next_hop.filter(F.col("dep_type") == "VIEW") \
-                         .select("view_name", F.col("dep_name").alias("intermediate_view"))
+    unresolved = (
+        next_hop.filter(F.col("dep_type") == "VIEW")
+        .select("view_name", F.col("dep_name").alias("intermediate_view"))
+    )
 
-# Final view → source-table mapping (one row per view-table pair)
-# view_name  = DATABASE_NAME.OBJECT_NAME   (the view)
-# source_table = DEP_DATABASE_NAME.DEP_OBJECT_NAME (the ultimate source table)
+# Final view -> source-table mapping (one row per view-table pair)
 view_to_source_tables_df = resolved.dropDuplicates(["view_name", "source_table"])
 
-print(f"Resolved {view_to_source_tables_df.count()} view → source-table mappings")
+print(f"Resolved {view_to_source_tables_df.count()} view -> source-table mappings")
 print(f"Unique views:  {view_to_source_tables_df.select('view_name').distinct().count()}")
 print(f"Unique tables: {view_to_source_tables_df.select('source_table').distinct().count()}")
 display(view_to_source_tables_df)
 
 # COMMAND ----------
 
-# DBTITLE 1,Reading report to table dependency
-# Read report CSV — use "Workbook Name" as report and "fullName" as table reference.
-# fullName comes in two formats: "schema.table" or "[SCHEMA].[TABLE]" — strip brackets
-# and upper-case to get a consistent DB_NAME.TABLE_NAME format.
-# Then replace any table that is actually a view with its ultimate source tables.
+# DBTITLE 1,Reading report-to-table dependency (with view resolution)
+# Read report CSV: "Workbook Name" -> report, "fullName" -> table reference.
+# fullName comes in two formats: "schema.table" or "[SCHEMA].[TABLE]"
+# Strip brackets and upper-case to get a consistent DB_NAME.TABLE_NAME format,
+# then replace any table that is actually a view with its resolved source tables.
 raw_report_df = (
     spark.read.format("csv")
     .option("header", "true")
     .load(report_dependency_path)
     .select(
         F.col("Workbook Name").alias("report_name"),
-        F.upper(
-            F.regexp_replace(F.col("fullName"), r"[\[\]]", "")
-        ).alias("table_name"),
+        F.upper(F.regexp_replace(F.col("fullName"), r"[\[\]]", "")).alias("table_name"),
     )
     .distinct()
-    .filter(~F.lower(F.col("report_name")).contains("corona") & ~F.lower(F.col("report_name")).contains("gdpr"))
+    .filter(
+        ~F.lower(F.col("report_name")).contains("corona")
+        & ~F.lower(F.col("report_name")).contains("gdpr")
+    )
 )
 
-# Split into rows whose table_name matches a known view vs those that don't
-# view_to_source_tables_df has (view_name, source_table) both as DB.OBJECT upper-cased
+# Split: rows whose table_name matches a known view vs those that don't
 report_with_views = raw_report_df.join(
     view_to_source_tables_df,
     raw_report_df["table_name"] == view_to_source_tables_df["view_name"],
@@ -223,21 +232,29 @@ community_raw_df = (
 print("Detected columns:", community_raw_df.columns)
 
 # Replace #N/A strings with null for date columns
-date_cols = ["Code Freeze Start", "Code Conv. Start Date", "Code Conv. End Date", "Code Freeze End"]
+DATE_COLS = [
+    "Code Freeze Start",
+    "Code Conv. Start Date",
+    "Code Conv. End Date",
+    "Code Freeze End",
+]
 
 community_df = community_raw_df.select(
     F.col("`Community_Number(Old)`").alias("community_old"),
     F.col("Updated_Community_Number").alias("community_new"),
     F.col("`Stream Name`").alias("stream_name"),
     F.col("`Scope Status`").alias("scope_status"),
-    *[F.when(F.col(f"`{c}`") == "#N/A", None).otherwise(F.col(f"`{c}`")).alias(c) for c in date_cols],
+    *[
+        F.when(F.col(f"`{c}`") == "#N/A", None)
+        .otherwise(F.col(f"`{c}`"))
+        .alias(c)
+        for c in DATE_COLS
+    ],
 )
 
 community_df = (
     community_df
-    # Remove out-of-scope rows
     .filter(~F.upper(F.col("scope_status")).contains("OUT OF SCOPE"))
-    # Resolve community number: use updated if available, else old
     .withColumn(
         "community",
         F.when(
@@ -245,11 +262,14 @@ community_df = (
             F.col("community_new"),
         ).otherwise(F.col("community_old")),
     )
-    .select("community", "stream_name",
-            F.col("`Code Freeze Start`").alias("code_freeze_start"),
-            F.col("`Code Conv. Start Date`").alias("code_conv_start"),
-            F.col("`Code Conv. End Date`").alias("code_conv_end"),
-            F.col("`Code Freeze End`").alias("code_freeze_end"))
+    .select(
+        "community",
+        "stream_name",
+        F.col("`Code Freeze Start`").alias("code_freeze_start"),
+        F.col("`Code Conv. Start Date`").alias("code_conv_start"),
+        F.col("`Code Conv. End Date`").alias("code_conv_end"),
+        F.col("`Code Freeze End`").alias("code_freeze_end"),
+    )
 )
 
 print(f"Community-stream mappings (in-scope): {community_df.count()}")
@@ -257,16 +277,15 @@ print(f"Unique communities: {community_df.select('community').distinct().count()
 display(community_df)
 
 # Build community execution order based on earliest Code Freeze Start date.
-# Communities with no freeze date go last.
-# Parse all date columns to proper dates before aggregating so min/max are chronological, not lexicographic.
+# Parse all date columns before aggregating so min/max are chronological, not lexicographic.
 DATE_FMT = F.lit("d-MMM-yy")
 
 community_order_df = (
     community_df
     .withColumn("_freeze_start", F.try_to_timestamp(F.col("code_freeze_start"), DATE_FMT))
-    .withColumn("_conv_start",   F.try_to_timestamp(F.col("code_conv_start"),   DATE_FMT))
-    .withColumn("_conv_end",     F.try_to_timestamp(F.col("code_conv_end"),     DATE_FMT))
-    .withColumn("_freeze_end",   F.try_to_timestamp(F.col("code_freeze_end"),   DATE_FMT))
+    .withColumn("_conv_start", F.try_to_timestamp(F.col("code_conv_start"), DATE_FMT))
+    .withColumn("_conv_end", F.try_to_timestamp(F.col("code_conv_end"), DATE_FMT))
+    .withColumn("_freeze_end", F.try_to_timestamp(F.col("code_freeze_end"), DATE_FMT))
     .groupBy("community")
     .agg(
         F.min("_freeze_start").alias("_freeze_start"),
@@ -274,24 +293,30 @@ community_order_df = (
         F.max("_conv_end").alias("_conv_end"),
         F.max("_freeze_end").alias("_freeze_end"),
     )
-    # Format back to readable strings for display/output
     .withColumn("code_freeze_start", F.date_format(F.col("_freeze_start"), "d-MMM-yy"))
-    .withColumn("code_conv_start",   F.date_format(F.col("_conv_start"),   "d-MMM-yy"))
-    .withColumn("code_conv_end",     F.date_format(F.col("_conv_end"),     "d-MMM-yy"))
-    .withColumn("code_freeze_end",   F.date_format(F.col("_freeze_end"),   "d-MMM-yy"))
+    .withColumn("code_conv_start", F.date_format(F.col("_conv_start"), "d-MMM-yy"))
+    .withColumn("code_conv_end", F.date_format(F.col("_conv_end"), "d-MMM-yy"))
+    .withColumn("code_freeze_end", F.date_format(F.col("_freeze_end"), "d-MMM-yy"))
     .withColumn(
         "has_date",
         F.when(F.col("_freeze_start").isNotNull(), F.lit(0)).otherwise(F.lit(1)),
     )
 )
 
-# Use a single-partition window but with deterministic ordering
+# Communities with no freeze date go last
 order_window = Window.orderBy("has_date", "_freeze_start", "community")
-community_order_df = community_order_df.withColumn(
-    "execution_order",
-    F.row_number().over(order_window),
-).select("community", "execution_order", "code_freeze_start", "code_conv_start",
-         "code_conv_end", "code_freeze_end")
+community_order_df = (
+    community_order_df
+    .withColumn("execution_order", F.row_number().over(order_window))
+    .select(
+        "community",
+        "execution_order",
+        "code_freeze_start",
+        "code_conv_start",
+        "code_conv_end",
+        "code_freeze_end",
+    )
+)
 
 print(f"\nCommunity execution order ({community_order_df.count()} communities):")
 display(community_order_df)
@@ -333,12 +358,11 @@ dependency_df = dependency_df_full.union(tgt_as_source).distinct()
 # COMMAND ----------
 
 # DBTITLE 1,Build table-to-stream production mapping
-# Which tables are produced (TGT/TGT_TRNS) by which streams
 stream_produces_df = (
     dependency_df
     .filter(
-        (F.upper(F.col("table_type")) == "TGT") |
-        (F.upper(F.col("table_type")) == "TGT_TRNS")
+        (F.upper(F.col("table_type")) == "TGT")
+        | (F.upper(F.col("table_type")) == "TGT_TRNS")
     )
     .select(
         F.col("stream_name"),
@@ -354,36 +378,28 @@ print(f"Unique produced tables:   {stream_produces_df.select('table_name').disti
 # COMMAND ----------
 
 # DBTITLE 1,Map tables to their producing communities
-# Join stream→table with community_df to get table→community
-# A table is available once ALL its producing communities have migrated,
-# but for simplicity we track: for each table, the latest community (by execution order)
-# that produces it — that's when the table is fully available.
+# For each table, find the latest community (by execution order) that produces it.
+# That is when the table becomes fully available.
 table_to_community_df = (
     stream_produces_df
-    .join(
-        community_df.select("stream_name", "community"),
-        on="stream_name",
-        how="inner",
-    )
+    .join(community_df.select("stream_name", "community"), on="stream_name", how="inner")
     .select("table_name", "community")
     .distinct()
 )
 
-# Join with community_order to get execution_order and code_freeze_end per table-community
 table_community_order_df = (
     table_to_community_df
     .join(community_order_df, on="community", how="inner")
     .select("table_name", "community", "execution_order", "code_freeze_end")
 )
 
-# For each table, find the LATEST community (max execution_order) — that's when it's fully available
 table_max_order_df = (
     table_community_order_df
     .groupBy("table_name")
     .agg(F.max("execution_order").alias("available_after_order"))
 )
 
-# Join back to get community name and code_freeze_end for that max execution_order
+# Join back to get community name and code_freeze_end for the max execution_order
 table_availability_df = (
     table_max_order_df.alias("ta")
     .join(
@@ -407,32 +423,39 @@ display(table_availability_df.orderBy("available_after_order"))
 # COMMAND ----------
 
 # DBTITLE 1,Determine report readiness
-# For each report, join its required tables with the table availability info.
+# For each report, find when it becomes ready based on its table dependencies.
 # A report is ready after the LATEST of its table dependencies becomes available.
-# Tables that are static (available from start) have order=0.
+# Static tables are available from the start (order = 0).
 
-# Collect to pandas for the readiness calculation
 table_avail_pd = table_availability_df.toPandas()
-table_avail_map = dict(zip(table_avail_pd["table_name"], zip(
-    table_avail_pd["available_after_community"],
-    table_avail_pd["available_after_order"],
-    table_avail_pd["available_after_date"],
-)))
+table_avail_map = dict(
+    zip(
+        table_avail_pd["table_name"],
+        zip(
+            table_avail_pd["available_after_community"],
+            table_avail_pd["available_after_order"],
+            table_avail_pd["available_after_date"],
+        ),
+    )
+)
 
-# Community order lookup for display
 comm_order_pd = community_order_df.toPandas()
 
-# Report to tables (from report_table_dependency_df), dropping any null table names
-report_tables_pd = report_table_dependency_df.select(
-    "report_name", "table_name",
-).filter(F.col("table_name").isNotNull() & F.col("report_name").isNotNull()).distinct().toPandas()
+# Report to tables, dropping any null values
+report_tables_pd = (
+    report_table_dependency_df
+    .select("report_name", "table_name")
+    .filter(F.col("table_name").isNotNull() & F.col("report_name").isNotNull())
+    .distinct()
+    .toPandas()
+)
 
 report_required = report_tables_pd.groupby("report_name")["table_name"].apply(set).to_dict()
 
 print(f"Total reports: {len(report_required)}")
 print(f"Total unique tables required: {report_tables_pd['table_name'].nunique()}")
 
-# For each report, find when it becomes ready
+# Classify each report as ready or not-ready
 readiness_rows = []
 not_ready_rows = []
 
@@ -445,7 +468,7 @@ for report, tables in report_required.items():
 
     for tbl in tables:
         if tbl in static_tables:
-            continue  # available from start, order=0
+            continue
         elif tbl in table_avail_map:
             comm, order, date = table_avail_map[tbl]
             if order > max_order:
@@ -453,16 +476,14 @@ for report, tables in report_required.items():
                 max_community = comm
                 max_date = date if date else ""
         else:
-            # Table not produced by any known stream/community
             all_resolved = False
             missing_tables.append(tbl)
 
     if all_resolved:
-        # Ideal End Date = code_freeze_end + 20 business days buffer for report migration
+        # Ideal End Date = code_freeze_end + 20 days buffer
         ideal_end = ""
         if max_date:
             try:
-                from datetime import timedelta
                 freeze_end_dt = pd.to_datetime(max_date, format="%d-%b-%y", dayfirst=True)
                 ideal_end = (freeze_end_dt + timedelta(days=20)).strftime("%-d-%b-%y")
             except (ValueError, TypeError):
@@ -486,11 +507,17 @@ for report, tables in report_required.items():
             "required_tables": ", ".join(sorted(tables)),
         })
 
-readiness_df = pd.DataFrame(readiness_rows).sort_values(
-    ["Migrate After Execution Order", "report_name"]
-).reset_index(drop=True)
+readiness_df = (
+    pd.DataFrame(readiness_rows)
+    .sort_values(["Migrate After Execution Order", "report_name"])
+    .reset_index(drop=True)
+)
 
-not_ready_df = pd.DataFrame(not_ready_rows).sort_values("report_name").reset_index(drop=True)
+not_ready_df = (
+    pd.DataFrame(not_ready_rows)
+    .sort_values("report_name")
+    .reset_index(drop=True)
+)
 
 print(f"\nReports ready after migration: {len(readiness_df)}")
 print(f"Reports NOT ready (missing tables): {len(not_ready_df)}")
@@ -543,7 +570,9 @@ with open(report_text_file, "w") as f:
     static_ready = readiness_df[readiness_df["Migrate After Execution Order"] == 0]
     if len(static_ready) > 0:
         f.write("=" * 100 + "\n")
-        f.write(f"REPORTS READY IMMEDIATELY — only static table dependencies ({len(static_ready)})\n")
+        f.write(
+            f"REPORTS READY IMMEDIATELY — only static table dependencies ({len(static_ready)})\n"
+        )
         f.write("=" * 100 + "\n\n")
         for _, rpt in static_ready.iterrows():
             f.write(f"  - {rpt['report_name']} ({rpt['num_required_tables']} tables)\n")
@@ -557,8 +586,8 @@ with open(report_text_file, "w") as f:
     for _, row in comm_order_pd.sort_values("execution_order").iterrows():
         comm = row["community"]
         order = row["execution_order"]
-        freeze_end = row["code_freeze_end"] if pd.notna(row["code_freeze_end"]) else "N/A"
         freeze_start = row["code_freeze_start"] if pd.notna(row["code_freeze_start"]) else "N/A"
+        freeze_end = row["code_freeze_end"] if pd.notna(row["code_freeze_end"]) else "N/A"
 
         reports_at = readiness_df[readiness_df["Migrate After Execution Order"] == order]
         cumulative += len(reports_at)
@@ -572,9 +601,9 @@ with open(report_text_file, "w") as f:
 
         if len(reports_at) > 0:
             for _, rpt in reports_at.iterrows():
+                table_list = rpt["required_tables"].split(", ")[:5]
                 f.write(f"  - {rpt['report_name']}\n")
-                f.write(f"    Tables ({rpt['num_required_tables']}): "
-                        f"{', '.join(rpt['required_tables'].split(', ')[:5])}")
+                f.write(f"    Tables ({rpt['num_required_tables']}): {', '.join(table_list)}")
                 if rpt["num_required_tables"] > 5:
                     f.write(f" ... and {rpt['num_required_tables'] - 5} more")
                 f.write("\n")
@@ -591,7 +620,9 @@ with open(report_text_file, "w") as f:
         for _, rpt in not_ready_df.iterrows():
             f.write(f"  - {rpt['report_name']}\n")
             f.write(f"    Required Tables: {rpt['num_required_tables']}\n")
-            f.write(f"    Missing Tables ({rpt['num_missing_tables']}): {rpt['missing_tables']}\n\n")
+            f.write(
+                f"    Missing Tables ({rpt['num_missing_tables']}): {rpt['missing_tables']}\n\n"
+            )
 
 print(f"Text report saved to: {report_text_file}")
 print("Analysis complete!")
