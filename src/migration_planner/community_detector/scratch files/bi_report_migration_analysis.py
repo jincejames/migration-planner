@@ -274,7 +274,7 @@ community_order_df = (
     )
     .withColumn(
         "freeze_date_parsed",
-        F.try_to_timestamp(F.col("code_freeze_start"), "d-MMM-yy"),
+        F.try_to_timestamp(F.col("code_freeze_start"), F.lit("d-MMM-yy")),
     )
     .withColumn(
         "has_date",
