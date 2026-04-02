@@ -219,23 +219,25 @@ print(f"Unique tables:  {report_table_dependency_df.select('table_name').distinc
 community_raw_df = (
     spark.read.format("csv")
     .option("header", "true")
+    .option("sep", ";")
     .load(community_mapping)
 )
 
 print("Detected columns:", community_raw_df.columns)
 
+# Replace #N/A strings with null for date columns
+date_cols = ["Code Freeze Start", "Code Conv. Start Date", "Code Conv. End Date", "Code Freeze End"]
+
+community_df = community_raw_df.select(
+    F.col("`Community_Number(Old)`").alias("community_old"),
+    F.col("Updated_Community_Number").alias("community_new"),
+    F.col("`Stream Name`").alias("stream_name"),
+    F.col("`Scope Status`").alias("scope_status"),
+    *[F.when(F.col(f"`{c}`") == "#N/A", None).otherwise(F.col(f"`{c}`")).alias(c) for c in date_cols],
+)
+
 community_df = (
-    community_raw_df
-    .select(
-        F.col("`Community_Number(Old)`").alias("community_old"),
-        F.col("Updated_Community_Number").alias("community_new"),
-        F.col("`Stream Name`").alias("stream_name"),
-        F.col("`Scope Status`").alias("scope_status"),
-        F.col("`Code Freeze Start`").alias("code_freeze_start"),
-        F.col("`Code Conv. Start Date`").alias("code_conv_start"),
-        F.col("`Code Conv. End Date`").alias("code_conv_end"),
-        F.col("`Code Freeze End`").alias("code_freeze_end"),
-    )
+    community_df
     # Remove out-of-scope rows
     .filter(~F.upper(F.col("scope_status")).contains("OUT OF SCOPE"))
     # Resolve community number: use updated if available, else old
@@ -246,8 +248,11 @@ community_df = (
             F.col("community_new"),
         ).otherwise(F.col("community_old")),
     )
-    .select("community", "stream_name", "code_freeze_start", "code_conv_start",
-            "code_conv_end", "code_freeze_end")
+    .select("community", "stream_name",
+            F.col("`Code Freeze Start`").alias("code_freeze_start"),
+            F.col("`Code Conv. Start Date`").alias("code_conv_start"),
+            F.col("`Code Conv. End Date`").alias("code_conv_end"),
+            F.col("`Code Freeze End`").alias("code_freeze_end"))
 )
 
 print(f"Community-stream mappings (in-scope): {community_df.count()}")
@@ -256,6 +261,8 @@ display(community_df)
 
 # Build community execution order based on earliest Code Freeze Start date.
 # Communities with no freeze date go last.
+from pyspark.sql.window import Window
+
 community_order_df = (
     community_df
     .groupBy("community")
@@ -267,20 +274,19 @@ community_order_df = (
     )
     .withColumn(
         "freeze_date_parsed",
-        F.to_date(F.col("code_freeze_start"), "d-MMM-yy"),
+        F.try_to_timestamp(F.col("code_freeze_start"), "d-MMM-yy"),
     )
     .withColumn(
         "has_date",
         F.when(F.col("freeze_date_parsed").isNotNull(), F.lit(0)).otherwise(F.lit(1)),
     )
-    .orderBy("has_date", "freeze_date_parsed")
 )
 
-# Add a 1-based execution order
-from pyspark.sql.window import Window
+# Use a single-partition window but with deterministic ordering
+order_window = Window.orderBy("has_date", "freeze_date_parsed", "community")
 community_order_df = community_order_df.withColumn(
     "execution_order",
-    F.row_number().over(Window.orderBy("has_date", "freeze_date_parsed")),
+    F.row_number().over(order_window),
 ).select("community", "execution_order", "code_freeze_start", "code_conv_start",
          "code_conv_end", "code_freeze_end")
 
