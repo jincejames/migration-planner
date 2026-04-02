@@ -98,25 +98,195 @@ from pyspark.sql import types as T
 # Read the csv file
 view_dependency_df = spark.read.format("csv").option("header", "true").load(view_table_association)
 
+# --- Resolve each view to its ultimate source TABLEs ---
+# A view can depend on other views or tables. We walk the chain iteratively:
+#   - rows where dep_object_type_cd = 'TABLE' are already resolved
+#   - rows where dep_object_type_cd = 'VIEW'  need another hop
+# We stop when no VIEW dependencies remain (all paths end at TABLEs).
 
+from pyspark.sql import functions as F
+
+# Standardise to upper-case and build fully-qualified names (DATABASE.OBJECT)
+view_dep = view_dependency_df.select(
+    F.concat_ws(".", F.upper(F.col("DATABASE_NAME")), F.upper(F.col("object_name"))).alias("view_fqn"),
+    F.upper(F.col("dep_object_type_cd")).alias("dep_type"),
+    F.concat_ws(".", F.upper(F.col("dep_database_name")), F.upper(F.col("dep_object_name"))).alias("dep_fqn"),
+)
+
+# Split into already-resolved (TABLE deps) and still-to-resolve (VIEW deps)
+resolved   = view_dep.filter(F.col("dep_type") == "TABLE") \
+                      .select(F.col("view_fqn").alias("view_name"),
+                              F.col("dep_fqn").alias("source_table"))
+unresolved = view_dep.filter(F.col("dep_type") == "VIEW") \
+                      .select(F.col("view_fqn").alias("view_name"),
+                              F.col("dep_fqn").alias("intermediate_view"))
+
+# Iteratively replace each intermediate VIEW with its own dependencies
+# until no VIEW dependencies remain.
+max_iterations = 20  # safety limit
+for i in range(max_iterations):
+    if unresolved.count() == 0:
+        break
+
+    # Join unresolved intermediate views back to the full dependency list
+    # to find what each intermediate view depends on
+    next_hop = unresolved.join(
+        view_dep,
+        unresolved["intermediate_view"] == view_dep["view_fqn"],
+        "inner",
+    ).select(
+        unresolved["view_name"],            # original top-level view
+        view_dep["dep_fqn"].alias("dep_name"),
+        view_dep["dep_type"],
+    )
+
+    # Rows that landed on a TABLE are now resolved
+    newly_resolved = next_hop.filter(F.col("dep_type") == "TABLE") \
+                             .select("view_name", F.col("dep_name").alias("source_table"))
+    resolved = resolved.union(newly_resolved).distinct()
+
+    # Rows still pointing at a VIEW need another iteration
+    unresolved = next_hop.filter(F.col("dep_type") == "VIEW") \
+                         .select("view_name", F.col("dep_name").alias("intermediate_view"))
+
+# Final view → source-table mapping (one row per view-table pair)
+# view_name  = DATABASE_NAME.OBJECT_NAME   (the view)
+# source_table = DEP_DATABASE_NAME.DEP_OBJECT_NAME (the ultimate source table)
+view_to_source_tables_df = resolved.distinct()
+view_to_source_tables_df.cache()
+
+print(f"Resolved {view_to_source_tables_df.count()} view → source-table mappings")
+print(f"Unique views:  {view_to_source_tables_df.select('view_name').distinct().count()}")
+print(f"Unique tables: {view_to_source_tables_df.select('source_table').distinct().count()}")
+display(view_to_source_tables_df)
 
 # COMMAND ----------
 
 # DBTITLE 1,Reading report to table dependency
-# Read report to stream dependency and standardize values and column names
-# Each table is marked as a Src, since reports only create tables and do not write to tables (or only exceptions)
-# Filtering two reports wrt corona and gdpr, since they skew the community creation due to high number of dependencies
-report_table_dependency_df = (
+# Read report CSV — use "Workbook Name" as report and "fullName" as table reference.
+# fullName comes in two formats: "schema.table" or "[SCHEMA].[TABLE]" — strip brackets
+# and upper-case to get a consistent DB_NAME.TABLE_NAME format.
+# Then replace any table that is actually a view with its ultimate source tables.
+raw_report_df = (
     spark.read.format("csv")
     .option("header", "true")
     .load(report_to_table_dependency)
     .select(
-        col("report_name").alias("stream_name"),
-        upper(col("table_name")).alias("table_name"),
-        lit("Src").alias('table_type'),
+        F.col("Workbook Name").alias("report_name"),
+        F.upper(
+            F.regexp_replace(F.col("fullName"), r"[\[\]]", "")
+        ).alias("table_name"),
     )
-    .filter(~lower(col("stream_name")).contains("corona") & ~lower(col("stream_name")).contains("gdpr"))
+    .distinct()
+    .filter(~F.lower(F.col("report_name")).contains("corona") & ~F.lower(F.col("report_name")).contains("gdpr"))
 )
+
+# Split into rows whose table_name matches a known view vs those that don't
+# view_to_source_tables_df has (view_name, source_table) both as DB.OBJECT upper-cased
+report_with_views = raw_report_df.join(
+    view_to_source_tables_df,
+    raw_report_df["table_name"] == view_to_source_tables_df["view_name"],
+    "inner",
+).select(
+    raw_report_df["report_name"],
+    view_to_source_tables_df["source_table"].alias("table_name"),
+)
+
+report_without_views = raw_report_df.join(
+    view_to_source_tables_df,
+    raw_report_df["table_name"] == view_to_source_tables_df["view_name"],
+    "left_anti",
+).select("report_name", "table_name")
+
+# Combine: views replaced with source tables + tables that were already tables
+report_table_dependency_df = (
+    report_with_views
+    .union(report_without_views)
+    .distinct()
+    .select(
+        F.col("report_name").alias("stream_name"),
+        F.col("table_name"),
+        F.lit("Src").alias("table_type"),
+    )
+)
+
+print(f"Report-table dependencies (after view resolution): {report_table_dependency_df.count()}")
+print(f"Unique reports: {report_table_dependency_df.select('stream_name').distinct().count()}")
+print(f"Unique tables:  {report_table_dependency_df.select('table_name').distinct().count()}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Reading community mapping and building community order
+# The 4th column has a very long header — read raw then rename.
+community_raw_df = spark.read.format("csv").option("header", "true").load(community_mapping)
+
+# Identify the stream-name column (the long one starting with "Stream Name by Preffix")
+stream_col = [c for c in community_raw_df.columns if c.lower().startswith("stream name")][0]
+
+community_df = (
+    community_raw_df
+    .select(
+        F.col("Community_Number(Old)").alias("community_old"),
+        F.col("Updated_Community_Number").alias("community_new"),
+        F.col(f"`{stream_col}`").alias("stream_name"),
+        F.col("Scope Status").alias("scope_status"),
+        F.col("Code Freeze Start").alias("code_freeze_start"),
+        F.col("Code Conv. Start Date").alias("code_conv_start"),
+        F.col("Code Conv. End Date").alias("code_conv_end"),
+        F.col("Code Freeze End").alias("code_freeze_end"),
+    )
+    # Remove out-of-scope rows
+    .filter(~F.upper(F.col("scope_status")).contains("OUT OF SCOPE"))
+    # Resolve community number: use updated if available, else old
+    .withColumn(
+        "community",
+        F.when(
+            F.col("community_new").isNotNull() & (F.trim(F.col("community_new")) != ""),
+            F.col("community_new"),
+        ).otherwise(F.col("community_old")),
+    )
+    .select("community", "stream_name", "code_freeze_start", "code_conv_start",
+            "code_conv_end", "code_freeze_end")
+)
+
+community_df.cache()
+print(f"Community-stream mappings (in-scope): {community_df.count()}")
+print(f"Unique communities: {community_df.select('community').distinct().count()}")
+display(community_df)
+
+# Build community execution order based on earliest Code Freeze Start date.
+# Communities with no freeze date go last.
+community_order_df = (
+    community_df
+    .groupBy("community")
+    .agg(
+        F.min("code_freeze_start").alias("code_freeze_start"),
+        F.min("code_conv_start").alias("code_conv_start"),
+        F.max("code_conv_end").alias("code_conv_end"),
+        F.max("code_freeze_end").alias("code_freeze_end"),
+    )
+    .withColumn(
+        "freeze_date_parsed",
+        F.to_date(F.col("code_freeze_start"), "d-MMM-yy"),
+    )
+    .withColumn(
+        "has_date",
+        F.when(F.col("freeze_date_parsed").isNotNull(), F.lit(0)).otherwise(F.lit(1)),
+    )
+    .orderBy("has_date", "freeze_date_parsed")
+)
+
+# Add a 1-based execution order
+from pyspark.sql.window import Window
+community_order_df = community_order_df.withColumn(
+    "execution_order",
+    F.row_number().over(Window.orderBy("has_date", "freeze_date_parsed")),
+).select("community", "execution_order", "code_freeze_start", "code_conv_start",
+         "code_conv_end", "code_freeze_end")
+
+community_order_df.cache()
+print(f"\nCommunity execution order ({community_order_df.count()} communities):")
+display(community_order_df)
 
 # COMMAND ----------
 
