@@ -152,8 +152,7 @@ for i in range(max_iterations):
 # Final view → source-table mapping (one row per view-table pair)
 # view_name  = DATABASE_NAME.OBJECT_NAME   (the view)
 # source_table = DEP_DATABASE_NAME.DEP_OBJECT_NAME (the ultimate source table)
-view_to_source_tables_df = resolved.distinct()
-view_to_source_tables_df.cache()
+view_to_source_tables_df = resolved.dropDuplicates(["view_name", "source_table"])
 
 print(f"Resolved {view_to_source_tables_df.count()} view → source-table mappings")
 print(f"Unique views:  {view_to_source_tables_df.select('view_name').distinct().count()}")
@@ -202,12 +201,12 @@ report_without_views = raw_report_df.join(
 report_table_dependency_df = (
     report_with_views
     .union(report_without_views)
-    .distinct()
     .select(
         F.col("report_name").alias("stream_name"),
         F.col("table_name"),
         F.lit("Src").alias("table_type"),
     )
+    .dropDuplicates(["stream_name", "table_name"])
 )
 
 print(f"Report-table dependencies (after view resolution): {report_table_dependency_df.count()}")
@@ -217,23 +216,25 @@ print(f"Unique tables:  {report_table_dependency_df.select('table_name').distinc
 # COMMAND ----------
 
 # DBTITLE 1,Reading community mapping and building community order
-# The 4th column has a very long header — read raw then rename.
-community_raw_df = spark.read.format("csv").option("header", "true").load(community_mapping)
+community_raw_df = (
+    spark.read.format("csv")
+    .option("header", "true")
+    .load(community_mapping)
+)
 
-# Identify the stream-name column (the long one starting with "Stream Name by Preffix")
-stream_col = [c for c in community_raw_df.columns if c.lower().startswith("stream name")][0]
+print("Detected columns:", community_raw_df.columns)
 
 community_df = (
     community_raw_df
     .select(
-        F.col("Community_Number(Old)").alias("community_old"),
+        F.col("`Community_Number(Old)`").alias("community_old"),
         F.col("Updated_Community_Number").alias("community_new"),
-        F.col(f"`{stream_col}`").alias("stream_name"),
-        F.col("Scope Status").alias("scope_status"),
-        F.col("Code Freeze Start").alias("code_freeze_start"),
-        F.col("Code Conv. Start Date").alias("code_conv_start"),
-        F.col("Code Conv. End Date").alias("code_conv_end"),
-        F.col("Code Freeze End").alias("code_freeze_end"),
+        F.col("`Stream Name`").alias("stream_name"),
+        F.col("`Scope Status`").alias("scope_status"),
+        F.col("`Code Freeze Start`").alias("code_freeze_start"),
+        F.col("`Code Conv. Start Date`").alias("code_conv_start"),
+        F.col("`Code Conv. End Date`").alias("code_conv_end"),
+        F.col("`Code Freeze End`").alias("code_freeze_end"),
     )
     # Remove out-of-scope rows
     .filter(~F.upper(F.col("scope_status")).contains("OUT OF SCOPE"))
@@ -249,7 +250,6 @@ community_df = (
             "code_conv_end", "code_freeze_end")
 )
 
-community_df.cache()
 print(f"Community-stream mappings (in-scope): {community_df.count()}")
 print(f"Unique communities: {community_df.select('community').distinct().count()}")
 display(community_df)
@@ -284,7 +284,6 @@ community_order_df = community_order_df.withColumn(
 ).select("community", "execution_order", "code_freeze_start", "code_conv_start",
          "code_conv_end", "code_freeze_end")
 
-community_order_df.cache()
 print(f"\nCommunity execution order ({community_order_df.count()} communities):")
 display(community_order_df)
 
