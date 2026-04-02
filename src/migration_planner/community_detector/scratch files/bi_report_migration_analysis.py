@@ -1,13 +1,10 @@
 # Databricks notebook source
 # DBTITLE 1,Library imports
 import pandas as pd
-import random
 from datetime import datetime
-import os
-import numpy as np
 from pyspark.sql.functions import col, lit, when, upper, lower
-from pyspark.sql.functions import ceil, sum, when, array, sort_array,explode,udf
-from pyspark.sql.types import ArrayType, StringType
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
 # COMMAND ----------
 
@@ -38,14 +35,14 @@ dbutils.widgets.text(
     "View Table dependencies"
 )
 dbutils.widgets.text(
-    "table_size",
-    "table-space-in-gb_20251201_1352.csv",
-    "Table size file name"
-)
-dbutils.widgets.text(
     "community_mapping",
     "ETL_Scripts_20260106_Master_Communities.csv",
     "Stream community mapping"
+)
+dbutils.widgets.text(
+    "static_tables_file_name",
+    "static_tables_for_report.csv",
+    "Static tables available from start"
 )
 
 # COMMAND ----------
@@ -54,10 +51,10 @@ dbutils.widgets.text(
 volume_path = dbutils.widgets.get("volume_name")
 dependency_input_path = volume_path + dbutils.widgets.get("input_dependency_name")
 outofscope_stream_path = volume_path + dbutils.widgets.get("outofscope_stream_file_name")
-report_to_table_dependency = volume_path + dbutils.widgets.get("report_table_dependency_file_name")
+report_dependency_path = volume_path + dbutils.widgets.get("report_table_dependency_file_name")
 view_table_association = volume_path + dbutils.widgets.get("view_table_association")
 community_mapping = volume_path + dbutils.widgets.get("community_mapping")
-table_size = volume_path + dbutils.widgets.get("table_size")
+static_tables_path = volume_path + dbutils.widgets.get("static_tables_file_name")
 
 # Output path with date and hour
 output_dir_name = "bi_migration_analysis_output" + datetime.now().strftime("%d%m%Y_%H")
@@ -84,17 +81,19 @@ dependency_df_full = spark.read.format("csv").option("header", "true").load(depe
 
 # COMMAND ----------
 
-# DBTITLE 1,Reading out of scope stream names
+# DBTITLE 1,Reading out of scope stream names and filtering dependency data
 outofscope_stream_names_df = spark.read.format("csv").option("header","true").load(outofscope_stream_path).select(col("stream_name"))
-outofscope_stream_names_rows_list = outofscope_stream_names_df.collect()
-outofscope_stream_names_list = [x['stream_name'] for x in outofscope_stream_names_rows_list]
+
+# Filter out out-of-scope streams from the dependency data
+dependency_df_full = dependency_df_full.join(
+    outofscope_stream_names_df,
+    dependency_df_full["stream_name"] == outofscope_stream_names_df["stream_name"],
+    "left_anti",
+)
 
 # COMMAND ----------
 
 # DBTITLE 1,Read view table dependencies and standardize
-from pyspark.sql import functions as F
-from pyspark.sql import types as T
-
 # Read the csv file
 view_dependency_df = spark.read.format("csv").option("header", "true").load(view_table_association)
 
@@ -103,8 +102,6 @@ view_dependency_df = spark.read.format("csv").option("header", "true").load(view
 #   - rows where dep_object_type_cd = 'TABLE' are already resolved
 #   - rows where dep_object_type_cd = 'VIEW'  need another hop
 # We stop when no VIEW dependencies remain (all paths end at TABLEs).
-
-from pyspark.sql import functions as F
 
 # Standardise to upper-case and build fully-qualified names (DATABASE.OBJECT)
 view_dep = view_dependency_df.select(
@@ -169,7 +166,7 @@ display(view_to_source_tables_df)
 raw_report_df = (
     spark.read.format("csv")
     .option("header", "true")
-    .load(report_to_table_dependency)
+    .load(report_dependency_path)
     .select(
         F.col("Workbook Name").alias("report_name"),
         F.upper(
@@ -202,15 +199,15 @@ report_table_dependency_df = (
     report_with_views
     .union(report_without_views)
     .select(
-        F.col("report_name").alias("stream_name"),
+        F.col("report_name"),
         F.col("table_name"),
         F.lit("Src").alias("table_type"),
     )
-    .dropDuplicates(["stream_name", "table_name"])
+    .dropDuplicates(["report_name", "table_name"])
 )
 
 print(f"Report-table dependencies (after view resolution): {report_table_dependency_df.count()}")
-print(f"Unique reports: {report_table_dependency_df.select('stream_name').distinct().count()}")
+print(f"Unique reports: {report_table_dependency_df.select('report_name').distinct().count()}")
 print(f"Unique tables:  {report_table_dependency_df.select('table_name').distinct().count()}")
 
 # COMMAND ----------
@@ -261,29 +258,35 @@ display(community_df)
 
 # Build community execution order based on earliest Code Freeze Start date.
 # Communities with no freeze date go last.
-from pyspark.sql.window import Window
+# Parse all date columns to proper dates before aggregating so min/max are chronological, not lexicographic.
+DATE_FMT = F.lit("d-MMM-yy")
 
 community_order_df = (
     community_df
+    .withColumn("_freeze_start", F.try_to_timestamp(F.col("code_freeze_start"), DATE_FMT))
+    .withColumn("_conv_start",   F.try_to_timestamp(F.col("code_conv_start"),   DATE_FMT))
+    .withColumn("_conv_end",     F.try_to_timestamp(F.col("code_conv_end"),     DATE_FMT))
+    .withColumn("_freeze_end",   F.try_to_timestamp(F.col("code_freeze_end"),   DATE_FMT))
     .groupBy("community")
     .agg(
-        F.min("code_freeze_start").alias("code_freeze_start"),
-        F.min("code_conv_start").alias("code_conv_start"),
-        F.max("code_conv_end").alias("code_conv_end"),
-        F.max("code_freeze_end").alias("code_freeze_end"),
+        F.min("_freeze_start").alias("_freeze_start"),
+        F.min("_conv_start").alias("_conv_start"),
+        F.max("_conv_end").alias("_conv_end"),
+        F.max("_freeze_end").alias("_freeze_end"),
     )
-    .withColumn(
-        "freeze_date_parsed",
-        F.try_to_timestamp(F.col("code_freeze_start"), F.lit("d-MMM-yy")),
-    )
+    # Format back to readable strings for display/output
+    .withColumn("code_freeze_start", F.date_format(F.col("_freeze_start"), "d-MMM-yy"))
+    .withColumn("code_conv_start",   F.date_format(F.col("_conv_start"),   "d-MMM-yy"))
+    .withColumn("code_conv_end",     F.date_format(F.col("_conv_end"),     "d-MMM-yy"))
+    .withColumn("code_freeze_end",   F.date_format(F.col("_freeze_end"),   "d-MMM-yy"))
     .withColumn(
         "has_date",
-        F.when(F.col("freeze_date_parsed").isNotNull(), F.lit(0)).otherwise(F.lit(1)),
+        F.when(F.col("_freeze_start").isNotNull(), F.lit(0)).otherwise(F.lit(1)),
     )
 )
 
 # Use a single-partition window but with deterministic ordering
-order_window = Window.orderBy("has_date", "freeze_date_parsed", "community")
+order_window = Window.orderBy("has_date", "_freeze_start", "community")
 community_order_df = community_order_df.withColumn(
     "execution_order",
     F.row_number().over(order_window),
@@ -295,390 +298,300 @@ display(community_order_df)
 
 # COMMAND ----------
 
-# DBTITLE 1,Reading table size in GB records
-table_size_df = spark.read.format("csv").option("header","true").load(table_size).select(upper(col("DB_Table_Name")).alias("table_name"), col("SPACE_IN_GB").alias("size"))
+# DBTITLE 1,Reading static tables (available from start)
+static_tables_df = (
+    spark.read.format("csv")
+    .option("header", "true")
+    .load(static_tables_path)
+    .select(F.upper(F.col("table_name")).alias("table_name"))
+)
+static_tables = set(row["table_name"] for row in static_tables_df.collect())
+print(f"Static tables available from start: {len(static_tables)}")
 
 # COMMAND ----------
 
 # DBTITLE 1,Considering all TGT tables as SRC
-# Considering all TGT tables as SRC as well due to a gap in ODAT output
-tgt_as_source = dependency_df_filtered.filter(upper(col('table_type')).contains("TGT")).replace({"Tgt" : "Src", "Tgt_Trns" : "Src_Trns"}, subset=["table_type"])
-dependency_df = dependency_df_filtered.union(tgt_as_source).distinct()
+# Every TGT table is also a potential SRC (a gap in ODAT output).
+# If a table is written by multiple streams, it is both SRC and TGT in each.
+tgt_as_source = (
+    dependency_df_full
+    .filter(F.upper(F.col("table_type")).contains("TGT"))
+    .replace({"Tgt": "Src", "Tgt_Trns": "Src_Trns"}, subset=["table_type"])
+)
+dependency_df = dependency_df_full.union(tgt_as_source).distinct()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Forming Table to Stream Dependecies
-
-# COMMAND ----------
-
-# DBTITLE 1,Filter out intra stream (self) dependency
-dependency_with_transactional_df = dependency_df.select(
-    'stream_name', col('DB_Table_Name').alias('table_name'), 'table_type'
-).distinct()
-
-# Self join to find dependencies and filter intra stream dependency (table to table within same stream)
-# This will basically result all cases where the exact table is a src or tgt of 2 different streams
-non_filtered_self_join_result = (
-    dependency_with_transactional_df.alias("df1")
-    .join(dependency_with_transactional_df.alias("df2"), col("df1.table_name") == col("df2.table_name"))
-    .filter(col("df1.stream_name") != col("df2.stream_name"))
-)
-
-
-# COMMAND ----------
-
-# DBTITLE 1,Joining reports to the stream data
-report_join_result = (
-    report_dependency_df.alias("df2")
-    .join(dependency_with_transactional_df.alias("df1"), upper(col("df1.table_name")) == upper(col("df2.table_name")))
-)
-
-# COMMAND ----------
-
-# DBTITLE 1,Merging reports and streams
-self_join_result_without_size = report_join_result.union(non_filtered_self_join_result)
-
-# COMMAND ----------
-
-# DBTITLE 1,Adding table size information
-#<TODO> revert back to include report dependencies
-self_join_result = non_filtered_self_join_result.join(
-    table_size_df.alias("table_size"),
-    col("df1.table_name") == col("table_size.table_name")
-).select(
-    "df1.*",
-    "df2.*",
-    col("table_size.size")
-)
-
-# COMMAND ----------
-
-# DBTITLE 1,Identify isolated streams (only intra-stream dependencies)
-# Get all unique stream names from the original dependency data (before filtering)
-all_streams_in_data = [row['stream_name'] for row in dependency_df.select('stream_name').distinct().collect()]
-
-# Get all streams that appear in the edges (have inter-stream dependencies)
-streams_in_edges = set([row['streamA'] for row in merged_dependency_df.select('streamA').distinct().collect()]) | \
-                   set([row['streamB'] for row in merged_dependency_df.select('streamB').distinct().collect()])
-
-# Find isolated streams (streams with only intra-stream dependencies)
-isolated_streams = [s for s in all_streams_in_data if s not in streams_in_edges]
-
-print(f"Total streams in original data: {len(all_streams_in_data)}")
-print(f"Streams with inter-stream dependencies: {len(streams_in_edges)}")
-print(f"Isolated streams (only intra-stream dependencies): {len(isolated_streams)}")
-
-if len(isolated_streams) > 0:
-    print(f"\nFirst 10 isolated streams: {isolated_streams[:10]}")
-    
-    # Save isolated streams to CSV for reference
-    isolated_streams_df = pd.DataFrame({'stream_name': isolated_streams})
-    isolated_streams_df.to_csv(f"{output_path}isolated_streams.csv", index=False)
-    print(f"\nIsolated streams saved to: {output_path}isolated_streams.csv")
-else:
-    print("\nNo isolated streams found - all streams have inter-stream dependencies.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC
 # MAGIC ## Report Migration Readiness Analysis
 # MAGIC
-# MAGIC Determining which reports can be migrated at each stage of the execution order based on:
-# MAGIC * Tables produced by migrated streams (TGT tables)
-# MAGIC * Tables that are currently synced (incoming dependencies)
-# MAGIC * Report-to-table dependencies from cell 9
+# MAGIC A report is ready to migrate when **all** its source tables are available.
+# MAGIC A source table becomes available when **every** stream that produces it (TGT/TGT_TRNS)
+# MAGIC belongs to a community that has completed migration.
+# MAGIC Static tables are available from the start.
 
 # COMMAND ----------
 
-# DBTITLE 1,Select resolution for report analysis
-# Select which resolution to use for report migration readiness analysis
-# This should match one of the resolutions processed in cell 40
+# DBTITLE 1,Build table-to-stream production mapping
+# Which tables are produced (TGT/TGT_TRNS) by which streams
+stream_produces_df = (
+    dependency_df
+    .filter(
+        (F.upper(F.col("table_type")) == "TGT") |
+        (F.upper(F.col("table_type")) == "TGT_TRNS")
+    )
+    .select(
+        F.col("stream_name"),
+        F.upper(F.col("DB_Table_Name")).alias("table_name"),
+    )
+    .distinct()
+)
 
-SELECTED_RESOLUTION = 1.8  # Change this to the desired resolution
-
-
-print(f"Selected resolution for report analysis: {SELECTED_RESOLUTION}")
-print(f"Available resolutions: {resolutions}")
-
-if SELECTED_RESOLUTION not in resolutions:
-    print(f"\nWARNING: Selected resolution {SELECTED_RESOLUTION} was not processed in cell 40!")
-    print(f"Please choose from: {resolutions}")
-else:
-    print(f"✓ Resolution {SELECTED_RESOLUTION} is valid")
-
-# COMMAND ----------
-
-# DBTITLE 1,Load required data for report readiness analysis
-# Use the selected resolution to load the correct CSV file
-stream_ordering_file = f"{output_path}migration_order_analysis/stream_community_ordering_gamma_{SELECTED_RESOLUTION}.csv"
-
-try:
-    stream_ordering_pd = pd.read_csv(stream_ordering_file)
-    print(f"Loaded stream ordering from: {stream_ordering_file}")
-    print(f"Resolution: {SELECTED_RESOLUTION}")
-    print(f"Columns: {stream_ordering_pd.columns.tolist()}")
-    print(f"Total streams: {len(stream_ordering_pd)}")
-    display(stream_ordering_pd.head(10))
-except FileNotFoundError:
-    print(f"ERROR: File not found: {stream_ordering_file}")
-    print(f"Please ensure cell 40 has completed and generated output for resolution {SELECTED_RESOLUTION}")
-    print(f"\nAvailable files:")
-    !ls -t {output_path}migration_order_analysis/stream_community_ordering_gamma_*.csv 2>/dev/null
+print(f"Stream-produces-table mappings: {stream_produces_df.count()}")
+print(f"Unique producing streams: {stream_produces_df.select('stream_name').distinct().count()}")
+print(f"Unique produced tables:   {stream_produces_df.select('table_name').distinct().count()}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Prepare report-to-table dependencies
-# Convert report_dependency_df to Pandas for easier manipulation
-report_to_tables_pd = report_dependency_df.select(
-    col('stream_name').alias('report_name'),
-    upper(col('table_name')).alias('table_name')
+# DBTITLE 1,Map tables to their producing communities
+# Join stream→table with community_df to get table→community
+# A table is available once ALL its producing communities have migrated,
+# but for simplicity we track: for each table, the latest community (by execution order)
+# that produces it — that's when the table is fully available.
+table_to_community_df = (
+    stream_produces_df
+    .join(
+        community_df.select("stream_name", "community"),
+        on="stream_name",
+        how="inner",
+    )
+    .select("table_name", "community")
+    .distinct()
+)
+
+# Join with community_order to get execution_order and code_freeze_end per table-community
+table_community_order_df = (
+    table_to_community_df
+    .join(community_order_df, on="community", how="inner")
+    .select("table_name", "community", "execution_order", "code_freeze_end")
+)
+
+# For each table, find the LATEST community (max execution_order) — that's when it's fully available
+table_max_order_df = (
+    table_community_order_df
+    .groupBy("table_name")
+    .agg(F.max("execution_order").alias("available_after_order"))
+)
+
+# Join back to get community name and code_freeze_end for that max execution_order
+table_availability_df = (
+    table_max_order_df.alias("ta")
+    .join(
+        table_community_order_df.alias("tco"),
+        (F.col("ta.table_name") == F.col("tco.table_name"))
+        & (F.col("ta.available_after_order") == F.col("tco.execution_order")),
+        "inner",
+    )
+    .select(
+        F.col("ta.table_name"),
+        F.col("tco.community").alias("available_after_community"),
+        F.col("ta.available_after_order"),
+        F.col("tco.code_freeze_end").alias("available_after_date"),
+    )
+    .distinct()
+)
+
+print(f"Tables with community availability: {table_availability_df.count()}")
+display(table_availability_df.orderBy("available_after_order"))
+
+# COMMAND ----------
+
+# DBTITLE 1,Determine report readiness
+# For each report, join its required tables with the table availability info.
+# A report is ready after the LATEST of its table dependencies becomes available.
+# Tables that are static (available from start) have order=0.
+
+# Collect to pandas for the readiness calculation
+table_avail_pd = table_availability_df.toPandas()
+table_avail_map = dict(zip(table_avail_pd["table_name"], zip(
+    table_avail_pd["available_after_community"],
+    table_avail_pd["available_after_order"],
+    table_avail_pd["available_after_date"],
+)))
+
+# Community order lookup for display
+comm_order_pd = community_order_df.toPandas()
+
+# Report to tables (from report_table_dependency_df)
+report_tables_pd = report_table_dependency_df.select(
+    "report_name", "table_name",
 ).distinct().toPandas()
 
-print(f"Total report-to-table dependencies: {len(report_to_tables_pd)}")
-print(f"Unique reports: {report_to_tables_pd['report_name'].nunique()}")
-print(f"Unique tables required by reports: {report_to_tables_pd['table_name'].nunique()}")
+report_required = report_tables_pd.groupby("report_name")["table_name"].apply(set).to_dict()
 
-# Group by report to get all tables required per report
-report_required_tables = report_to_tables_pd.groupby('report_name')['table_name'].apply(set).to_dict()
+print(f"Total reports: {len(report_required)}")
+print(f"Total unique tables required: {report_tables_pd['table_name'].nunique()}")
 
-print(f"\nExample - First 3 reports and their required tables:")
-for i, (report, tables) in enumerate(list(report_required_tables.items())[:3]):
-    print(f"  {report}: {len(tables)} tables - {list(tables)[:5]}{'...' if len(tables) > 5 else ''}")
+# For each report, find when it becomes ready
+readiness_rows = []
+not_ready_rows = []
 
-# COMMAND ----------
+for report, tables in report_required.items():
+    max_order = 0
+    max_community = "Static (available from start)"
+    max_date = ""
+    missing_tables = []
+    all_resolved = True
 
-# DBTITLE 1,Extract table production by streams
-# Get which tables are produced (TGT) by which streams
-# From the original dependency_df, extract TGT tables per stream
-stream_produces_tables_df = dependency_df.filter(
-    (upper(col('table_type')) == 'TGT') |
-    (upper(col('table_type')) == 'TGT_TRNS')
-).select(
-    col('stream_name'),
-    upper(col('DB_Table_Name')).alias('table_name')
-).distinct()
+    for tbl in tables:
+        if tbl in static_tables:
+            continue  # available from start, order=0
+        elif tbl in table_avail_map:
+            comm, order, date = table_avail_map[tbl]
+            if order > max_order:
+                max_order = order
+                max_community = comm
+                max_date = date if date else ""
+        else:
+            # Table not produced by any known stream/community
+            all_resolved = False
+            missing_tables.append(tbl)
 
-stream_produces_tables_pd = stream_produces_tables_df.toPandas()
-print(f"Total stream-produces-table mappings: {len(stream_produces_tables_pd)}")
+    if all_resolved:
+        # Ideal End Date = code_freeze_end + 20 business days buffer for report migration
+        ideal_end = ""
+        if max_date:
+            try:
+                from datetime import timedelta
+                freeze_end_dt = pd.to_datetime(max_date, format="%d-%b-%y", dayfirst=True)
+                ideal_end = (freeze_end_dt + timedelta(days=20)).strftime("%-d-%b-%y")
+            except (ValueError, TypeError):
+                ideal_end = ""
 
-# Group by stream to get all tables produced per stream
-stream_produces = stream_produces_tables_pd.groupby('stream_name')['table_name'].apply(set).to_dict()
-
-print(f"Total streams that produce tables: {len(stream_produces)}")
-print(f"\nExample - First 3 streams and tables they produce:")
-for i, (stream, tables) in enumerate(list(stream_produces.items())[:3]):
-    print(f"  {stream}: {len(tables)} tables - {list(tables)[:5]}{'...' if len(tables) > 5 else ''}")
-
-# COMMAND ----------
-
-# DBTITLE 1,Calculate report readiness at each execution stage
-# Get execution orders in the EXACT order they appear (preserving optimization order)
-# Do NOT sort - the order from the CSV reflects the optimized community ordering
-execution_stages = stream_ordering_pd['execution_order'].unique().tolist()
-
-print(f"Total execution stages: {len(execution_stages)}")
-print(f"Execution order (optimized): {execution_stages}")
-
-missing_static_tables_df = spark.read.option("header", True).csv("/Volumes/odp_adw_mvp_n/migration/utilities/community_detection/static_tables_for_report.csv").select("table_name")
-missing_static_tables = set(row["table_name"] for row in missing_static_tables_df.collect())
-
-
-# Initialize tracking
-available_tables = missing_static_tables  # Tables available from ALL migrated streams (cumulative) and initialized with already available static tables
-synced_tables = set()  # Tables that are synced (incoming dependencies, cumulative)
-reports_ready_by_stage = {}  # stage -> list of reports ready
-reports_migrated = set()  # Track which reports have been marked as ready
-
-# Process each execution stage IN THE OPTIMIZED ORDER
-for stage in execution_stages:
-    # Get communities being migrated at this stage
-    communities_at_stage = stream_ordering_pd[stream_ordering_pd['execution_order'] == stage]['community_id'].unique()
-    
-    # Get streams being migrated at this stage
-    streams_at_stage = stream_ordering_pd[stream_ordering_pd['execution_order'] == stage]['stream_name'].tolist()
-    
-    # Track new tables added at this stage
-    new_synced_tables = set()
-    new_produced_tables = set()
-    
-    # Add synced tables for these communities (incoming dependencies)
-    for comm_id in communities_at_stage:
-        if comm_id in community_sync_tables:
-            new_synced_tables.update(community_sync_tables[comm_id])
-    
-    # Add tables produced by streams at this stage
-    for stream in streams_at_stage:
-        if stream in stream_produces:
-            new_produced_tables.update(stream_produces[stream])
-    
-    # Update cumulative sets
-    synced_tables.update(new_synced_tables)
-    available_tables.update(new_produced_tables)
-    
-    # Combine all available tables: produced by migrated streams + synced tables
-    all_available_tables = available_tables.union(synced_tables)
-    
-    # Check which reports are now ready (all required tables available)
-    reports_ready_at_stage = []
-    for report, required_tables in report_required_tables.items():
-        if report not in reports_migrated:  # Only check reports not yet migrated
-            if required_tables.issubset(all_available_tables):
-                reports_ready_at_stage.append(report)
-                reports_migrated.add(report)
-    
-    reports_ready_by_stage[stage] = reports_ready_at_stage
-    
-    print(f"\nStage {stage}:")
-    print(f"  Communities: {list(communities_at_stage)}")
-    print(f"  Streams migrated at this stage: {len(streams_at_stage)}")
-    print(f"  New tables produced: {len(new_produced_tables)}")
-    print(f"  New tables synced: {len(new_synced_tables)}")
-    print(f"  Cumulative tables from migrated streams: {len(available_tables)}")
-    print(f"  Cumulative tables synced: {len(synced_tables)}")
-    print(f"  Total tables available: {len(all_available_tables)}")
-    print(f"  Reports ready at this stage: {len(reports_ready_at_stage)}")
-    if reports_ready_at_stage:
-        print(f"  Report names: {reports_ready_at_stage[:5]}{'...' if len(reports_ready_at_stage) > 5 else ''}")
-
-print(f"\n{'='*80}")
-print(f"SUMMARY:")
-print(f"Total reports analyzed: {len(report_required_tables)}")
-print(f"Total reports ready after all stages: {len(reports_migrated)}")
-print(f"Reports not ready: {len(report_required_tables) - len(reports_migrated)}")
-
-# COMMAND ----------
-
-# DBTITLE 1,Generate detailed report readiness output
-# Create detailed output DataFrame
-report_readiness_data = []
-
-for stage in execution_stages:
-    for report in reports_ready_by_stage[stage]:
-        report_readiness_data.append({
-            'execution_order': stage,
-            'report_name': report,
-            'num_required_tables': len(report_required_tables[report]),
-            'required_tables': ', '.join(sorted(list(report_required_tables[report])[:10])) + 
-                             ('...' if len(report_required_tables[report]) > 10 else '')
+        readiness_rows.append({
+            "Ready After": max_community,
+            "Migrate After Execution Order": max_order,
+            "report_name": report,
+            "num_required_tables": len(tables),
+            "Ready to migrate from": max_date,
+            "Ideal End Date": ideal_end,
+            "required_tables": ", ".join(sorted(tables)),
+        })
+    else:
+        not_ready_rows.append({
+            "report_name": report,
+            "num_required_tables": len(tables),
+            "num_missing_tables": len(missing_tables),
+            "missing_tables": ", ".join(sorted(missing_tables)),
+            "required_tables": ", ".join(sorted(tables)),
         })
 
-report_readiness_df = pd.DataFrame(report_readiness_data)
+readiness_df = pd.DataFrame(readiness_rows).sort_values(
+    ["Migrate After Execution Order", "report_name"]
+).reset_index(drop=True)
 
-# Save to CSV in the migration_order_analysis subdirectory with resolution in filename
-report_readiness_file = f"{output_path}migration_order_analysis/report_migration_readiness_gamma_{SELECTED_RESOLUTION}.csv"
-report_readiness_df.to_csv(report_readiness_file, index=False)
-print(f"Report readiness saved to: {report_readiness_file}")
+not_ready_df = pd.DataFrame(not_ready_rows).sort_values("report_name").reset_index(drop=True)
 
-# Display summary statistics
-print(f"\nReport Readiness by Execution Stage:")
-stage_summary = report_readiness_df.groupby('execution_order').agg({
-    'report_name': 'count'
-}).rename(columns={'report_name': 'reports_ready'}).reset_index()
+print(f"\nReports ready after migration: {len(readiness_df)}")
+print(f"Reports NOT ready (missing tables): {len(not_ready_df)}")
+display(readiness_df.head(20))
 
-stage_summary['cumulative_reports'] = stage_summary['reports_ready'].cumsum()
+# COMMAND ----------
 
-display(stage_summary)
+# DBTITLE 1,Save report readiness CSV
+readiness_file = f"{output_path}report_migration_readiness.csv"
+readiness_df.to_csv(readiness_file, index=False)
+print(f"Readiness CSV saved to: {readiness_file}")
 
-print(f"\nFirst 20 reports ready:")
-display(report_readiness_df.head(20))
+if len(not_ready_df) > 0:
+    not_ready_file = f"{output_path}reports_not_ready.csv"
+    not_ready_df.to_csv(not_ready_file, index=False)
+    print(f"Not-ready CSV saved to: {not_ready_file}")
+
+display(readiness_df)
+
+# COMMAND ----------
+
+# DBTITLE 1,Readiness summary by community
+summary = (
+    readiness_df
+    .groupby(["Migrate After Execution Order", "Ready After"])
+    .agg(reports_ready=("report_name", "count"))
+    .reset_index()
+    .sort_values("Migrate After Execution Order")
+)
+summary["cumulative_reports"] = summary["reports_ready"].cumsum()
+display(summary)
 
 # COMMAND ----------
 
 # DBTITLE 1,Generate detailed text report
-# Generate a detailed text report similar to the migration analysis
-report_readiness_text_file = f"{output_path}migration_order_analysis/report_migration_readiness_analysis_gamma_{SELECTED_RESOLUTION}.txt"
+report_text_file = f"{output_path}report_migration_readiness_analysis.txt"
 
-with open(report_readiness_text_file, 'w') as f:
-    f.write("="*100 + "\n")
+with open(report_text_file, "w") as f:
+    f.write("=" * 100 + "\n")
     f.write("REPORT MIGRATION READINESS ANALYSIS\n")
-    f.write("="*100 + "\n\n")
-    
+    f.write("=" * 100 + "\n\n")
     f.write(f"Analysis Date: {pd.Timestamp.now()}\n")
-    f.write(f"Resolution (gamma): {SELECTED_RESOLUTION}\n")
-    # f.write(f"Weight Method: {WEIGHT_METHOD}\n")
-    f.write(f"Total Reports Analyzed: {len(report_required_tables)}\n")
-    f.write(f"Total Reports Ready: {len(reports_migrated)}\n")
-    f.write(f"Total Execution Stages: {len(execution_stages)}\n\n")
-    
-    f.write("="*100 + "\n")
-    f.write("REPORT READINESS BY EXECUTION STAGE\n")
-    f.write("="*100 + "\n\n")
-    
-    cumulative_reports = 0
-    for stage in execution_stages:
-        reports_at_stage = reports_ready_by_stage[stage]
-        cumulative_reports += len(reports_at_stage)
-        
-        communities_at_stage = stream_ordering_pd[stream_ordering_pd['execution_order'] == stage]['community_id'].unique()
-        streams_at_stage = stream_ordering_pd[stream_ordering_pd['execution_order'] == stage]['stream_name'].tolist()
-        
-        f.write(f"\n{'─'*100}\n")
-        f.write(f"EXECUTION STAGE {stage}\n")
-        f.write(f"{'─'*100}\n")
-        f.write(f"Communities Migrated: {list(communities_at_stage)}\n")
-        f.write(f"Number of Streams: {len(streams_at_stage)}\n")
-        f.write(f"Reports Ready at This Stage: {len(reports_at_stage)}\n")
-        f.write(f"Cumulative Reports Ready: {cumulative_reports}\n\n")
-        
-        if reports_at_stage:
-            f.write(f"Reports Ready:\n")
-            for report in sorted(reports_at_stage):
-                required_tables = report_required_tables[report]
-                f.write(f"  • {report}\n")
-                f.write(f"    Required Tables ({len(required_tables)}): {', '.join(sorted(list(required_tables)[:5]))}")
-                if len(required_tables) > 5:
-                    f.write(f" ... and {len(required_tables) - 5} more")
-                f.write(f"\n")
+    f.write(f"Total Reports Analyzed: {len(report_required)}\n")
+    f.write(f"Reports Ready After All Communities: {len(readiness_df)}\n")
+    f.write(f"Reports Not Ready: {len(not_ready_df)}\n")
+    f.write(f"Static Tables (available from start): {len(static_tables)}\n")
+    f.write(f"Total Communities: {len(comm_order_pd)}\n\n")
+
+    # Reports ready immediately (only static table dependencies)
+    static_ready = readiness_df[readiness_df["Migrate After Execution Order"] == 0]
+    if len(static_ready) > 0:
+        f.write("=" * 100 + "\n")
+        f.write(f"REPORTS READY IMMEDIATELY — only static table dependencies ({len(static_ready)})\n")
+        f.write("=" * 100 + "\n\n")
+        for _, rpt in static_ready.iterrows():
+            f.write(f"  - {rpt['report_name']} ({rpt['num_required_tables']} tables)\n")
+        f.write("\n")
+
+    f.write("=" * 100 + "\n")
+    f.write("REPORT READINESS BY COMMUNITY (EXECUTION ORDER)\n")
+    f.write("=" * 100 + "\n")
+
+    cumulative = len(static_ready)
+    for _, row in comm_order_pd.sort_values("execution_order").iterrows():
+        comm = row["community"]
+        order = row["execution_order"]
+        freeze_end = row["code_freeze_end"] if pd.notna(row["code_freeze_end"]) else "N/A"
+        freeze_start = row["code_freeze_start"] if pd.notna(row["code_freeze_start"]) else "N/A"
+
+        reports_at = readiness_df[readiness_df["Migrate After Execution Order"] == order]
+        cumulative += len(reports_at)
+
+        f.write(f"\n{'─' * 100}\n")
+        f.write(f"EXECUTION ORDER {order}: {comm}\n")
+        f.write(f"{'─' * 100}\n")
+        f.write(f"Code Freeze: {freeze_start} - {freeze_end}\n")
+        f.write(f"Reports Ready at This Stage: {len(reports_at)}\n")
+        f.write(f"Cumulative Reports Ready: {cumulative}\n\n")
+
+        if len(reports_at) > 0:
+            for _, rpt in reports_at.iterrows():
+                f.write(f"  - {rpt['report_name']}\n")
+                f.write(f"    Tables ({rpt['num_required_tables']}): "
+                        f"{', '.join(rpt['required_tables'].split(', ')[:5])}")
+                if rpt["num_required_tables"] > 5:
+                    f.write(f" ... and {rpt['num_required_tables'] - 5} more")
+                f.write("\n")
         else:
-            f.write(f"  No reports ready at this stage.\n")
-    
+            f.write("  No new reports ready at this stage.\n")
+
     # Reports not ready
-    reports_not_ready = set(report_required_tables.keys()) - reports_migrated
-    if reports_not_ready:
-        f.write(f"\n\n{'='*100}\n")
-        f.write(f"REPORTS NOT READY AFTER ALL STAGES ({len(reports_not_ready)})\n")
-        f.write(f"{'='*100}\n\n")
-        
-        for report in sorted(reports_not_ready):
-            required_tables = report_required_tables[report]
-            missing_tables = required_tables - available_tables.union(synced_tables)
-            f.write(f"  • {report}\n")
-            f.write(f"    Required Tables: {len(required_tables)}\n")
-            f.write(f"    Missing Tables: {len(missing_tables)}\n")
-            if missing_tables:
-                f.write(f"    Missing: {', '.join(sorted(list(missing_tables)[:10]))}")
-                if len(missing_tables) > 10:
-                    f.write(f" ... and {len(missing_tables) - 10} more")
-                f.write(f"\n")
+    if len(not_ready_df) > 0:
+        f.write(f"\n\n{'=' * 100}\n")
+        f.write(f"REPORTS NOT READY AFTER ALL COMMUNITIES ({len(not_ready_df)})\n")
+        f.write(f"{'=' * 100}\n\n")
+        f.write("These reports depend on tables not produced by any known stream/community.\n\n")
 
-print(f"\nDetailed text report saved to: {report_readiness_text_file}")
-print(f"\nAnalysis complete!")
-print(f"\nOutput files:")
-print(f"  1. {report_readiness_file}")
-print(f"  2. {report_readiness_text_file}")
+        for _, rpt in not_ready_df.iterrows():
+            f.write(f"  - {rpt['report_name']}\n")
+            f.write(f"    Required Tables: {rpt['num_required_tables']}\n")
+            f.write(f"    Missing Tables ({rpt['num_missing_tables']}): {rpt['missing_tables']}\n\n")
 
-# COMMAND ----------
-
-# DBTITLE 1,Report migration readiness output
-missing_tables = set()
-section_found = False
-with open(f"{output_path}migration_order_analysis/report_migration_readiness_analysis_gamma_1.8.txt", "r") as f:
-    for line in f:
-        if "REPORTS NOT READY AFTER ALL STAGES" in line:
-            section_found = True
-        elif section_found and line.strip().startswith("Missing:"):
-            tables_str = line.strip().split("Missing:")[1].split("...")[0]
-            tables = [t.strip() for t in tables_str.split(",") if t.strip()]
-            missing_tables.update(tables)
-        elif section_found and line.strip() == "":
-            continue
-
-missing_tables = sorted(missing_tables)
-print(",\n".join(missing_tables))
-
-pd.DataFrame({"table name": missing_tables}).to_csv(
-    f"{output_path}migration_order_analysis/missing_tables_for_reports.csv",
-    index=False
-)
+print(f"Text report saved to: {report_text_file}")
+print("Analysis complete!")
