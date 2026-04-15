@@ -192,48 +192,106 @@ prd_views_raw_df = (
     .select(
         F.upper(F.col("view_name")).alias("view_name"),
         F.col("dependent_tables"),
+        F.col("dependent_views"),
     )
 )
 
-# Filter to views with resolved table dependencies
-prd_views_with_tables = prd_views_raw_df.filter(
-    F.col("dependent_tables").isNotNull()
-    & (F.trim(F.col("dependent_tables")) != "")
-)
-
-# Explode pipe-separated dependent_tables into individual rows
-prd_view_to_tables_df = (
-    prd_views_with_tables
-    .withColumn("source_table", F.explode(F.split(F.col("dependent_tables"), r"\s*\|\s*")))
+# Explode dependent_tables (TABLE edges: view -> table)
+prd_table_edges = (
+    prd_views_raw_df
+    .filter(F.col("dependent_tables").isNotNull() & (F.trim(F.col("dependent_tables")) != ""))
+    .withColumn("dep_fqn", F.explode(F.split(F.col("dependent_tables"), r"\s*\|\s*")))
     .select(
-        F.col("view_name"),
-        F.upper(F.trim(F.col("source_table"))).alias("source_table"),
+        F.col("view_name").alias("view_fqn"),
+        F.lit("TABLE").alias("dep_type"),
+        F.upper(F.trim(F.col("dep_fqn"))).alias("dep_fqn"),
     )
-    .filter(F.col("source_table") != "")
+    .filter(F.col("dep_fqn") != "")
+)
+
+# Explode dependent_views (VIEW edges: view -> view)
+prd_view_edges = (
+    prd_views_raw_df
+    .filter(F.col("dependent_views").isNotNull() & (F.trim(F.col("dependent_views")) != ""))
+    .withColumn("dep_fqn", F.explode(F.split(F.col("dependent_views"), r"\s*\|\s*")))
+    .select(
+        F.col("view_name").alias("view_fqn"),
+        F.lit("VIEW").alias("dep_type"),
+        F.upper(F.trim(F.col("dep_fqn"))).alias("dep_fqn"),
+    )
+    .filter(F.col("dep_fqn") != "")
+)
+
+prd_all_edges = prd_table_edges.union(prd_view_edges)
+prd_table_count = prd_table_edges.count()
+prd_view_count = prd_view_edges.count()
+print(f"PRD edges — TABLE: {prd_table_count}, VIEW: {prd_view_count}")
+print(f"PRD unique views: {prd_all_edges.select('view_fqn').distinct().count()}")
+
+# Also build the flat PRD view-to-table-only mapping (for comparison analysis later)
+prd_view_to_tables_df = (
+    prd_table_edges
+    .select(F.col("view_fqn").alias("view_name"), F.col("dep_fqn").alias("source_table"))
     .dropDuplicates(["view_name", "source_table"])
 )
-
-print(f"PRD view-to-table mappings: {prd_view_to_tables_df.count()}")
-print(f"Unique views (PRD):  {prd_view_to_tables_df.select('view_name').distinct().count()}")
-print(f"Unique tables (PRD): {prd_view_to_tables_df.select('source_table').distinct().count()}")
-print(f"PRD views with no direct table deps: {prd_views_raw_df.count() - prd_views_with_tables.count()}")
 display(prd_view_to_tables_df)
 
 # COMMAND ----------
 
-# DBTITLE 1,Merge iterative and PRD view-to-table mappings
-# Union source tables from both datasets, deduplicate:
-#   - Views in both: union of their source tables
-#   - Views in only one: kept as-is
-view_to_source_tables_df = (
-    iterative_view_to_tables_df
-    .union(prd_view_to_tables_df)
-    .dropDuplicates(["view_name", "source_table"])
+# DBTITLE 1,Merge iterative and PRD edges, then iteratively resolve to tables
+# Combine edges from View-Table-Association (view_dep) and PRD into one edge set.
+# view_dep was built at the iterative resolution step with columns: view_fqn, dep_type, dep_fqn
+all_edges = view_dep.union(prd_all_edges).dropDuplicates(["view_fqn", "dep_fqn"])
+
+# Split into resolved (TABLE deps) and unresolved (VIEW deps)
+resolved = (
+    all_edges.filter(F.col("dep_type") == "TABLE")
+    .select(F.col("view_fqn").alias("view_name"), F.col("dep_fqn").alias("source_table"))
+)
+unresolved = (
+    all_edges.filter(F.col("dep_type") == "VIEW")
+    .select(F.col("view_fqn").alias("view_name"), F.col("dep_fqn").alias("intermediate_view"))
 )
 
-print(f"Merged view -> source-table mappings: {view_to_source_tables_df.count()}")
-print(f"Unique views (merged):  {view_to_source_tables_df.select('view_name').distinct().count()}")
-print(f"Unique tables (merged): {view_to_source_tables_df.select('source_table').distinct().count()}")
+# Iteratively replace each intermediate VIEW with its own dependencies
+for i in range(MAX_VIEW_DEPTH):
+    if unresolved.count() == 0:
+        break
+
+    next_hop = unresolved.join(
+        all_edges,
+        unresolved["intermediate_view"] == all_edges["view_fqn"],
+        "inner",
+    ).select(
+        unresolved["view_name"],
+        all_edges["dep_fqn"].alias("dep_name"),
+        all_edges["dep_type"],
+    )
+
+    newly_resolved = (
+        next_hop.filter(F.col("dep_type") == "TABLE")
+        .select("view_name", F.col("dep_name").alias("source_table"))
+    )
+    resolved = resolved.union(newly_resolved).distinct()
+
+    unresolved = (
+        next_hop.filter(F.col("dep_type") == "VIEW")
+        .select("view_name", F.col("dep_name").alias("intermediate_view"))
+    )
+
+# Treat remaining unresolved view deps as potential tables (PRD parser may have
+# mis-classified actual tables as views when the DDL wasn't available).
+remaining_as_tables = unresolved.select(
+    F.col("view_name"),
+    F.col("intermediate_view").alias("source_table"),
+)
+resolved = resolved.union(remaining_as_tables).distinct()
+
+view_to_source_tables_df = resolved.dropDuplicates(["view_name", "source_table"])
+
+print(f"Combined view -> source-table mappings: {view_to_source_tables_df.count()}")
+print(f"Unique views (combined):  {view_to_source_tables_df.select('view_name').distinct().count()}")
+print(f"Unique tables (combined): {view_to_source_tables_df.select('source_table').distinct().count()}")
 display(view_to_source_tables_df)
 
 # COMMAND ----------
