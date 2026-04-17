@@ -43,11 +43,6 @@ dbutils.widgets.text(
     "static_tables_for_report.csv",
     "Static tables available from start",
 )
-dbutils.widgets.text(
-    "prd_views_mapping",
-    "PRDViews_to_Table_mapping.csv",
-    "PRD Views to Table mapping file name",
-)
 
 # COMMAND ----------
 
@@ -59,7 +54,6 @@ report_dependency_path = volume_path + dbutils.widgets.get("report_table_depende
 view_table_association = volume_path + dbutils.widgets.get("view_table_association")
 community_mapping = volume_path + dbutils.widgets.get("community_mapping")
 static_tables_path = volume_path + dbutils.widgets.get("static_tables_file_name")
-prd_views_mapping_path = volume_path + dbutils.widgets.get("prd_views_mapping")
 
 # Output path with date and hour
 output_dir_name = "bi_migration_analysis_output" + datetime.now().strftime("%d%m%Y_%H")
@@ -188,231 +182,6 @@ print(f"Resolved {view_to_source_tables_df.count()} view -> source-table mapping
 print(f"Unique views:  {view_to_source_tables_df.select('view_name').distinct().count()}")
 print(f"Unique tables: {view_to_source_tables_df.select('source_table').distinct().count()}")
 display(view_to_source_tables_df)
-
-# Save iterative resolution output before merging (for comparison analysis)
-iterative_view_to_tables_df = view_to_source_tables_df
-
-# COMMAND ----------
-
-# DBTITLE 1,Reading PRD views-to-table mapping (supplementary)
-prd_views_raw_df = (
-    spark.read.format("csv")
-    .option("header", "true")
-    .load(prd_views_mapping_path)
-    .select(
-        F.upper(F.col("view_name")).alias("view_name"),
-        F.col("dependent_tables"),
-        F.col("dependent_views"),
-    )
-)
-
-# Explode dependent_tables (TABLE edges: view -> table)
-prd_table_edges = (
-    prd_views_raw_df
-    .filter(F.col("dependent_tables").isNotNull() & (F.trim(F.col("dependent_tables")) != ""))
-    .withColumn("dep_fqn", F.explode(F.split(F.col("dependent_tables"), r"\s*\|\s*")))
-    .select(
-        F.col("view_name").alias("view_fqn"),
-        F.lit("TABLE").alias("dep_type"),
-        F.upper(F.trim(F.col("dep_fqn"))).alias("dep_fqn"),
-    )
-    .filter(F.col("dep_fqn") != "")
-)
-
-# Explode dependent_views (VIEW edges: view -> view)
-prd_view_edges = (
-    prd_views_raw_df
-    .filter(F.col("dependent_views").isNotNull() & (F.trim(F.col("dependent_views")) != ""))
-    .withColumn("dep_fqn", F.explode(F.split(F.col("dependent_views"), r"\s*\|\s*")))
-    .select(
-        F.col("view_name").alias("view_fqn"),
-        F.lit("VIEW").alias("dep_type"),
-        F.upper(F.trim(F.col("dep_fqn"))).alias("dep_fqn"),
-    )
-    .filter(F.col("dep_fqn") != "")
-)
-
-prd_all_edges = prd_table_edges.union(prd_view_edges)
-prd_table_count = prd_table_edges.count()
-prd_view_count = prd_view_edges.count()
-print(f"PRD edges — TABLE: {prd_table_count}, VIEW: {prd_view_count}")
-print(f"PRD unique views: {prd_all_edges.select('view_fqn').distinct().count()}")
-
-# Also build the flat PRD view-to-table-only mapping (for comparison analysis later)
-prd_view_to_tables_df = (
-    prd_table_edges
-    .select(F.col("view_fqn").alias("view_name"), F.col("dep_fqn").alias("source_table"))
-    .dropDuplicates(["view_name", "source_table"])
-)
-display(prd_view_to_tables_df)
-
-# COMMAND ----------
-
-# DBTITLE 1,Merge iterative and PRD edges, then iteratively resolve to tables
-# Combine edges from View-Table-Association (view_dep) and PRD into one edge set.
-# view_dep was built at the iterative resolution step with columns: view_fqn, dep_type, dep_fqn
-all_edges = view_dep.union(prd_all_edges).dropDuplicates(["view_fqn", "dep_fqn"])
-
-# Split into resolved (TABLE deps) and unresolved (VIEW deps)
-resolved = (
-    all_edges.filter(F.col("dep_type") == "TABLE")
-    .select(F.col("view_fqn").alias("view_name"), F.col("dep_fqn").alias("source_table"))
-)
-unresolved = (
-    all_edges.filter(F.col("dep_type") == "VIEW")
-    .select(F.col("view_fqn").alias("view_name"), F.col("dep_fqn").alias("intermediate_view"))
-)
-
-# Iteratively replace each intermediate VIEW with its own dependencies
-for i in range(MAX_VIEW_DEPTH):
-    if unresolved.count() == 0:
-        break
-
-    next_hop = unresolved.join(
-        all_edges,
-        unresolved["intermediate_view"] == all_edges["view_fqn"],
-        "inner",
-    ).select(
-        unresolved["view_name"],
-        all_edges["dep_fqn"].alias("dep_name"),
-        all_edges["dep_type"],
-    )
-
-    newly_resolved = (
-        next_hop.filter(F.col("dep_type") == "TABLE")
-        .select("view_name", F.col("dep_name").alias("source_table"))
-    )
-    resolved = resolved.union(newly_resolved).distinct()
-
-    unresolved = (
-        next_hop.filter(F.col("dep_type") == "VIEW")
-        .select("view_name", F.col("dep_name").alias("intermediate_view"))
-    )
-
-# Treat remaining unresolved view deps as potential tables (PRD parser may have
-# mis-classified actual tables as views when the DDL wasn't available).
-remaining_as_tables = unresolved.select(
-    F.col("view_name"),
-    F.col("intermediate_view").alias("source_table"),
-)
-resolved = resolved.union(remaining_as_tables).distinct()
-
-view_to_source_tables_df = resolved.dropDuplicates(["view_name", "source_table"])
-
-print(f"Combined view -> source-table mappings: {view_to_source_tables_df.count()}")
-print(f"Unique views (combined):  {view_to_source_tables_df.select('view_name').distinct().count()}")
-print(f"Unique tables (combined): {view_to_source_tables_df.select('source_table').distinct().count()}")
-display(view_to_source_tables_df)
-
-# COMMAND ----------
-
-# DBTITLE 1,Analysis: Iterative vs PRD view-to-table mapping comparison
-iter_pd = iterative_view_to_tables_df.toPandas()
-prd_pd = prd_view_to_tables_df.toPandas()
-
-iter_view_tables = iter_pd.groupby("view_name")["source_table"].apply(set).to_dict()
-prd_view_tables = prd_pd.groupby("view_name")["source_table"].apply(set).to_dict()
-
-iter_views = set(iter_view_tables.keys())
-prd_views = set(prd_view_tables.keys())
-
-# All PRD view names (including those with no dependent_tables)
-prd_all_views = set(
-    prd_views_raw_df.select("view_name").distinct().toPandas()["view_name"]
-)
-
-common_views = iter_views & prd_views
-only_in_iterative = iter_views - prd_all_views
-only_in_prd = prd_views - iter_views
-# Views present in both datasets, but PRD has no table deps for them
-in_both_but_prd_no_tables = (iter_views & prd_all_views) - prd_views
-
-# Classify common views (both have source tables)
-exact_match = []
-varying_tables = []
-for v in sorted(common_views):
-    if iter_view_tables[v] == prd_view_tables[v]:
-        exact_match.append(v)
-    else:
-        varying_tables.append(v)
-
-print("=" * 80)
-print("VIEW-TO-TABLE MAPPING COMPARISON: Iterative Resolution vs PRD Mapping")
-print("=" * 80)
-print(f"\nTotal views in Iterative resolution:            {len(iter_views)}")
-print(f"Total views in PRD mapping (with tables):        {len(prd_views)}")
-print(f"Total views in PRD mapping (all):                {len(prd_all_views)}")
-print()
-print(f"Common views (both have source tables):          {len(common_views)}")
-print(f"  - Exact same source tables:                    {len(exact_match)}")
-print(f"  - Different source table lists:                {len(varying_tables)}")
-print(f"Tables in Iterative only (no tables in PRD):     {len(in_both_but_prd_no_tables)}")
-print(f"Views only in Iterative (not in PRD at all):     {len(only_in_iterative)}")
-print(f"Views only in PRD (not in Iterative):            {len(only_in_prd)}")
-
-MAX_EXAMPLES = 5
-
-if exact_match:
-    print(f"\n{'─' * 80}")
-    print(f"EXAMPLES: Views with EXACT SAME source tables ({min(MAX_EXAMPLES, len(exact_match))} of {len(exact_match)})")
-    print(f"{'─' * 80}")
-    for v in exact_match[:MAX_EXAMPLES]:
-        tables = sorted(iter_view_tables[v])
-        print(f"  {v}")
-        print(f"    Tables: {', '.join(tables[:5])}{' ...' if len(tables) > 5 else ''}")
-
-if varying_tables:
-    print(f"\n{'─' * 80}")
-    print(f"EXAMPLES: Views with DIFFERENT source tables ({min(MAX_EXAMPLES, len(varying_tables))} of {len(varying_tables)})")
-    print(f"{'─' * 80}")
-    for v in varying_tables[:MAX_EXAMPLES]:
-        iter_only = sorted(iter_view_tables[v] - prd_view_tables[v])
-        prd_only = sorted(prd_view_tables[v] - iter_view_tables[v])
-        shared = sorted(iter_view_tables[v] & prd_view_tables[v])
-        print(f"  {v}")
-        if shared:
-            print(f"    Shared:          {', '.join(shared[:3])}{' ...' if len(shared) > 3 else ''}")
-        if iter_only:
-            print(f"    Only Iterative:  {', '.join(iter_only[:3])}{' ...' if len(iter_only) > 3 else ''}")
-        if prd_only:
-            print(f"    Only PRD:        {', '.join(prd_only[:3])}{' ...' if len(prd_only) > 3 else ''}")
-
-if in_both_but_prd_no_tables:
-    print(f"\n{'─' * 80}")
-    print(f"EXAMPLES: Views with tables in Iterative but NO tables in PRD ({min(MAX_EXAMPLES, len(in_both_but_prd_no_tables))} of {len(in_both_but_prd_no_tables)})")
-    print(f"{'─' * 80}")
-    for v in sorted(in_both_but_prd_no_tables)[:MAX_EXAMPLES]:
-        tables = sorted(iter_view_tables[v])
-        print(f"  {v}")
-        print(f"    Iterative tables: {', '.join(tables[:5])}{' ...' if len(tables) > 5 else ''}")
-
-if only_in_iterative:
-    print(f"\n{'─' * 80}")
-    print(f"EXAMPLES: Views ONLY in Iterative ({min(MAX_EXAMPLES, len(only_in_iterative))} of {len(only_in_iterative)})")
-    print(f"{'─' * 80}")
-    for v in sorted(only_in_iterative)[:MAX_EXAMPLES]:
-        tables = sorted(iter_view_tables[v])
-        print(f"  {v}")
-        print(f"    Tables: {', '.join(tables[:5])}{' ...' if len(tables) > 5 else ''}")
-
-if only_in_prd:
-    print(f"\n{'─' * 80}")
-    print(f"EXAMPLES: Views ONLY in PRD ({min(MAX_EXAMPLES, len(only_in_prd))} of {len(only_in_prd)})")
-    print(f"{'─' * 80}")
-    for v in sorted(only_in_prd)[:MAX_EXAMPLES]:
-        tables = sorted(prd_view_tables[v])
-        print(f"  {v}")
-        print(f"    Tables: {', '.join(tables[:5])}{' ...' if len(tables) > 5 else ''}")
-
-# Summary DataFrame for display
-comparison_summary = pd.DataFrame([
-    {"Category": "Common views - exact same tables", "Count": len(exact_match)},
-    {"Category": "Common views - different table lists", "Count": len(varying_tables)},
-    {"Category": "Tables in Iterative only (PRD has view but no tables)", "Count": len(in_both_but_prd_no_tables)},
-    {"Category": "Views only in Iterative (not in PRD)", "Count": len(only_in_iterative)},
-    {"Category": "Views only in PRD (not in Iterative)", "Count": len(only_in_prd)},
-])
-display(comparison_summary)
 
 # COMMAND ----------
 
@@ -717,7 +486,8 @@ print(f"Total reports: {len(report_required)}")
 print(f"Total unique tables required: {report_tables_pd['table_name'].nunique()}")
 
 # Classify each report as ready or not-ready
-all_report_rows = []
+readiness_rows = []
+not_ready_rows = []
 
 for report, tables in report_required.items():
     max_order = 0
@@ -739,56 +509,63 @@ for report, tables in report_required.items():
             all_resolved = False
             missing_tables.append(tbl)
 
-    # Ideal End Date = code_freeze_end + 20 days buffer
-    ideal_end = ""
-    if max_date:
-        try:
-            freeze_end_dt = pd.to_datetime(max_date, format="%d-%b-%y", dayfirst=True)
-            ideal_end = (freeze_end_dt + timedelta(days=20)).strftime("%-d-%b-%y")
-        except (ValueError, TypeError):
-            ideal_end = ""
+    if all_resolved:
+        # Ideal End Date = code_freeze_end + 20 days buffer
+        ideal_end = ""
+        if max_date:
+            try:
+                freeze_end_dt = pd.to_datetime(max_date, format="%d-%b-%y", dayfirst=True)
+                ideal_end = (freeze_end_dt + timedelta(days=20)).strftime("%-d-%b-%y")
+            except (ValueError, TypeError):
+                ideal_end = ""
 
-    all_report_rows.append({
-        "report_name": report,
-        "status": "Ready" if all_resolved else "Not Ready",
-        "Ready After": max_community,
-        "Migrate After Execution Order": max_order,
-        "num_required_tables": len(tables),
-        "Ready to migrate from": max_date,
-        "Ideal End Date": ideal_end,
-        "num_missing_tables": len(missing_tables),
-        "missing_tables": ", ".join(sorted(missing_tables)),
-        "required_tables": ", ".join(sorted(tables)),
-    })
+        readiness_rows.append({
+            "Ready After": max_community,
+            "Migrate After Execution Order": max_order,
+            "report_name": report,
+            "num_required_tables": len(tables),
+            "Ready to migrate from": max_date,
+            "Ideal End Date": ideal_end,
+            "required_tables": ", ".join(sorted(tables)),
+        })
+    else:
+        not_ready_rows.append({
+            "report_name": report,
+            "num_required_tables": len(tables),
+            "num_missing_tables": len(missing_tables),
+            "missing_tables": ", ".join(sorted(missing_tables)),
+            "required_tables": ", ".join(sorted(tables)),
+        })
 
-# Split for per-status views, then combine: ready first (by order), not-ready last (by name)
-all_reports_df = pd.DataFrame(all_report_rows)
 readiness_df = (
-    all_reports_df[all_reports_df["status"] == "Ready"]
+    pd.DataFrame(readiness_rows)
     .sort_values(["Migrate After Execution Order", "report_name"])
     .reset_index(drop=True)
 )
+
 not_ready_df = (
-    all_reports_df[all_reports_df["status"] == "Not Ready"]
+    pd.DataFrame(not_ready_rows)
     .sort_values("report_name")
     .reset_index(drop=True)
 )
-all_reports_df = pd.concat([readiness_df, not_ready_df], ignore_index=True)
 
-print(f"\nTotal reports analyzed: {len(all_reports_df)}")
-print(f"Reports ready after migration: {len(readiness_df)}")
+print(f"\nReports ready after migration: {len(readiness_df)}")
 print(f"Reports NOT ready (missing tables): {len(not_ready_df)}")
-display(all_reports_df.head(20))
+display(readiness_df.head(20))
 
 # COMMAND ----------
 
 # DBTITLE 1,Save report readiness CSV
 readiness_file = f"{output_path}report_migration_readiness.csv"
-all_reports_df.to_csv(readiness_file, index=False)
+readiness_df.to_csv(readiness_file, index=False)
 print(f"Readiness CSV saved to: {readiness_file}")
-print(f"  Ready reports: {len(readiness_df)}, Not-ready reports: {len(not_ready_df)}")
 
-display(all_reports_df)
+if len(not_ready_df) > 0:
+    not_ready_file = f"{output_path}reports_not_ready.csv"
+    not_ready_df.to_csv(not_ready_file, index=False)
+    print(f"Not-ready CSV saved to: {not_ready_file}")
+
+display(readiness_df)
 
 # COMMAND ----------
 
