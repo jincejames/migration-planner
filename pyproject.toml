@@ -68,6 +68,7 @@ dependencies = [
   "adjustText",
   "pandas",
   "scikit-learn",
+  "pyvis",
 ]
 
 python="3.10"
