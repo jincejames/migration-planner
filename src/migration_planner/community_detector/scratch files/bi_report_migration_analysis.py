@@ -88,6 +88,16 @@ dependency_df_full = _dep_raw.select(
     [F.col(c).alias(c.lower()) for c in _dep_raw.columns]
 )
 
+# Normalize key join/filter columns to uppercase so all downstream comparisons
+# are case-consistent (values in ODAT CSV may arrive in mixed case).
+_case_norm_cols = {"stream_name", "db_table_name", "table_type"}
+dependency_df_full = dependency_df_full.select(
+    *[
+        F.upper(F.col(c)).alias(c) if c in _case_norm_cols else F.col(c)
+        for c in dependency_df_full.columns
+    ]
+)
+
 # Filter out rows with empty DB_Table_Name or table_type (admin streams with no tables)
 dependency_df_full = dependency_df_full.filter(
     F.col("db_table_name").isNotNull()
@@ -103,7 +113,7 @@ outofscope_stream_names_df = (
     spark.read.format("csv")
     .option("header", "true")
     .load(outofscope_stream_path)
-    .select(F.col("stream_name"))
+    .select(F.upper(F.col("stream_name")).alias("stream_name"))
 )
 
 # Filter out out-of-scope streams from the dependency data
@@ -491,10 +501,10 @@ DATE_COLS = [
 community_df = community_raw_df.select(
     F.col("`Community_Number(Old)`").alias("community_old"),
     F.col("Updated_Community_Number").alias("community_new"),
-    F.col("`Stream Name`").alias("stream_name"),
+    F.upper(F.col("`Stream Name`")).alias("stream_name"),
     F.col("`Scope Status`").alias("scope_status"),
     *[
-        F.when(F.col(f"`{c}`") == "#N/A", None)
+        F.when(F.upper(F.col(f"`{c}`")) == "#N/A", None)
         .otherwise(F.col(f"`{c}`"))
         .alias(c)
         for c in DATE_COLS
@@ -590,7 +600,7 @@ print(f"Static tables available from start: {len(static_tables)}")
 tgt_as_source = (
     dependency_df_full
     .filter(F.upper(F.col("table_type")).contains("TGT"))
-    .replace({"Tgt": "Src", "Tgt_Trns": "Src_Trns"}, subset=["table_type"])
+    .replace({"TGT": "SRC", "TGT_TRNS": "SRC_TRNS"}, subset=["table_type"])
 )
 dependency_df = dependency_df_full.union(tgt_as_source).distinct()
 
